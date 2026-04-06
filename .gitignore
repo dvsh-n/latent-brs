@@ -2,6 +2,7 @@ latent_brs_venv/
 /.codex
 .vscode/
 *.pt
+*.pth
 *.mp4
 *.png
 **/runs/

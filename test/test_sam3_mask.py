@@ -13,7 +13,7 @@ import torch
 from sam3 import build_sam3_predictor
 
 
-VIDEO_PATH = Path("test/reacher_texture_test.mp4")
+VIDEO_PATH = Path("test/trajectory_0000000.mp4")
 PROMPT = "green ball"
 CHECKPOINT_PATH = Path("models/sam3/sam3.pt")
 OUTPUT_PATH = Path("test/sam3_mask_output.pt")
