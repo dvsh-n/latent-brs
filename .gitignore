@@ -6,3 +6,4 @@ latent_brs_venv/
 *.png
 **/runs/
 **/__pycache__/
+models/sam3
