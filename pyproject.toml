@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latent-brs"
+version = "0.1.0"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["latent_brs_venv*", "third_party*", "waste*"]

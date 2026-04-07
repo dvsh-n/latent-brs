@@ -25,7 +25,7 @@ import hubconf  # noqa: E402  (must come after sys.path insert)
 # ---------------------------------------------------------------------------
 # Config — edit these
 # ---------------------------------------------------------------------------
-VIDEO_DIR   = REPO_ROOT / "test" / "videos_512" 
+VIDEO_DIR   = REPO_ROOT / "data" / "expert_data" / "videos"  
 VIZ_VIDEO   = VIDEO_DIR / "trajectory_0000081.mp4"   
 OUTPUT_DIR  = REPO_ROOT / "test"
 
@@ -55,36 +55,36 @@ MODELS = [
         "weights": REPO_ROOT / "models" / "dinov2_vits14_pretrain.pth",
         "embed_dim": 384,
     },
-    # {
-    #     "name": "ViT-S/14 reg4",
-    #     "hub_fn": "dinov2_vits14_reg",
-    #     "weights": REPO_ROOT / "models" / "dinov2_vits14_reg4_pretrain.pth",
-    #     "embed_dim": 384,
-    # },
-    # {
-    #     "name": "ViT-B/14",
-    #     "hub_fn": "dinov2_vitb14",
-    #     "weights": REPO_ROOT / "models" / "dinov2_vitb14_pretrain.pth",
-    #     "embed_dim": 768,
-    # },
-    # {
-    #     "name": "ViT-B/14 reg4",
-    #     "hub_fn": "dinov2_vitb14_reg",
-    #     "weights": REPO_ROOT / "models" / "dinov2_vitb14_reg4_pretrain.pth",
-    #     "embed_dim": 768,
-    # },
-    # {
-    #     "name": "ViT-L/14",
-    #     "hub_fn": "dinov2_vitl14",
-    #     "weights": REPO_ROOT / "models" / "dinov2_vitl14_pretrain.pth",
-    #     "embed_dim": 1024,
-    # },
-    # {
-    #     "name": "ViT-L/14 reg4",
-    #     "hub_fn": "dinov2_vitl14_reg",
-    #     "weights": REPO_ROOT / "models" / "dinov2_vitl14_reg4_pretrain.pth",
-    #     "embed_dim": 1024,
-    # },
+    {
+        "name": "ViT-S/14 reg4",
+        "hub_fn": "dinov2_vits14_reg",
+        "weights": REPO_ROOT / "models" / "dinov2_vits14_reg4_pretrain.pth",
+        "embed_dim": 384,
+    },
+    {
+        "name": "ViT-B/14",
+        "hub_fn": "dinov2_vitb14",
+        "weights": REPO_ROOT / "models" / "dinov2_vitb14_pretrain.pth",
+        "embed_dim": 768,
+    },
+    {
+        "name": "ViT-B/14 reg4",
+        "hub_fn": "dinov2_vitb14_reg",
+        "weights": REPO_ROOT / "models" / "dinov2_vitb14_reg4_pretrain.pth",
+        "embed_dim": 768,
+    },
+    {
+        "name": "ViT-L/14",
+        "hub_fn": "dinov2_vitl14",
+        "weights": REPO_ROOT / "models" / "dinov2_vitl14_pretrain.pth",
+        "embed_dim": 1024,
+    },
+    {
+        "name": "ViT-L/14 reg4",
+        "hub_fn": "dinov2_vitl14_reg",
+        "weights": REPO_ROOT / "models" / "dinov2_vitl14_reg4_pretrain.pth",
+        "embed_dim": 1024,
+    },
     # {
     #     "name": "ViT-G/14",
     #     "hub_fn": "dinov2_vitg14",
