@@ -7,3 +7,6 @@
 [submodule "third_party/dinov2"]
 	path = third_party/dinov2
 	url = https://github.com/facebookresearch/dinov2.git
+[submodule "third_party/dm_control"]
+	path = third_party/dm_control
+	url = https://github.com/google-deepmind/dm_control.git

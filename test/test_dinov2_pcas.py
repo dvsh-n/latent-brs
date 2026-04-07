@@ -25,8 +25,8 @@ import hubconf  # noqa: E402  (must come after sys.path insert)
 # ---------------------------------------------------------------------------
 # Config — edit these
 # ---------------------------------------------------------------------------
-VIDEO_DIR   = REPO_ROOT / "test" / "videos_768" 
-VIZ_VIDEO   = VIDEO_DIR / "trajectory_0000051.mp4"   # trajectory to visualize
+VIDEO_DIR   = REPO_ROOT / "test" / "videos_512" 
+VIZ_VIDEO   = VIDEO_DIR / "trajectory_0000081.mp4"   
 OUTPUT_DIR  = REPO_ROOT / "test"
 
 N_TRAJECTORIES   = 50   # videos sampled to fit PCA
