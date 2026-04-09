@@ -10,3 +10,6 @@
 [submodule "third_party/dm_control"]
 	path = third_party/dm_control
 	url = https://github.com/google-deepmind/dm_control.git
+[submodule "third_party/temporal-straightening"]
+	path = third_party/temporal-straightening
+	url = https://github.com/agentic-learning-ai-lab/temporal-straightening.git
