@@ -29,7 +29,7 @@ from eval.reacher_policy_viz import (
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTDIR = REPO_ROOT / "data" / "expert_data"
+DEFAULT_OUTDIR = REPO_ROOT / "data" / "test_data"
 
 CONTROL_FREQ_HZ = 50
 STEPS_PER_EPISODE = 50
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vecnormalize-path", type=Path, default=DEFAULT_VECNORMALIZE_PATH)
     parser.add_argument("--task", choices=("easy", "hard"), default="hard")
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
-    parser.add_argument("--num-trajectories", type=int, default=10_000)
+    parser.add_argument("--num-trajectories", type=int, default=1_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--time-limit", type=float, default=10.0)
     parser.add_argument("--width", type=int, default=252)
