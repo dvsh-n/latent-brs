@@ -7,6 +7,9 @@ models/reacher-dm-control-sac/
 latent_brs.egg-info/
 *.pt
 *.pth
+*.h5
+models/lewm_reacher_*/
+*.json
 *.mp4
 *.png
 **/runs/

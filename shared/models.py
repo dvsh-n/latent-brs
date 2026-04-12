@@ -5,6 +5,355 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
+
+
+def detach_clone(v):
+    return v.detach().clone() if torch.is_tensor(v) else v
+
+
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1 + scale) + shift
+
+
+class SIGReg(torch.nn.Module):
+    """Sketch Isotropic Gaussian Regularizer used by LE-WM."""
+
+    def __init__(self, knots: int = 17, num_proj: int = 1024) -> None:
+        super().__init__()
+        self.num_proj = num_proj
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, proj: torch.Tensor) -> torch.Tensor:
+        """
+        proj: (T, B, D)
+        """
+        a = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
+        a = a.div_(a.norm(p=2, dim=0))
+        x_t = (proj @ a).unsqueeze(-1) * self.t
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ self.weights) * proj.size(-2)
+        return statistic.mean()
+
+
+class FeedForward(nn.Module):
+    """FeedForward network used in LE-WM transformers."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Attention(nn.Module):
+    """Scaled dot-product attention with causal masking."""
+
+    def __init__(self, dim: int, heads: int = 8, dim_head: int = 64, dropout: float = 0.0) -> None:
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+        self.heads = heads
+        self.scale = dim_head**-0.5
+        self.dropout = dropout
+        self.norm = nn.LayerNorm(dim)
+        self.attend = nn.Softmax(dim=-1)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out
+            else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
+        x = self.norm(x)
+        drop = self.dropout if self.training else 0.0
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        out = rearrange(out, "b h t d -> b t (h d)")
+        return self.to_out(out)
+
+
+class ConditionalBlock(nn.Module):
+    """Transformer block with AdaLN-zero conditioning."""
+
+    def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
+
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class Block(nn.Module):
+    """Standard Transformer block."""
+
+    def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class Transformer(nn.Module):
+    """LE-WM Transformer with optional AdaLN-zero blocks."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        depth: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        block_class: type[nn.Module] = Block,
+    ) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.layers = nn.ModuleList([])
+        self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.cond_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.output_proj = nn.Linear(hidden_dim, output_dim) if hidden_dim != output_dim else nn.Identity()
+
+        for _ in range(depth):
+            self.layers.append(block_class(hidden_dim, heads, dim_head, mlp_dim, dropout))
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.input_proj(x)
+        if c is not None:
+            c = self.cond_proj(c)
+
+        for block in self.layers:
+            x = block(x) if isinstance(block, Block) else block(x, c)
+        x = self.norm(x)
+        return self.output_proj(x)
+
+
+class Embedder(nn.Module):
+    def __init__(
+        self,
+        input_dim: int = 10,
+        smoothed_dim: int = 10,
+        emb_dim: int = 10,
+        mlp_scale: int = 4,
+    ) -> None:
+        super().__init__()
+        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
+        self.embed = nn.Sequential(
+            nn.Linear(smoothed_dim, mlp_scale * emb_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_scale * emb_dim, emb_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        x = x.permute(0, 2, 1)
+        x = self.patch_embed(x)
+        x = x.permute(0, 2, 1)
+        return self.embed(x)
+
+
+class MLP(nn.Module):
+    """Simple MLP with optional normalization and activation."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int | None = None,
+        norm_fn=nn.LayerNorm,
+        act_fn=nn.GELU,
+    ) -> None:
+        super().__init__()
+        norm = norm_fn(hidden_dim) if norm_fn is not None else nn.Identity()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            norm,
+            act_fn(),
+            nn.Linear(hidden_dim, output_dim or input_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class ARPredictor(nn.Module):
+    """Autoregressive predictor for next-step embedding prediction."""
+
+    def __init__(
+        self,
+        *,
+        num_frames: int,
+        depth: int,
+        heads: int,
+        mlp_dim: int,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int | None = None,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        emb_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        self.transformer = Transformer(
+            input_dim,
+            hidden_dim,
+            output_dim or input_dim,
+            depth,
+            heads,
+            dim_head,
+            mlp_dim,
+            dropout,
+            block_class=ConditionalBlock,
+        )
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        t = x.size(1)
+        x = x + self.pos_embedding[:, :t]
+        x = self.dropout(x)
+        return self.transformer(x, c)
+
+
+class JEPA(nn.Module):
+    """LE-WM joint-embedding predictive architecture."""
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        predictor: nn.Module,
+        action_encoder: nn.Module,
+        projector: nn.Module | None = None,
+        pred_proj: nn.Module | None = None,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.predictor = predictor
+        self.action_encoder = action_encoder
+        self.projector = projector or nn.Identity()
+        self.pred_proj = pred_proj or nn.Identity()
+
+    def encode(self, info: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        pixels = info["pixels"].float()
+        b = pixels.size(0)
+        pixels = rearrange(pixels, "b t ... -> (b t) ...")
+        output = self.encoder(pixels, interpolate_pos_encoding=True)
+        pixels_emb = output.last_hidden_state[:, 0]
+        emb = self.projector(pixels_emb)
+        info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
+
+        if "action" in info:
+            info["act_emb"] = self.action_encoder(info["action"])
+        return info
+
+    def predict(self, emb: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
+        preds = self.predictor(emb, act_emb)
+        preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
+        return rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
+
+    def rollout(self, info: dict[str, torch.Tensor], action_sequence: torch.Tensor, history_size: int = 3):
+        assert "pixels" in info, "pixels not in info_dict"
+        h = info["pixels"].size(2)
+        b, s, t = action_sequence.shape[:3]
+        act_0, act_future = torch.split(action_sequence, [h, t - h], dim=2)
+        info["action"] = act_0
+        n_steps = t - h
+
+        init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+        init = self.encode(init)
+        emb = info["emb"] = init["emb"].unsqueeze(1).expand(b, s, -1, -1)
+        init = {k: detach_clone(v) for k, v in init.items()}
+
+        emb = rearrange(emb, "b s ... -> (b s) ...").clone()
+        act = rearrange(act_0, "b s ... -> (b s) ...")
+        act_future = rearrange(act_future, "b s ... -> (b s) ...")
+
+        hs = history_size
+        for step in range(n_steps):
+            act_emb = self.action_encoder(act)
+            emb_trunc = emb[:, -hs:]
+            act_trunc = act_emb[:, -hs:]
+            pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]
+            emb = torch.cat([emb, pred_emb], dim=1)
+
+            next_act = act_future[:, step : step + 1, :]
+            act = torch.cat([act, next_act], dim=1)
+
+        act_emb = self.action_encoder(act)
+        emb_trunc = emb[:, -hs:]
+        act_trunc = act_emb[:, -hs:]
+        pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]
+        emb = torch.cat([emb, pred_emb], dim=1)
+
+        info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=b, s=s)
+        return info
+
+    def criterion(self, info_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        pred_emb = info_dict["predicted_emb"]
+        goal_emb = info_dict["goal_emb"]
+        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
+        return F.mse_loss(
+            pred_emb[..., -1:, :],
+            goal_emb[..., -1:, :].detach(),
+            reduction="none",
+        ).sum(dim=tuple(range(2, pred_emb.ndim)))
+
+    def get_cost(self, info_dict: dict[str, torch.Tensor], action_candidates: torch.Tensor) -> torch.Tensor:
+        assert "goal" in info_dict, "goal not in info_dict"
+        device = next(self.parameters()).device
+        for key in list(info_dict.keys()):
+            if torch.is_tensor(info_dict[key]):
+                info_dict[key] = info_dict[key].to(device)
+
+        goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+        goal["pixels"] = goal["goal"]
+
+        for key in list(info_dict.keys()):
+            if key.startswith("goal_"):
+                goal[key[len("goal_") :]] = goal.pop(key)
+
+        goal.pop("action")
+        goal = self.encode(goal)
+        info_dict["goal_emb"] = goal["emb"]
+        info_dict = self.rollout(info_dict, action_candidates)
+        return self.criterion(info_dict)
 
 
 def build_mlp(
