@@ -13,3 +13,6 @@
 [submodule "third_party/temporal-straightening"]
 	path = third_party/temporal-straightening
 	url = https://github.com/agentic-learning-ai-lab/temporal-straightening.git
+[submodule "third_party/le-wm"]
+	path = third_party/le-wm
+	url = https://github.com/lucas-maes/le-wm.git
