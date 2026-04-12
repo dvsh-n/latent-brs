@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 from collections import OrderedDict
 from pathlib import Path
@@ -21,6 +20,7 @@ from shared.models import LatentDynamicsModel
 DEFAULT_DATA_DIR = "data/expert_data/prepocessed"
 DEFAULT_SAVE_PATH = "models/latent_dyn_reacher.pt"
 DEFAULT_LOG_DIR = "runs/latent_dyn_reacher"
+MODEL_ARCHITECTURE = "residual_next_latent_dynamics_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,11 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=12)
-    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=20)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument("--history", type=int, default=3)
     parser.add_argument("--rollout-steps", type=int, default=4)
     parser.add_argument("--latent-dim", type=int, default=24)
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamics-depth", type=int, default=3)
     parser.add_argument("--encoder-proj-hidden-dim", type=int, default=512)
     parser.add_argument("--encoder-proj-depth", type=int, default=1)
-    parser.add_argument("--cache-episodes", type=int, default=24)
+    parser.add_argument("--cache-episodes", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--curvature-weight", type=float, default=0.05)
@@ -68,70 +68,6 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-class SequenceAugment:
-    def __init__(self) -> None:
-        self.brightness = 0.2
-        self.contrast = 0.2
-        self.saturation = 0.2
-
-    def _sample_crop(self, height: int, width: int) -> tuple[int, int, int, int]:
-        scale = random.uniform(0.8, 1.0)
-        crop_h = max(1, int(round(height * scale)))
-        crop_w = max(1, int(round(width * scale)))
-        top = 0 if crop_h == height else random.randint(0, height - crop_h)
-        left = 0 if crop_w == width else random.randint(0, width - crop_w)
-        return top, left, crop_h, crop_w
-
-    def _sample_color(self) -> tuple[float, float, float]:
-        brightness = random.uniform(1.0 - self.brightness, 1.0 + self.brightness)
-        contrast = random.uniform(1.0 - self.contrast, 1.0 + self.contrast)
-        saturation = random.uniform(1.0 - self.saturation, 1.0 + self.saturation)
-        return brightness, contrast, saturation
-
-    def __call__(self, frames: torch.Tensor) -> torch.Tensor:
-        if frames.ndim != 4:
-            raise ValueError("Expected frames with shape [time, channels, height, width].")
-
-        frames = ((frames * 0.5) + 0.5).clamp(0.0, 1.0)
-        _time, _channels, height, width = frames.shape
-        top, left, crop_h, crop_w = self._sample_crop(height, width)
-        brightness, contrast, saturation = self._sample_color()
-
-        cropped = frames[:, :, top : top + crop_h, left : left + crop_w]
-        resized = torch.nn.functional.interpolate(
-            cropped,
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        augmented = resized
-        if random.random() < 0.2:
-            gray = augmented.mean(dim=1, keepdim=True)
-            augmented = gray.repeat(1, 3, 1, 1)
-        if random.random() < 0.3:
-            noise = 0.01 * torch.randn_like(augmented)
-            augmented = augmented + noise
-
-        augmented = self._apply_color_ops(augmented, brightness, contrast, saturation)
-        augmented = augmented.clamp(0.0, 1.0)
-        return (augmented - 0.5) / 0.5
-
-    @staticmethod
-    def _apply_color_ops(
-        frames: torch.Tensor,
-        brightness: float,
-        contrast: float,
-        saturation: float,
-    ) -> torch.Tensor:
-        transformed = frames * brightness
-        mean = transformed.mean(dim=(2, 3), keepdim=True)
-        transformed = (transformed - mean) * contrast + mean
-        gray = transformed.mean(dim=1, keepdim=True)
-        transformed = (transformed - gray) * saturation + gray
-        return transformed
-
-
 class ReacherLatentDynamicsDataset(Dataset):
     def __init__(
         self,
@@ -147,9 +83,8 @@ class ReacherLatentDynamicsDataset(Dataset):
         self.seq_lengths = torch.load(data_dir / "seq_lengths.pth", map_location="cpu").long()
         self.history = int(history)
         self.rollout_steps = int(rollout_steps)
-        self.total_frames = self.history + self.rollout_steps
+        self.total_rollout_frames = self.rollout_steps + 1
         self.total_actions = self.rollout_steps
-        self.augment = SequenceAugment()
         self.cache_episodes = int(cache_episodes)
         self._episode_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
         self.slices: list[tuple[int, int]] = []
@@ -161,7 +96,7 @@ class ReacherLatentDynamicsDataset(Dataset):
 
         for traj_idx in range(len(self.seq_lengths)):
             frame_count = int(self.seq_lengths[traj_idx])
-            max_start = frame_count - self.total_frames
+            max_start = frame_count - self.total_rollout_frames
             for start in range(max_start + 1):
                 self.slices.append((traj_idx, start))
 
@@ -180,14 +115,35 @@ class ReacherLatentDynamicsDataset(Dataset):
             self._episode_cache.popitem(last=False)
         return episode
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int]:
         traj_idx, start = self.slices[idx]
-        stop = start + self.total_frames
-        frames = self._load_episode(traj_idx)[start:stop].clone()
-        action_start = start + self.history - 1
+        context_start = max(0, start - self.history + 1)
+        stop = start + self.total_rollout_frames
+        frames = self._load_episode(traj_idx)[context_start:stop].clone()
+        rollout_start_idx = start - context_start
+        action_start = start
         action_stop = action_start + self.total_actions
         actions = self.actions[traj_idx, action_start:action_stop].clone()
-        return self.augment(frames), self.augment(frames), actions
+        return frames, actions, rollout_start_idx
+
+
+def collate_latent_dynamics_batch(
+    batch: list[tuple[torch.Tensor, torch.Tensor, int]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    frames, actions, rollout_start_indices = zip(*batch)
+    max_frames = max(frame.shape[0] for frame in frames)
+    padded_frames = []
+    for frame in frames:
+        pad_count = max_frames - frame.shape[0]
+        if pad_count > 0:
+            padding = frame[-1:].expand(pad_count, *frame.shape[1:])
+            frame = torch.cat((frame, padding), dim=0)
+        padded_frames.append(frame)
+    return (
+        torch.stack(padded_frames, dim=0),
+        torch.stack(actions, dim=0),
+        torch.tensor(rollout_start_indices, dtype=torch.long),
+    )
 
 
 def make_loader(
@@ -206,6 +162,7 @@ def make_loader(
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "persistent_workers": persistent_workers,
+        "collate_fn": collate_latent_dynamics_batch,
     }
     if persistent_workers:
         loader_kwargs["prefetch_factor"] = prefetch_factor
@@ -224,24 +181,23 @@ def train_epoch(
     amp_enabled: bool,
 ) -> tuple[dict[str, float], int]:
     model.train()
-    running = {"loss": 0.0, "state_loss": 0.0, "dynamics_loss": 0.0, "curvature_loss": 0.0}
+    running = {"loss": 0.0, "dynamics_loss": 0.0, "curvature_loss": 0.0}
     count = 0
 
-    for frames_a, frames_b, actions in tqdm(loader, desc="Train", leave=False):
-        frames_a = frames_a.to(device, non_blocking=True)
-        frames_b = frames_b.to(device, non_blocking=True)
+    for frames, actions, rollout_start_idx in tqdm(loader, desc="Train", leave=False):
+        frames = frames.to(device, non_blocking=True)
         actions = actions.to(device, non_blocking=True)
+        rollout_start_idx = rollout_start_idx.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            outputs = model(frames_a=frames_a, frames_b=frames_b, actions=actions)
+            outputs = model(frames=frames, actions=actions, rollout_start_idx=rollout_start_idx)
 
         scaler.scale(outputs.loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
         running["loss"] += float(outputs.loss.item())
-        running["state_loss"] += float(outputs.state_loss.item())
         running["dynamics_loss"] += float(outputs.dynamics_loss.item())
         running["curvature_loss"] += float(outputs.curvature_loss.item())
         count += 1
@@ -275,7 +231,7 @@ def main() -> None:
     train_loader = make_loader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         prefetch_factor=args.prefetch_factor,
@@ -324,7 +280,7 @@ def main() -> None:
 
         ckpt = {
             "epoch": epoch,
-            "model_architecture": "next_latent_dynamics_v1",
+            "model_architecture": MODEL_ARCHITECTURE,
             "args": vars(args),
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),

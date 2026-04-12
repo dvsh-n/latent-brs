@@ -168,6 +168,38 @@ def make_history_states(frame_latents: torch.Tensor, history: int) -> torch.Tens
     return torch.stack(windows, dim=1)
 
 
+def make_initial_padded_history_states(
+    frame_latents: torch.Tensor,
+    history: int,
+    *,
+    horizon: int | None = None,
+) -> torch.Tensor:
+    if frame_latents.ndim != 3:
+        raise ValueError("frame_latents must have shape [batch, time, latent_dim].")
+    batch, total_frames, latent_dim = frame_latents.shape
+    if history < 1:
+        raise ValueError("history must be positive.")
+    if total_frames < 1:
+        raise ValueError("At least one frame is required to build padded history states.")
+
+    horizon = total_frames - 1 if horizon is None else int(horizon)
+    if horizon < 0:
+        raise ValueError("horizon must be non-negative.")
+    if total_frames < horizon + 1:
+        raise ValueError("Not enough frames to build padded history states for the requested horizon.")
+
+    states = []
+    for end in range(horizon + 1):
+        start = max(0, end - history + 1)
+        window = frame_latents[:, start : end + 1]
+        pad_count = history - window.shape[1]
+        if pad_count > 0:
+            padding = frame_latents[:, :1].expand(batch, pad_count, latent_dim)
+            window = torch.cat((padding, window), dim=1)
+        states.append(window.reshape(batch, history * latent_dim))
+    return torch.stack(states, dim=1)
+
+
 def rollout_dynamics(
     dynamics: nn.Module,
     initial_state: torch.Tensor,
@@ -180,7 +212,8 @@ def rollout_dynamics(
     state = initial_state
     latent_dim = int(dynamics.latent_dim)
     for step in range(actions.shape[1]):
-        next_latent = dynamics(state, actions[:, step])
+        current_latent = state[:, -latent_dim:]
+        next_latent = current_latent + dynamics(state, actions[:, step])
         state = torch.cat((state[:, latent_dim:], next_latent), dim=-1)
         predictions.append(state)
     return torch.stack(predictions, dim=1)
@@ -207,7 +240,6 @@ def curvature_loss(frame_latents: torch.Tensor, eps: float = 1e-8) -> torch.Tens
 @dataclass
 class LatentDynamicsOutput:
     loss: torch.Tensor
-    state_loss: torch.Tensor
     dynamics_loss: torch.Tensor
     curvature_loss: torch.Tensor
     encoded_latents: torch.Tensor
@@ -257,50 +289,58 @@ class LatentDynamicsModel(nn.Module):
 
     def compute_losses(
         self,
-        latents_a: torch.Tensor,
-        latents_b: torch.Tensor,
+        latents: torch.Tensor,
         actions: torch.Tensor,
+        rollout_start_idx: torch.Tensor | None = None,
     ) -> LatentDynamicsOutput:
-        states_a = make_history_states(latents_a, self.history)
-        states_b = make_history_states(latents_b, self.history)
-        initial_a = states_a[:, 0]
-        initial_b = states_b[:, 0]
-        target_a = states_a[:, 1:]
-        target_b = states_b[:, 1:]
+        batch = latents.shape[0]
+        horizon = actions.shape[1]
+        if rollout_start_idx is None:
+            rollout_start_idx = torch.zeros(batch, dtype=torch.long, device=latents.device)
+        else:
+            rollout_start_idx = rollout_start_idx.to(device=latents.device, dtype=torch.long)
+        if rollout_start_idx.shape != (batch,):
+            raise ValueError("rollout_start_idx must have shape [batch].")
 
-        pred_a = rollout_dynamics(self.dynamics, initial_a, actions)
-        pred_b = rollout_dynamics(self.dynamics, initial_b, actions)
-        pred_next_a = pred_a[..., -self.latent_dim :]
-        pred_next_b = pred_b[..., -self.latent_dim :]
-        target_next_a = target_a[..., -self.latent_dim :]
-        target_next_b = target_b[..., -self.latent_dim :]
+        max_state_idx = int(rollout_start_idx.max().item()) + horizon
+        states = make_initial_padded_history_states(latents, self.history, horizon=max_state_idx)
+        batch_idx = torch.arange(batch, device=latents.device)
+        target_offsets = rollout_start_idx[:, None] + torch.arange(1, horizon + 1, device=latents.device)
 
-        state_loss = symmetric_stopgrad_mse(initial_a, initial_b)
-        dyn_loss_a = symmetric_stopgrad_mse(pred_next_a, target_next_b)
-        dyn_loss_b = symmetric_stopgrad_mse(pred_next_b, target_next_a)
-        dynamics_loss = 0.5 * (dyn_loss_a + dyn_loss_b)
+        initial = states[batch_idx, rollout_start_idx]
+        target = states[batch_idx[:, None], target_offsets]
 
-        curvature = latents_a.new_zeros(())
+        pred = rollout_dynamics(self.dynamics, initial, actions)
+        pred_next = pred[..., -self.latent_dim :]
+        target_next = target[..., -self.latent_dim :]
+
+        dynamics_loss = symmetric_stopgrad_mse(pred_next, target_next)
+
+        curvature = latents.new_zeros(())
         if self.curvature_weight > 0.0:
-            curvature = 0.5 * (curvature_loss(latents_a) + curvature_loss(latents_b))
+            rollout_offsets = rollout_start_idx[:, None] + torch.arange(horizon + 1, device=latents.device)
+            rollout_latents = latents[batch_idx[:, None], rollout_offsets]
+            curvature = curvature_loss(rollout_latents)
 
-        total_loss = state_loss + dynamics_loss + self.curvature_weight * curvature
+        total_loss = dynamics_loss + self.curvature_weight * curvature
         return LatentDynamicsOutput(
             loss=total_loss,
-            state_loss=state_loss,
             dynamics_loss=dynamics_loss,
             curvature_loss=curvature,
-            encoded_latents=0.5 * (latents_a + latents_b),
-            predicted_states=0.5 * (pred_a + pred_b),
-            target_states=0.5 * (target_a + target_b),
+            encoded_latents=latents,
+            predicted_states=pred,
+            target_states=target,
         )
 
     def forward(
         self,
-        frames_a: torch.Tensor,
-        frames_b: torch.Tensor,
+        frames: torch.Tensor,
         actions: torch.Tensor,
+        rollout_start_idx: torch.Tensor | None = None,
     ) -> LatentDynamicsOutput:
-        latents_a = self.encode_frames(frames_a)
-        latents_b = self.encode_frames(frames_b)
-        return self.compute_losses(latents_a=latents_a, latents_b=latents_b, actions=actions)
+        latents = self.encode_frames(frames)
+        return self.compute_losses(
+            latents=latents,
+            actions=actions,
+            rollout_start_idx=rollout_start_idx,
+        )

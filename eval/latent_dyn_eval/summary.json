@@ -8,7 +8,7 @@
   "episodes_evaluated": 10,
   "history": 3,
   "latent_dim": 24,
-  "rollout_steps": 48,
+  "rollout_steps": 50,
   "plots_saved": 10,
   "error_csv": "/home/devesh/latent-brs/eval/latent_dyn_eval/rollout_errors_by_step.csv",
   "error_plot": "/home/devesh/latent-brs/eval/latent_dyn_eval/rollout_error_by_step.png"

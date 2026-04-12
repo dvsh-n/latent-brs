@@ -28,12 +28,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from shared.models import LatentDynamicsModel, make_history_states, rollout_dynamics
+from shared.models import LatentDynamicsModel, make_initial_padded_history_states, rollout_dynamics
 
 
 DEFAULT_CHECKPOINT_PATH = REPO_ROOT / "models" / "latent_dyn_reacher_epoch_1.pt"
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "test_data" / "preprocessed"
 DEFAULT_OUT_DIR = REPO_ROOT / "eval" / "latent_dyn_eval"
+MODEL_ARCHITECTURE = "residual_next_latent_dynamics_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +79,13 @@ def load_checkpoint(path: Path) -> dict:
 
 def build_model(checkpoint: dict, device: torch.device) -> LatentDynamicsModel:
     ckpt_args = checkpoint.get("args", {})
+    checkpoint_architecture = checkpoint.get("model_architecture")
+    if checkpoint_architecture != MODEL_ARCHITECTURE:
+        raise RuntimeError(
+            f"Checkpoint architecture {checkpoint_architecture!r} is incompatible with "
+            f"{MODEL_ARCHITECTURE!r}. Retrain with train/latent_dyn_train.py before evaluating this model."
+        )
+
     model = LatentDynamicsModel(
         latent_dim=int(ckpt_args.get("latent_dim", 24)),
         history=int(ckpt_args.get("history", 3)),
@@ -92,7 +100,7 @@ def build_model(checkpoint: dict, device: torch.device) -> LatentDynamicsModel:
         model.load_state_dict(checkpoint["model_state_dict"])
     except RuntimeError:
         raise RuntimeError(
-            "Checkpoint is incompatible with the current next-latent dynamics architecture. "
+            "Checkpoint is incompatible with the current residual next-latent dynamics architecture. "
             "Retrain with train/latent_dyn_train.py before evaluating this model."
         ) from None
     model.eval()
@@ -128,8 +136,8 @@ def rollout_episode(
     amp_enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     history = model.history
-    if seq_len <= history:
-        raise ValueError(f"seq_len={seq_len} must be greater than history={history}.")
+    if seq_len < 2:
+        raise ValueError(f"seq_len={seq_len} must include at least two frames.")
 
     latents = encode_episode(
         model,
@@ -138,17 +146,22 @@ def rollout_episode(
         frame_batch_size=frame_batch_size,
         amp_enabled=amp_enabled,
     )
-    initial_state = latents[:history].reshape(1, -1)
-    rollout_actions = actions[history - 1 : seq_len - 1].unsqueeze(0).to(device, non_blocking=True)
+    initial_latents = latents[:1].expand(history, -1)
+    initial_state = initial_latents.reshape(1, -1)
+    rollout_actions = actions[: seq_len - 1].unsqueeze(0).to(device, non_blocking=True)
+    target_states = make_initial_padded_history_states(
+        latents.unsqueeze(0),
+        history,
+        horizon=rollout_actions.shape[1],
+    )[:, 1:]
 
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
         pred_states = rollout_dynamics(model.dynamics, initial_state, rollout_actions)
 
-    target_states = make_history_states(latents.unsqueeze(0), history)[:, 1:]
     latent_dim = latents.shape[-1]
     pred_next_latents = pred_states.reshape(1, -1, history, latent_dim)[0, :, -1]
-    true_next_latents = latents[history:seq_len]
-    return latents[:history], true_next_latents, pred_next_latents, target_states[0], pred_states[0]
+    true_next_latents = latents[1:seq_len]
+    return latents[:1], true_next_latents, pred_next_latents, target_states[0], pred_states[0]
 
 
 def update_error_stats(
@@ -182,7 +195,7 @@ def update_error_stats(
         row["state_sumsq"] += state_value * state_value
 
 
-def summarize_errors(stats: list[dict[str, float]], history: int) -> list[dict[str, float]]:
+def summarize_errors(stats: list[dict[str, float]]) -> list[dict[str, float]]:
     rows = []
     for step_idx, row in enumerate(stats):
         count = max(row["count"], 1.0)
@@ -193,7 +206,7 @@ def summarize_errors(stats: list[dict[str, float]], history: int) -> list[dict[s
         rows.append(
             {
                 "rollout_step": step_idx + 1,
-                "frame_index": history + step_idx,
+                "frame_index": step_idx + 1,
                 "count": int(row["count"]),
                 "latent_rmse_mean": latent_mean,
                 "latent_rmse_std": math.sqrt(latent_var),
@@ -257,16 +270,15 @@ def plot_error_curves(rows: list[dict[str, float]], path: Path) -> None:
 
 
 def plot_latent_rollout(
-    initial_latents: torch.Tensor,
+    initial_latent: torch.Tensor,
     true_next: torch.Tensor,
     pred_next: torch.Tensor,
     *,
     episode_idx: int,
-    history: int,
     path: Path,
 ) -> None:
-    true_latents = torch.cat((initial_latents, true_next), dim=0)
-    pred_latents = torch.cat((initial_latents, pred_next), dim=0)
+    true_latents = torch.cat((initial_latent, true_next), dim=0)
+    pred_latents = torch.cat((initial_latent, pred_next), dim=0)
     true_np = true_latents.detach().float().cpu().numpy()
     pred_np = pred_latents.detach().float().cpu().numpy()
     rollout_steps, latent_dim = true_np.shape
@@ -280,14 +292,13 @@ def plot_latent_rollout(
         ax = flat_axes[dim]
         ax.plot(x, true_np[:, dim], label="true", color="#0072B2", linewidth=1.3)
         ax.plot(x, pred_np[:, dim], label="pred", color="#D55E00", linewidth=1.1, linestyle="--")
-        ax.axvline(history - 0.5, color="#666666", linewidth=0.8, alpha=0.5)
         ax.set_title(f"z[{dim}]")
         ax.grid(True, alpha=0.25)
     for ax in flat_axes[latent_dim:]:
         ax.axis("off")
 
     flat_axes[0].legend(loc="best")
-    fig.supxlabel("frame index; prediction starts after the vertical line")
+    fig.supxlabel("frame index")
     fig.supylabel("latent value")
     fig.suptitle(f"Episode {episode_idx:05d}: true encoding vs predicted rollout")
     fig.tight_layout()
@@ -338,7 +349,7 @@ def main() -> None:
         if not frame_path.is_file():
             raise FileNotFoundError(f"Missing preprocessed episode: {frame_path}")
         frames = torch.load(frame_path, map_location="cpu", weights_only=False).float()
-        initial_latents, true_next, pred_next, target_states, pred_states = rollout_episode(
+        initial_latent, true_next, pred_next, target_states, pred_states = rollout_episode(
             model,
             frames,
             actions[episode_idx],
@@ -351,16 +362,15 @@ def main() -> None:
 
         if not args.no_plots and plotted < plot_episodes:
             plot_latent_rollout(
-                initial_latents,
+                initial_latent,
                 true_next,
                 pred_next,
                 episode_idx=episode_idx,
-                history=history,
                 path=out_dir / f"latent_rollout_episode_{episode_idx:05d}.png",
             )
             plotted += 1
 
-    rows = summarize_errors(stats, history)
+    rows = summarize_errors(stats)
     save_error_csv(rows, out_dir / "rollout_errors_by_step.csv")
     if not args.no_plots:
         plot_error_curves(rows, out_dir / "rollout_error_by_step.png")
