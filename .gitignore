@@ -8,7 +8,7 @@ latent_brs.egg-info/
 *.pt
 *.pth
 *.h5
-models/lewm_reacher_*/
+models/lewm_reacher*/
 *.json
 *.mp4
 *.png

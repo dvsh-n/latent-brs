@@ -27,8 +27,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from train.lewm_train import LeWMReacherDataset
 
-DEFAULT_DATASET_PATH = "data/test_data/reacher_expert_test.h5"
-DEFAULT_CHECKPOINT = "models/lewm_reacher/lewm_epoch_30_object.ckpt"
+DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
+DEFAULT_CHECKPOINT = "models/lewm_reacher_40D/lewm_epoch_30_object.ckpt"
 DEFAULT_OUT_DIR = "eval/lewm_eval"
 
 
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--episode-idx", type=int, default=None)
+    parser.add_argument("--episode-idx", type=int, default=9387)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--history-size", type=int, default=3)
     parser.add_argument("--num-preds", type=int, default=1)
