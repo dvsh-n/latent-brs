@@ -693,3 +693,109 @@ class LatentDynamicsModel(nn.Module):
             actions=actions,
             rollout_start_idx=rollout_start_idx,
         )
+
+
+def create_koopman_mlp(
+    input_dim: int,
+    output_dim: int,
+    hidden_width: int,
+    depth: int,
+    activation_fn: type[nn.Module] | str = nn.ReLU,
+) -> nn.Sequential:
+    if isinstance(activation_fn, str):
+        activations = {
+            "relu": nn.ReLU,
+            "gelu": nn.GELU,
+            "tanh": nn.Tanh,
+        }
+        activation_fn = activations[activation_fn.lower()]
+
+    if depth == 0:
+        return nn.Sequential(nn.Linear(input_dim, output_dim))
+
+    layers: list[nn.Module] = [nn.Linear(input_dim, hidden_width), activation_fn()]
+    for _ in range(depth - 1):
+        layers.extend([nn.Linear(hidden_width, hidden_width), activation_fn()])
+    layers.append(nn.Linear(hidden_width, output_dim))
+    return nn.Sequential(*layers)
+
+
+class KoopmanEncoder(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int,
+        hidden_width: int,
+        depth: int,
+        activation_fn: type[nn.Module] | str,
+    ) -> None:
+        super().__init__()
+        self.net = create_koopman_mlp(input_dim, latent_dim, hidden_width, depth, activation_fn)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class HistoryDeepKoopmanNoDec(nn.Module):
+    """Decoder-free Koopman model with lifted state z = [x_t, enc(history)]."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        control_dim: int,
+        embedding_dim: int,
+        hidden_width: int,
+        depth: int,
+        activation_fn: type[nn.Module] | str,
+        history: int = 3,
+    ) -> None:
+        super().__init__()
+        if history < 1:
+            raise ValueError("history must be at least 1.")
+
+        self.state_dim = int(state_dim)
+        self.control_dim = int(control_dim)
+        self.embedding_dim = int(embedding_dim)
+        self.history = int(history)
+        self.history_dim = self.history * self.state_dim
+        self.latent_dim = self.state_dim + self.embedding_dim
+
+        self.encoder = KoopmanEncoder(self.history_dim, embedding_dim, hidden_width, depth, activation_fn)
+        self.A = nn.Linear(self.latent_dim, self.latent_dim, bias=False)
+        self.B = nn.Linear(control_dim, self.latent_dim, bias=False)
+
+    def lift_state(self, history: torch.Tensor) -> torch.Tensor:
+        """Lift chronological history [x_{t-h+1}, ..., x_t] into Koopman coordinates."""
+        current_state = history[..., -self.state_dim :]
+        return torch.cat([current_state, self.encoder(history)], dim=-1)
+
+    def forward(
+        self,
+        history_k: torch.Tensor,
+        u_seq: torch.Tensor,
+        history_next_seq: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        history_k: [B, H * STATE_DIM] chronological history ending at x_t
+        u_seq: [B, M, CONTROL_DIM] actions a_t ... a_{t+M-1}
+        history_next_seq: [B, M, H * STATE_DIM] histories ending at x_{t+1} ... x_{t+M}
+        """
+        batch, horizon = u_seq.shape[:2]
+
+        z_k = self.lift_state(history_k)
+
+        history_next_flat = history_next_seq.reshape(batch * horizon, self.history_dim)
+        z_target_seq_flat = self.lift_state(history_next_flat)
+        z_target_seq = z_target_seq_flat.reshape(batch, horizon, self.latent_dim)
+
+        z_pred_list = []
+        z_current_pred = z_k
+        for step in range(horizon):
+            u_i = u_seq[:, step, :]
+            z_next_pred = self.A(z_current_pred) + self.B(u_i)
+            z_pred_list.append(z_next_pred)
+            z_current_pred = z_next_pred
+
+        z_pred_seq = torch.stack(z_pred_list, dim=1)
+        x_pred_seq = z_pred_seq[..., : self.state_dim]
+        return z_pred_seq, x_pred_seq, z_target_seq
