@@ -22,9 +22,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-DATA_PATH = REPO_ROOT / "data" / "expert_data" / "latent_traj_lewm_reacher_24D.pt"
-MODEL_SAVE_PATH = REPO_ROOT / "test" / "mlp_lewm_reacher_24D.pt"
-LOG_DIR = REPO_ROOT / "test" / "runs" / "mlp_lewm_reacher_24D"
+DATA_PATH = REPO_ROOT / "data" / "expert_data" / "latent_traj_lewm_reacher_mlp.pt"
+MODEL_SAVE_PATH = REPO_ROOT / "test" / "mlp_lewm_reacher_mlp.pt"
+LOG_DIR = REPO_ROOT / "test" / "runs" / "mlp_lewm_reacher_mlp"
 
 STATE_DIM = 24
 ACTION_DIM = 2

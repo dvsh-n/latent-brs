@@ -27,8 +27,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from train.lewm_train_mlp import LeWMReacherDataset
 
-DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
-DEFAULT_CHECKPOINT = "models/lewm_reacher_mlp/lewm_epoch_50_object.ckpt"
+DEFAULT_DATASET_PATH = "data/test_data/reacher_expert_test.h5"
+DEFAULT_CHECKPOINT = "models/lewm_reacher/lewm_epoch_50_object.ckpt"
 DEFAULT_OUT_DIR = "eval/lewm_mlp_eval"
 
 
