@@ -252,6 +252,61 @@ class ARPredictor(nn.Module):
         return self.transformer(x, c)
 
 
+class MLPDynamicsPredictor(nn.Module):
+    """Predict future embeddings from flattened embedding and action history."""
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        action_dim: int,
+        history_size: int,
+        num_preds: int = 1,
+        hidden_width: int = 1024,
+        depth: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if history_size < 1:
+            raise ValueError("history_size must be positive.")
+        if num_preds < 1:
+            raise ValueError("num_preds must be positive.")
+        if depth < 1:
+            raise ValueError("depth must be at least 1.")
+
+        self.embed_dim = int(embed_dim)
+        self.action_dim = int(action_dim)
+        self.history_size = int(history_size)
+        self.num_preds = int(num_preds)
+        input_dim = self.history_size * (self.embed_dim + self.action_dim)
+
+        layers: list[nn.Module] = []
+        current_dim = input_dim
+        for _ in range(depth):
+            layers.append(nn.Linear(current_dim, hidden_width))
+            layers.append(nn.GELU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            current_dim = hidden_width
+        layers.append(nn.Linear(current_dim, self.num_preds * self.embed_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, emb: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        if emb.ndim != 3:
+            raise ValueError(f"Expected emb with shape [batch, history, dim], got {emb.shape}.")
+        if action.ndim != 3:
+            raise ValueError(f"Expected action with shape [batch, history, dim], got {action.shape}.")
+        if emb.shape[1] != self.history_size or action.shape[1] != self.history_size:
+            raise ValueError(
+                "History length mismatch: "
+                f"emb={emb.shape[1]}, action={action.shape[1]}, expected={self.history_size}."
+            )
+
+        x = torch.cat((emb.flatten(1), action.flatten(1)), dim=-1)
+        pred = self.net(x)
+        return pred.reshape(emb.shape[0], self.num_preds, self.embed_dim)
+
+
 class JEPA(nn.Module):
     """LE-WM joint-embedding predictive architecture."""
 

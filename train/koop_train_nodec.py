@@ -23,23 +23,25 @@ from shared.models import HistoryDeepKoopmanNoDec
 
 
 DATA_PATH = "data/expert_data/latent_traj_lewm_reacher_24D.pt"
-MODEL_SAVE_PATH = "models/koop_lewm_reacher_24D_nodec.pt"
+MODEL_SAVE_PATH = "models/koop_lewm_reacher_24D_nodec_actemb.pt"
 LOG_DIR = "runs/koop_lewm_reacher_24D_nodec"
+LEWM_CHECKPOINT = "models/lewm_reacher_24D/lewm_epoch_50_object.ckpt"
 
 STATE_DIM = 24
 CONTROL_DIM = 2
-EMBEDDING_DIM = 128
+ACTION_ENCODER = True
+EMBEDDING_DIM = 600
 HISTORY = 3
-HIDDEN_WIDTH = 1024
+HIDDEN_WIDTH = 4096
 HIDDEN_DEPTH = 3
 ACTIVATION_FN = nn.GELU
 
 LEARNING_RATE = 1e-4
 MIN_LEARNING_RATE = 1e-7
 WEIGHT_DECAY = 1e-6
-EPOCHS = 500
+EPOCHS = 50
 BATCH_SIZE = 4096
-MULTI_STEP_HORIZON = 25
+MULTI_STEP_HORIZON = 35
 NUM_WORKERS = 20
 PREFETCH_FACTOR = 4
 
@@ -75,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_dir", type=str, default=LOG_DIR)
     parser.add_argument("--state_dim", type=int, default=STATE_DIM)
     parser.add_argument("--control_dim", type=int, default=CONTROL_DIM)
+    parser.add_argument("--action_encoder", action=argparse.BooleanOptionalAction, default=ACTION_ENCODER)
+    parser.add_argument("--lewm_checkpoint", type=str, default=LEWM_CHECKPOINT)
     parser.add_argument("--embedding_dim", type=int, default=EMBEDDING_DIM)
     parser.add_argument("--history", type=int, default=HISTORY)
     parser.add_argument("--hidden_width", type=int, default=HIDDEN_WIDTH)
@@ -170,6 +174,38 @@ class LeWMLatentKoopmanDataset(Dataset):
         return history_k, u_seq, x_kp1_seq, history_kp1_seq
 
 
+def load_lewm_action_encoder(checkpoint_path: Path, device: torch.device) -> nn.Module:
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"LE-WM checkpoint not found: {checkpoint_path}")
+    lewm_model = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    action_encoder = lewm_model.action_encoder.to(device)
+    action_encoder.eval()
+    action_encoder.requires_grad_(False)
+    return action_encoder
+
+
+def encode_action_sequences(
+    actions: torch.Tensor,
+    action_encoder: nn.Module,
+    device: torch.device,
+    *,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = actions.reshape(-1, actions.shape[-1])
+    finite_mask = torch.isfinite(flat).all(dim=-1)
+    finite_actions = flat[finite_mask]
+    action_mean = finite_actions.mean(dim=0)
+    action_std = finite_actions.std(dim=0, unbiased=False).clamp_min(1e-6)
+
+    normalized_actions = (torch.nan_to_num(actions, nan=0.0) - action_mean) / action_std
+    encoded_chunks: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, normalized_actions.shape[0], batch_size):
+            chunk = normalized_actions[start : start + batch_size].to(device, non_blocking=device.type == "cuda")
+            encoded_chunks.append(action_encoder(chunk).cpu())
+    return torch.cat(encoded_chunks, dim=0), action_mean, action_std
+
+
 def train(args: argparse.Namespace) -> None:
     data_path = Path(args.data_path)
     model_save_path = get_unique_path(Path(args.model_save_path))
@@ -188,6 +224,20 @@ def train(args: argparse.Namespace) -> None:
         multi_step_horizon=args.multi_step_horizon,
         history=args.history,
     )
+
+    action_mean = None
+    action_std = None
+    action_encoder_path = None
+    if args.action_encoder:
+        action_encoder_path = Path(args.lewm_checkpoint)
+        action_encoder = load_lewm_action_encoder(action_encoder_path, device)
+        dataset.actions, action_mean, action_std = encode_action_sequences(
+            dataset.actions,
+            action_encoder,
+            device,
+            batch_size=args.batch_size,
+        )
+
     loader_kwargs = {
         "batch_size": args.batch_size,
         "shuffle": True,
@@ -201,7 +251,7 @@ def train(args: argparse.Namespace) -> None:
 
     model_config = {
         "state_dim": args.state_dim,
-        "control_dim": args.control_dim,
+        "control_dim": int(dataset.actions.shape[-1]),
         "embedding_dim": args.embedding_dim,
         "hidden_width": args.hidden_width,
         "depth": args.hidden_depth,
@@ -247,6 +297,11 @@ def train(args: argparse.Namespace) -> None:
         "num_workers": args.num_workers,
         "prefetch_factor": args.prefetch_factor if args.num_workers > 0 else None,
         "uses_precomputed_history": dataset.uses_precomputed_history,
+        "action_encoder": args.action_encoder,
+        "action_encoder_path": str(action_encoder_path) if action_encoder_path is not None else None,
+        "raw_action_dim": args.control_dim,
+        "action_mean": action_mean.tolist() if action_mean is not None else None,
+        "action_std": action_std.tolist() if action_std is not None else None,
     }
     print_config(training_config, title="Training Configuration")
 

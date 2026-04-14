@@ -26,10 +26,12 @@ from shared.models import HistoryDeepKoopmanNoDec
 
 
 DATA_PATH = "data/expert_data/latent_traj_lewm_reacher_24D.pt"
-MODEL_SAVE_PATH = "models/koop_lewm_reacher_24D_nodec_1.pt"
+MODEL_SAVE_PATH = "models/koop_lewm_reacher_24D_nodec_actemb_2.pt"
 PLOT_SAVE_DIR = "eval/koop_eval_nodec"
+LEWM_CHECKPOINT = "models/lewm_reacher_24D/lewm_epoch_50_object.ckpt"
 N_EVAL_EPISODES = 25
 MAX_TIMESTEP = 50
+START_TIME = 2
 PURE_LATENT_ROLLOUT = True
 OVERALL_RMSE_STEPS = [1, 10, 25, 50]
 
@@ -41,6 +43,12 @@ def parse_eval_args() -> argparse.Namespace:
     parser.add_argument("--plot_save_dir", type=str, default=PLOT_SAVE_DIR)
     parser.add_argument("--n_eval_episodes", type=int, default=N_EVAL_EPISODES)
     parser.add_argument("--max_timestep", type=int, default=MAX_TIMESTEP)
+    parser.add_argument(
+        "--start_time",
+        type=int,
+        default=START_TIME,
+        help="Episode time index to start rollouts from. Use history-1 for unrepeated initial history.",
+    )
     parser.add_argument(
         "--pure_latent_rollout",
         action=argparse.BooleanOptionalAction,
@@ -136,12 +144,46 @@ class LeWMLatentKoopmanEvalDataset:
     def __len__(self) -> int:
         return int(self.latents.shape[0])
 
-    def get_raw_episode(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def action_stats(self) -> tuple[torch.Tensor, torch.Tensor]:
+        flat = self.actions.reshape(-1, self.actions.shape[-1])
+        finite_actions = flat[torch.isfinite(flat).all(dim=-1)]
+        action_mean = finite_actions.mean(dim=0)
+        action_std = finite_actions.std(dim=0, unbiased=False).clamp_min(1e-6)
+        return action_mean, action_std
+
+    def get_raw_episode(self, idx: int, start_time: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         length = int(self.ep_len[idx].item())
-        latents = self.latents[idx, :length]
-        actions = self.actions[idx, : max(length - 1, 0)]
-        history0 = self.history_states[idx, 0]
+        if not 0 <= start_time < length:
+            raise ValueError(f"start_time={start_time} is outside episode {idx} length {length}.")
+        latents = self.latents[idx, start_time:length]
+        actions = self.actions[idx, start_time : max(length - 1, 0)]
+        history0 = self.history_states[idx, start_time]
         return latents, actions, history0
+
+
+def load_lewm_action_encoder(checkpoint_path: Path, device: torch.device) -> nn.Module:
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"LE-WM checkpoint not found: {checkpoint_path}")
+    lewm_model = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    action_encoder = lewm_model.action_encoder.to(device)
+    action_encoder.eval()
+    action_encoder.requires_grad_(False)
+    return action_encoder
+
+
+@torch.no_grad()
+def encode_actions(
+    actions: torch.Tensor,
+    action_encoder: nn.Module,
+    action_mean: torch.Tensor,
+    action_std: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    action_mean = action_mean.to(actions.device)
+    action_std = action_std.to(actions.device)
+    normalized = (torch.nan_to_num(actions, nan=0.0) - action_mean) / action_std
+    encoded = action_encoder(normalized.unsqueeze(0).to(device))
+    return encoded.squeeze(0).cpu()
 
 
 @torch.no_grad()
@@ -253,6 +295,7 @@ def evaluate(
     plot_save_dir_arg: str | None = None,
     n_eval_episodes: int = N_EVAL_EPISODES,
     max_timestep: int | None = MAX_TIMESTEP,
+    start_time: int = START_TIME,
     pure_latent_rollout: bool = PURE_LATENT_ROLLOUT,
 ) -> None:
     data_path = Path(data_path_arg or DATA_PATH)
@@ -264,9 +307,35 @@ def evaluate(
         raise FileNotFoundError(f"Model file not found: {model_save_path}")
     if not data_path.is_file():
         raise FileNotFoundError(f"Data file not found: {data_path}")
+    if start_time < 0:
+        raise ValueError("--start_time must be non-negative.")
 
     model, model_config, training_config = load_model(model_save_path, device)
     dataset = LeWMLatentKoopmanEvalDataset(data_path, history=model.history)
+    if "action_encoder" in training_config:
+        use_action_encoder = bool(training_config["action_encoder"])
+    else:
+        use_action_encoder = model.control_dim != dataset.actions.shape[-1]
+    action_encoder = None
+    action_mean = None
+    action_std = None
+    if use_action_encoder:
+        action_encoder_path = Path(
+            training_config.get("action_encoder_path")
+            or LEWM_CHECKPOINT
+        )
+        action_encoder = load_lewm_action_encoder(action_encoder_path, device)
+        if training_config.get("action_mean") is not None and training_config.get("action_std") is not None:
+            action_mean = torch.tensor(training_config["action_mean"], dtype=torch.float32)
+            action_std = torch.tensor(training_config["action_std"], dtype=torch.float32)
+        else:
+            action_mean, action_std = dataset.action_stats()
+
+    if start_time < model.history - 1:
+        print(
+            f"WARNING: start_time={start_time} is before history-1={model.history - 1}; "
+            "the initial history still contains repeated boundary latents."
+        )
 
     printable_model_config = model_config.copy()
     if isinstance(printable_model_config.get("activation_fn"), type):
@@ -281,10 +350,14 @@ def evaluate(
 
     pbar = tqdm(range(n_eval_episodes), desc="Evaluating episodes")
     for ep_id in pbar:
-        x_traj, u, history0 = dataset.get_raw_episode(ep_id)
+        x_traj, u, history0 = dataset.get_raw_episode(ep_id, start_time)
         if max_timestep is not None and max_timestep > 0:
             u = u[:max_timestep]
             x_traj = x_traj[: max_timestep + 1]
+        if action_encoder is not None:
+            u = encode_actions(u, action_encoder, action_mean, action_std, device)
+        if u.shape[-1] != model.control_dim:
+            raise ValueError(f"Control dim mismatch: rollout actions have dim {u.shape[-1]}, model expects {model.control_dim}.")
 
         if pure_latent_rollout:
             x_hat_traj = rollout_latent(model, history0, u, device)
@@ -328,5 +401,6 @@ if __name__ == "__main__":
         plot_save_dir_arg=args.plot_save_dir,
         n_eval_episodes=args.n_eval_episodes,
         max_timestep=args.max_timestep,
+        start_time=args.start_time,
         pure_latent_rollout=args.pure_latent_rollout,
     )
