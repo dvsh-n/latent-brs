@@ -260,6 +260,9 @@ def make_loader(dataset: Dataset, args: argparse.Namespace, *, shuffle: bool, dr
 
 
 def main() -> None:
+    import torch.multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
+
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
 

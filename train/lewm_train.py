@@ -9,6 +9,7 @@ import os
 import sys
 from functools import partial
 from pathlib import Path
+import hdf5plugin
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -28,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 from shared.models import ARPredictor, Embedder, JEPA, MLP, SIGReg
 
 
-DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
+DEFAULT_DATASET_PATH = "data/reacher.h5"
 DEFAULT_RUN_DIR = "models/lewm_reacher"
 
 
@@ -269,6 +270,9 @@ def make_loader(dataset: Dataset, args: argparse.Namespace, *, shuffle: bool, dr
 
 
 def main() -> None:
+    import torch.multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
+
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
 
