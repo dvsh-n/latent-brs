@@ -125,6 +125,7 @@ class LeWMReacherDataset(Dataset):
                 self.samples.append((ep_idx, start))
         if not self.samples:
             raise ValueError("No valid training windows found. Check frameskip/history/num_preds.")
+        self.num_valid_episodes = len({ep_idx for ep_idx, _ in self.samples})
 
         self.pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
         self.pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
@@ -285,8 +286,13 @@ def main() -> None:
         img_size=args.img_size,
         action_dim=args.action_dim,
     )
+    if len(dataset) < 2:
+        raise ValueError(f"Need at least 2 valid training windows for train/val splitting, got {len(dataset)}.")
     train_len = int(len(dataset) * args.train_split)
     val_len = len(dataset) - train_len
+    if train_len < 1:
+        train_len = 1
+        val_len = len(dataset) - train_len
     generator = torch.Generator().manual_seed(args.seed)
     train_set, val_set = random_split(dataset, [train_len, val_len], generator=generator)
 

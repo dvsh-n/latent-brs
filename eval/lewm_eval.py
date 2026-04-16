@@ -84,7 +84,26 @@ def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -
     for key, fallback in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, config.get(key, fallback))
-            
+
+
+def require_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        device_arg = "cuda" if torch.cuda.is_available() else "cpu"
+    if device_arg.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+    return torch.device(device_arg)
+
+
+def valid_episode_indices(dataset_path: Path, *, args: argparse.Namespace) -> np.ndarray:
+    with h5py.File(dataset_path, "r") as h5:
+        ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
+    num_steps = int(args.history_size) + int(args.num_preds)
+    required_last_frame_offset = (num_steps - 1) * int(args.frameskip)
+    action_start_step = 0 if args.action_history else int(args.history_size) - 1
+    action_steps = int(args.history_size) if args.action_history else 1
+    required_action_end_offset = (action_start_step + action_steps) * int(args.frameskip)
+    required_offset = max(required_last_frame_offset, required_action_end_offset)
+    return np.flatnonzero(ep_len - 1 - required_offset >= 0)
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
@@ -270,14 +289,22 @@ def main() -> None:
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = args.device
+    device = require_device(args.device)
+    valid_episodes = valid_episode_indices(dataset_path, args=args)
     with h5py.File(dataset_path, "r") as h5:
         num_episodes = int(h5["ep_len"].shape[0])
+    if valid_episodes.size == 0:
+        raise ValueError("No episodes are long enough for the requested history/num_preds/frameskip settings.")
     episode_idx = args.episode_idx
     if episode_idx is None:
-        episode_idx = int(np.random.default_rng().integers(num_episodes))
+        episode_idx = int(np.random.default_rng().choice(valid_episodes))
     if not 0 <= episode_idx < num_episodes:
         raise IndexError(f"episode_idx {episode_idx} is out of range [0, {num_episodes}).")
+    if episode_idx not in set(valid_episodes.tolist()):
+        raise ValueError(
+            f"episode_idx {episode_idx} is too short for history_size={args.history_size}, "
+            f"num_preds={args.num_preds}, frameskip={args.frameskip}."
+        )
 
     model = load_model(checkpoint_path, device)
     pixels, actions = load_episode(dataset_path, episode_idx, args=args)
