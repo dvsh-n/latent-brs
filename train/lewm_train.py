@@ -38,13 +38,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--output-model-name", default="lewm")
     parser.add_argument("--seed", type=int, default=3072)
-    parser.add_argument("--train-split", type=float, default=0.9)
+    parser.add_argument("--train-split", type=float, default=0.95)
 
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=24)
     parser.add_argument("--history-size", type=int, default=3)
+    parser.add_argument("--action-history", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--num-preds", type=int, default=1)
     parser.add_argument("--frameskip", type=int, default=1)
     parser.add_argument("--action-dim", type=int, default=2)
@@ -80,6 +81,7 @@ class LeWMReacherDataset(Dataset):
         dataset_path: Path,
         *,
         history_size: int,
+        action_history: bool = True,
         num_preds: int,
         frameskip: int,
         img_size: int,
@@ -87,6 +89,8 @@ class LeWMReacherDataset(Dataset):
     ) -> None:
         self.dataset_path = dataset_path
         self.history_size = int(history_size)
+        self.action_history = bool(action_history)
+        self.action_steps = self.history_size if self.action_history else 1
         self.num_preds = int(num_preds)
         self.frameskip = int(frameskip)
         self.num_steps = self.history_size + self.num_preds
@@ -115,7 +119,8 @@ class LeWMReacherDataset(Dataset):
 
         self.samples: list[tuple[int, int]] = []
         required_last_frame_offset = (self.num_steps - 1) * self.frameskip
-        required_action_end_offset = self.history_size * self.frameskip
+        action_start_step = 0 if self.action_history else self.history_size - 1
+        required_action_end_offset = (action_start_step + self.action_steps) * self.frameskip
         required_offset = max(required_last_frame_offset, required_action_end_offset)
         for ep_idx, ep_len in enumerate(self.ep_len.tolist()):
             max_start = ep_len - 1 - required_offset
@@ -149,7 +154,8 @@ class LeWMReacherDataset(Dataset):
         pixels = (pixels - self.pixel_mean) / self.pixel_std
 
         action_blocks = []
-        for step in range(self.history_size):
+        first_action_step = 0 if self.action_history else self.history_size - 1
+        for step in range(first_action_step, first_action_step + self.action_steps):
             action_start = base + step * self.frameskip
             action_stop = action_start + self.frameskip
             block = np.asarray(h5["action"][action_start:action_stop], dtype=np.float32)
@@ -204,11 +210,21 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     emb = output["emb"]
     act_emb = output["act_emb"]
     ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
-    tgt_emb = emb[:, n_preds:]
+    ctx_act = act_emb[:, :ctx_len] if args.action_history else act_emb
     pred_emb = self.model.predict(ctx_emb, ctx_act)
 
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+    if args.action_history:
+        tgt_emb = emb[:, n_preds:]
+        pred_for_loss = pred_emb
+    else:
+        if n_preds > pred_emb.shape[1]:
+            raise ValueError(
+                f"num_preds={n_preds} cannot exceed history_size={pred_emb.shape[1]} when action_history=False."
+            )
+        tgt_emb = emb[:, ctx_len : ctx_len + n_preds]
+        pred_for_loss = pred_emb[:, -n_preds:]
+
+    output["pred_loss"] = (pred_for_loss - tgt_emb).pow(2).mean()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
@@ -281,6 +297,7 @@ def main() -> None:
     dataset = LeWMReacherDataset(
         dataset_path,
         history_size=args.history_size,
+        action_history=args.action_history,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,

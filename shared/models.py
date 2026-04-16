@@ -261,6 +261,7 @@ class MLPDynamicsPredictor(nn.Module):
         embed_dim: int,
         action_dim: int,
         history_size: int,
+        action_history_size: int | None = None,
         num_preds: int = 1,
         hidden_width: int = 1024,
         depth: int = 4,
@@ -269,6 +270,8 @@ class MLPDynamicsPredictor(nn.Module):
         super().__init__()
         if history_size < 1:
             raise ValueError("history_size must be positive.")
+        if action_history_size is not None and action_history_size < 1:
+            raise ValueError("action_history_size must be positive.")
         if num_preds < 1:
             raise ValueError("num_preds must be positive.")
         if depth < 1:
@@ -277,8 +280,9 @@ class MLPDynamicsPredictor(nn.Module):
         self.embed_dim = int(embed_dim)
         self.action_dim = int(action_dim)
         self.history_size = int(history_size)
+        self.action_history_size = int(action_history_size or history_size)
         self.num_preds = int(num_preds)
-        input_dim = self.history_size * (self.embed_dim + self.action_dim)
+        input_dim = self.history_size * self.embed_dim + self.action_history_size * self.action_dim
 
         layers: list[nn.Module] = []
         current_dim = input_dim
@@ -295,11 +299,12 @@ class MLPDynamicsPredictor(nn.Module):
         if emb.ndim != 3:
             raise ValueError(f"Expected emb with shape [batch, history, dim], got {emb.shape}.")
         if action.ndim != 3:
-            raise ValueError(f"Expected action with shape [batch, history, dim], got {action.shape}.")
-        if emb.shape[1] != self.history_size or action.shape[1] != self.history_size:
+            raise ValueError(f"Expected action with shape [batch, action_history, dim], got {action.shape}.")
+        if emb.shape[1] != self.history_size or action.shape[1] != self.action_history_size:
             raise ValueError(
                 "History length mismatch: "
-                f"emb={emb.shape[1]}, action={action.shape[1]}, expected={self.history_size}."
+                f"emb={emb.shape[1]}, expected_emb={self.history_size}, "
+                f"action={action.shape[1]}, expected_action={self.action_history_size}."
             )
 
         x = torch.cat((emb.flatten(1), action.flatten(1)), dim=-1)

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -28,25 +29,61 @@ if str(REPO_ROOT) not in sys.path:
 from train.lewm_train_mlp import LeWMReacherDataset
 
 DEFAULT_DATASET_PATH = "data/test_data/reacher_expert_test.h5"
-DEFAULT_CHECKPOINT = "models/lewm_reacher/lewm_epoch_50_object.ckpt"
+DEFAULT_MODEL_DIR = "models/lewm_reacher_mlp"
 DEFAULT_OUT_DIR = "eval/lewm_mlp_eval"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--model-dir", type=Path, default=None)
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--episode-idx", type=int, default=None)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--history-size", type=int, default=3)
-    parser.add_argument("--num-preds", type=int, default=1)
-    parser.add_argument("--frameskip", type=int, default=1)
-    parser.add_argument("--img-size", type=int, default=224)
-    parser.add_argument("--action-dim", type=int, default=2)
+    parser.add_argument("--history-size", type=int, default=None)
+    parser.add_argument("--action-history", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--num-preds", type=int, default=None)
+    parser.add_argument("--frameskip", type=int, default=None)
+    parser.add_argument("--img-size", type=int, default=None)
+    parser.add_argument("--action-dim", type=int, default=None)
     parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--max-rollout-steps", type=int, default=None)
     return parser.parse_args()
+
+
+def load_config(model_dir: Path) -> dict[str, object]:
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Model config not found: {config_path}")
+    with config_path.open() as f:
+        return json.load(f)
+
+
+def latest_object_checkpoint(model_dir: Path) -> Path:
+    pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
+    candidates: list[tuple[int, Path]] = []
+    for path in model_dir.glob("*_epoch_*_object.ckpt"):
+        match = pattern.match(path.name)
+        if match is not None:
+            candidates.append((int(match.group(1)), path))
+    if not candidates:
+        raise FileNotFoundError(f"No object checkpoints matching '*_epoch_N_object.ckpt' found in {model_dir}")
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -> None:
+    defaults = {
+        "history_size": 3,
+        "action_history": True,
+        "num_preds": 1,
+        "frameskip": 1,
+        "img_size": 224,
+        "action_dim": 2,
+    }
+    for key, fallback in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, config.get(key, fallback))
 
 
 def require_device(device_arg: str) -> torch.device:
@@ -76,6 +113,7 @@ def load_episode(
     dataset = LeWMReacherDataset(
         dataset_path,
         history_size=args.history_size,
+        action_history=args.action_history,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,
@@ -126,6 +164,7 @@ def rollout_latents(
     actions: torch.Tensor,
     *,
     history_size: int,
+    action_history: bool,
     frameskip: int,
     max_rollout_steps: int | None,
 ) -> torch.Tensor:
@@ -141,7 +180,9 @@ def rollout_latents(
 
     for step in range(rollout_steps):
         action_blocks = []
-        for hist_idx in range(history_size):
+        first_action_idx = 0 if action_history else history_size - 1
+        action_steps = history_size if action_history else 1
+        for hist_idx in range(first_action_idx, first_action_idx + action_steps):
             action_start = (step + hist_idx) * frameskip
             action_stop = action_start + frameskip
             action_blocks.append(actions[action_start:action_stop].reshape(-1))
@@ -219,8 +260,20 @@ def plot_latents(
 
 def main() -> None:
     args = parse_args()
+    if args.model_dir is not None:
+        model_dir = args.model_dir.expanduser().resolve()
+    elif args.checkpoint is not None:
+        model_dir = args.checkpoint.expanduser().resolve().parent
+    else:
+        model_dir = Path(DEFAULT_MODEL_DIR).expanduser().resolve()
+    config = load_config(model_dir)
+    apply_config_defaults(args, config)
     dataset_path = args.dataset_path.expanduser().resolve()
-    checkpoint_path = args.checkpoint.expanduser().resolve()
+    checkpoint_path = (
+        args.checkpoint.expanduser().resolve()
+        if args.checkpoint is not None
+        else latest_object_checkpoint(model_dir).resolve()
+    )
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,6 +299,7 @@ def main() -> None:
         true_latents,
         actions.to(device),
         history_size=args.history_size,
+        action_history=args.action_history,
         frameskip=args.frameskip,
         max_rollout_steps=args.max_rollout_steps,
     )
@@ -254,9 +308,12 @@ def main() -> None:
     metrics.update(
         {
             "episode_idx": episode_idx,
+            "model_dir": str(model_dir),
             "checkpoint": str(checkpoint_path),
+            "config_path": str(model_dir / "config.json"),
             "dataset_path": str(dataset_path),
             "history_size": args.history_size,
+            "action_history": args.action_history,
             "frameskip": args.frameskip,
         }
     )
@@ -277,6 +334,8 @@ def main() -> None:
                 "episode_idx": episode_idx,
                 "mean_rmse": metrics["mean_rmse"],
                 "final_rmse": metrics["final_rmse"],
+                "checkpoint": str(checkpoint_path),
+                "action_history": args.action_history,
                 "metrics_path": str(metrics_path),
                 "plot_paths": [str(path) for path in plot_paths],
             },
