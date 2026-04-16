@@ -270,7 +270,7 @@ def main() -> None:
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = require_device(args.device)
+    device = args.device
     with h5py.File(dataset_path, "r") as h5:
         num_episodes = int(h5["ep_len"].shape[0])
     episode_idx = args.episode_idx

@@ -3,7 +3,7 @@ latent_brs_venv/
 .vscode/
 .claude/
 models/reacher-v5-sac-expert/
-models/reacher-dm-control-sac/
+models/reacher-dm-control-sac*/
 latent_brs.egg-info/
 *.pt
 *.pth

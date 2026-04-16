@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +22,16 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from tqdm.auto import tqdm
 
-from train.reacher_train import DEFAULT_OUTPUT_DIR, DmControlGymEnv
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
+from train.reacher_train import DmControlGymEnv
 
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "models" / "reacher-dm-control-sac"
 DEFAULT_MODEL_PATH = DEFAULT_OUTPUT_DIR / "best_model" / "best_model.zip"
 DEFAULT_VECNORMALIZE_PATH = DEFAULT_OUTPUT_DIR / "vecnormalize.pkl"
-DEFAULT_OUTDIR = Path("eval/reacher_videos")
+DEFAULT_OUTDIR = REPO_ROOT / "eval" / "reacher_videos"
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--videos",
         type=int,
-        default=10,
+        default=20,
         help="Number of episodes to render.",
     )
     parser.add_argument(
@@ -78,6 +83,33 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=10.0,
         help="Episode time limit in seconds.",
+    )
+    parser.add_argument(
+        "--action-cost-weight",
+        type=float,
+        default=None,
+        help=(
+            "Quadratic action penalty used by the environment. Defaults to the "
+            "value in train_config.json when available, otherwise 0.0."
+        ),
+    )
+    parser.add_argument(
+        "--action-rate-cost-weight",
+        type=float,
+        default=None,
+        help=(
+            "Quadratic action-change penalty used by the environment. Defaults to the "
+            "value in train_config.json when available, otherwise 0.0."
+        ),
+    )
+    parser.add_argument(
+        "--velocity-cost-weight",
+        type=float,
+        default=None,
+        help=(
+            "Quadratic velocity penalty used by the environment. Defaults to the "
+            "value in train_config.json when available, otherwise 0.0."
+        ),
     )
     parser.add_argument(
         "--width",
@@ -124,13 +156,60 @@ def require_device(device_arg: str) -> str:
     return device_arg
 
 
-def make_eval_env(task: str, seed: int, time_limit: float, vecnormalize_path: Path) -> VecNormalize:
+def load_train_config(model_path: Path, vecnormalize_path: Path) -> dict[str, Any]:
+    config_candidates = [
+        model_path.parent.parent / "train_config.json",
+        model_path.parent / "train_config.json",
+        vecnormalize_path.parent / "train_config.json",
+    ]
+    for config_path in config_candidates:
+        if not config_path.exists():
+            continue
+        with config_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    return {}
+
+
+def resolve_vecnormalize_path(requested_path: Path, model_path: Path) -> Path:
+    if requested_path.exists():
+        return requested_path
+
+    run_dir = model_path.parent.parent if model_path.parent.name == "best_model" else model_path.parent
+    candidates = [
+        run_dir / "vecnormalize.pkl",
+        run_dir / "eval_vecnormalize.pkl",
+    ]
+    candidates.extend(sorted((run_dir / "checkpoints").glob("*vecnormalize*.pkl")))
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        raise FileNotFoundError(
+            f"VecNormalize stats not found: {requested_path}. "
+            "Pass --vecnormalize-path for the run that produced this model."
+        )
+
+    best_path = max(existing, key=lambda path: path.stat().st_mtime)
+    print(f"VecNormalize stats not found at {requested_path}; using {best_path}")
+    return best_path
+
+
+def make_eval_env(
+    task: str,
+    seed: int,
+    time_limit: float,
+    vecnormalize_path: Path,
+    action_cost_weight: float = 0.0,
+    action_rate_cost_weight: float = 0.0,
+    velocity_cost_weight: float = 0.0,
+) -> VecNormalize:
     def _factory() -> Monitor:
         env = DmControlGymEnv(
             domain_name="reacher",
             task_name=task,
             seed=seed,
             time_limit=time_limit,
+            action_cost_weight=action_cost_weight,
+            action_rate_cost_weight=action_rate_cost_weight,
+            velocity_cost_weight=velocity_cost_weight,
         )
         env.reset(seed=seed)
         return Monitor(env)
@@ -200,11 +279,40 @@ def main() -> None:
     outdir = args.outdir.expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    vecnormalize_path = resolve_vecnormalize_path(vecnormalize_path, model_path)
+    train_config = load_train_config(model_path, vecnormalize_path)
+    action_cost_weight = (
+        float(train_config.get("action_cost_weight", 0.0))
+        if args.action_cost_weight is None
+        else float(args.action_cost_weight)
+    )
+    action_rate_cost_weight = (
+        float(train_config.get("action_rate_cost_weight", 0.0))
+        if args.action_rate_cost_weight is None
+        else float(args.action_rate_cost_weight)
+    )
+    velocity_cost_weight = (
+        float(train_config.get("velocity_cost_weight", 0.0))
+        if args.velocity_cost_weight is None
+        else float(args.velocity_cost_weight)
+    )
+    if action_cost_weight < 0.0:
+        raise ValueError("--action-cost-weight must be non-negative")
+    if action_rate_cost_weight < 0.0:
+        raise ValueError("--action-rate-cost-weight must be non-negative")
+    if velocity_cost_weight < 0.0:
+        raise ValueError("--velocity-cost-weight must be non-negative")
+
     vec_env = make_eval_env(
         task=args.task,
         seed=args.seed,
         time_limit=args.time_limit,
         vecnormalize_path=vecnormalize_path,
+        action_cost_weight=action_cost_weight,
+        action_rate_cost_weight=action_rate_cost_weight,
+        velocity_cost_weight=velocity_cost_weight,
     )
     render_env = get_render_env(vec_env)
     model = SAC.load(str(model_path), env=vec_env, device=device)
@@ -242,6 +350,9 @@ def main() -> None:
         "outdir": str(outdir),
         "device": device,
         "deterministic": not args.stochastic,
+        "action_cost_weight": action_cost_weight,
+        "action_rate_cost_weight": action_rate_cost_weight,
+        "velocity_cost_weight": velocity_cost_weight,
         "mean_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
         "mean_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
         "width": args.width,

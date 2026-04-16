@@ -36,7 +36,7 @@ from tqdm.auto import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "models" / "reacher-dm-control-sac"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "models" / "reacher-dm-control-sac-v3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-envs",
         type=int,
-        default=8,
+        default=24,
         help="Number of parallel training environments.",
     )
     parser.add_argument(
@@ -83,6 +83,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=10.0,
         help="Episode time limit in seconds. dm_control default is 20.0.",
+    )
+    parser.add_argument(
+        "--action-cost-weight",
+        type=float,
+        default=0.0,
+        help="Quadratic control-effort penalty weight: reward -= weight * ||action||_2^2. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--action-rate-cost-weight",
+        type=float,
+        default=1e-2,
+        help="Quadratic action-change penalty weight: reward -= weight * ||action_t - action_{t-1}||_2^2.",
+    )
+    parser.add_argument(
+        "--velocity-cost-weight",
+        type=float,
+        default=1e-2,
+        help="Quadratic joint-velocity penalty weight: reward -= weight * ||velocity||_2^2. Use 0 to disable.",
     )
     parser.add_argument(
         "--seed",
@@ -189,17 +207,24 @@ class DmControlGymEnv(gym.Env[np.ndarray, np.ndarray]):
         task_name: str,
         seed: int,
         time_limit: float,
+        action_cost_weight: float,
+        action_rate_cost_weight: float,
+        velocity_cost_weight: float,
     ) -> None:
         super().__init__()
         self.domain_name = domain_name
         self.task_name = task_name
         self.base_seed = int(seed)
         self.time_limit = float(time_limit)
+        self.action_cost_weight = float(action_cost_weight)
+        self.action_rate_cost_weight = float(action_rate_cost_weight)
+        self.velocity_cost_weight = float(velocity_cost_weight)
         self._episode_index = 0
         self._env = self._build_env(self.base_seed)
 
         action_spec = self._env.action_spec()
         self.action_space = spec_to_box(action_spec)
+        self._last_action = np.zeros(self.action_space.shape, dtype=np.float32)
 
         first_time_step = self._env.reset()
         first_obs = flatten_observation(first_time_step.observation)
@@ -241,13 +266,25 @@ class DmControlGymEnv(gym.Env[np.ndarray, np.ndarray]):
             self._episode_index = 0
             self._env = self._build_env(self.base_seed)
         time_step = self._env.reset()
+        self._last_action = np.zeros(self.action_space.shape, dtype=np.float32)
         obs = flatten_observation(time_step.observation)
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         clipped = np.clip(action, self.action_space.low, self.action_space.high).astype(np.float32)
         time_step = self._env.step(clipped)
-        obs, reward, terminated, truncated, info = self._convert_time_step(time_step)
+        obs, dm_reward, terminated, truncated, info = self._convert_time_step(time_step)
+        action_cost = self.action_cost_weight * float(np.dot(clipped, clipped))
+        action_delta = clipped - self._last_action
+        action_rate_cost = self.action_rate_cost_weight * float(np.dot(action_delta, action_delta))
+        velocity = obs[-2:]
+        velocity_cost = self.velocity_cost_weight * float(np.dot(velocity, velocity))
+        reward = dm_reward - action_cost - action_rate_cost - velocity_cost
+        info["dm_reward"] = dm_reward
+        info["action_cost"] = action_cost
+        info["action_rate_cost"] = action_rate_cost
+        info["velocity_cost"] = velocity_cost
+        self._last_action = clipped
         if terminated or truncated:
             self._episode_index += 1
         return obs, reward, terminated, truncated, info
@@ -266,6 +303,9 @@ def make_env(
     task_name: str,
     seed: int,
     time_limit: float,
+    action_cost_weight: float,
+    action_rate_cost_weight: float,
+    velocity_cost_weight: float,
 ) -> Callable[[], gym.Env]:
     def _factory() -> gym.Env:
         env = DmControlGymEnv(
@@ -273,6 +313,9 @@ def make_env(
             task_name=task_name,
             seed=seed,
             time_limit=time_limit,
+            action_cost_weight=action_cost_weight,
+            action_rate_cost_weight=action_rate_cost_weight,
+            velocity_cost_weight=velocity_cost_weight,
         )
         env.reset(seed=seed)
         return Monitor(env)
@@ -286,10 +329,20 @@ def build_vec_env(
     task_name: str,
     seed: int,
     time_limit: float,
+    action_cost_weight: float,
+    action_rate_cost_weight: float,
+    velocity_cost_weight: float,
     training: bool,
 ) -> VecNormalize:
     env_fns = [
-        make_env(task_name=task_name, seed=seed + env_index, time_limit=time_limit)
+        make_env(
+            task_name=task_name,
+            seed=seed + env_index,
+            time_limit=time_limit,
+            action_cost_weight=action_cost_weight,
+            action_rate_cost_weight=action_rate_cost_weight,
+            velocity_cost_weight=velocity_cost_weight,
+        )
         for env_index in range(num_envs)
     ]
     vec_env = DummyVecEnv(env_fns) if num_envs == 1 else SubprocVecEnv(env_fns, start_method="spawn")
@@ -308,6 +361,9 @@ def write_metadata(args: argparse.Namespace, output_dir: Path, device: str) -> N
         "task": args.task,
         "seed": args.seed,
         "time_limit": args.time_limit,
+        "action_cost_weight": args.action_cost_weight,
+        "action_rate_cost_weight": args.action_rate_cost_weight,
+        "velocity_cost_weight": args.velocity_cost_weight,
         "total_timesteps": args.total_timesteps,
         "num_envs": args.num_envs,
         "device": device,
@@ -359,6 +415,12 @@ def main() -> None:
         raise ValueError("--total-timesteps must be positive")
     if args.time_limit <= 0.0:
         raise ValueError("--time-limit must be positive")
+    if args.action_cost_weight < 0.0:
+        raise ValueError("--action-cost-weight must be non-negative")
+    if args.action_rate_cost_weight < 0.0:
+        raise ValueError("--action-rate-cost-weight must be non-negative")
+    if args.velocity_cost_weight < 0.0:
+        raise ValueError("--velocity-cost-weight must be non-negative")
 
     output_dir = args.output_dir.expanduser().resolve()
     checkpoint_dir = output_dir / "checkpoints"
@@ -374,6 +436,9 @@ def main() -> None:
         task_name=args.task,
         seed=args.seed,
         time_limit=args.time_limit,
+        action_cost_weight=args.action_cost_weight,
+        action_rate_cost_weight=args.action_rate_cost_weight,
+        velocity_cost_weight=args.velocity_cost_weight,
         training=True,
     )
     eval_env = build_vec_env(
@@ -381,6 +446,9 @@ def main() -> None:
         task_name=args.task,
         seed=args.seed + 100_000,
         time_limit=args.time_limit,
+        action_cost_weight=args.action_cost_weight,
+        action_rate_cost_weight=args.action_rate_cost_weight,
+        velocity_cost_weight=args.velocity_cost_weight,
         training=False,
     )
 
@@ -436,6 +504,9 @@ def main() -> None:
                 "batch_size": args.batch_size,
                 "gradient_steps": args.gradient_steps,
                 "time_limit_seconds": args.time_limit,
+                "action_cost_weight": args.action_cost_weight,
+                "action_rate_cost_weight": args.action_rate_cost_weight,
+                "velocity_cost_weight": args.velocity_cost_weight,
                 "output_dir": str(output_dir),
             },
             indent=2,
