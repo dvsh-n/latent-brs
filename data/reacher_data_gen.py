@@ -29,8 +29,8 @@ from eval.reacher_policy_viz import (
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTDIR = REPO_ROOT / "data" / "expert_data_100hz"
-DEFAULT_OUTPUT_NAME = "reacher_expert.h5"
+DEFAULT_OUTDIR = REPO_ROOT / "data" / "test_data_100hz"
+DEFAULT_OUTPUT_NAME = "reacher_expert_test.h5"
 
 # Local timing/video knobs.
 PHYSICS_FREQ_HZ = 100.0
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=1_000_000,
+        default=100_000,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(

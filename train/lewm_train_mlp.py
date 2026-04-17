@@ -46,7 +46,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=24)
     parser.add_argument("--history-size", type=int, default=2)
-    parser.add_argument("--action-history", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
@@ -80,7 +79,6 @@ class LeWMReacherDataset(Dataset):
         dataset_path: Path,
         *,
         history_size: int,
-        action_history: bool = True,
         num_preds: int,
         frameskip: int,
         img_size: int,
@@ -88,11 +86,10 @@ class LeWMReacherDataset(Dataset):
     ) -> None:
         self.dataset_path = dataset_path
         self.history_size = int(history_size)
-        self.action_history = bool(action_history)
         self.num_preds = int(num_preds)
         self.frameskip = int(frameskip)
         self.num_steps = self.history_size + self.num_preds
-        self.action_steps = self.history_size + self.num_preds - 1 if self.action_history else self.num_preds
+        self.action_steps = self.num_preds
         self.img_size = int(img_size)
         self.action_dim = int(action_dim)
         self.effective_action_dim = self.frameskip * self.action_dim
@@ -118,7 +115,7 @@ class LeWMReacherDataset(Dataset):
 
         self.samples: list[tuple[int, int]] = []
         required_last_frame_offset = (self.num_steps - 1) * self.frameskip
-        action_start_step = 0 if self.action_history else self.history_size - 1
+        action_start_step = self.history_size - 1
         required_action_end_offset = (action_start_step + self.action_steps) * self.frameskip
         required_offset = max(required_last_frame_offset, required_action_end_offset)
         for ep_idx, ep_len in enumerate(self.ep_len.tolist()):
@@ -154,7 +151,7 @@ class LeWMReacherDataset(Dataset):
         pixels = (pixels - self.pixel_mean) / self.pixel_std
 
         action_blocks = []
-        first_action_step = 0 if self.action_history else self.history_size - 1
+        first_action_step = self.history_size - 1
         for step in range(first_action_step, first_action_step + self.action_steps):
             action_start = base + step * self.frameskip
             action_stop = action_start + self.frameskip
@@ -214,10 +211,7 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     pred_embs = []
     for step in range(n_preds):
         ctx_emb = rollout_emb[:, -ctx_len:]
-        if args.action_history:
-            ctx_act = act_emb[:, step : step + ctx_len]
-        else:
-            ctx_act = act_emb[:, step : step + 1]
+        ctx_act = act_emb[:, step : step + 1]
 
         pred_next = self.model.predict(ctx_emb, ctx_act)[:, 0]
         tgt_next = emb[:, ctx_len + step]
@@ -252,7 +246,7 @@ def build_model(args: argparse.Namespace) -> JEPA:
         embed_dim=embed_dim,
         action_dim=effective_act_dim,
         history_size=args.history_size,
-        action_history_size=args.history_size if args.action_history else 1,
+        action_history_size=1,
         num_preds=1,
         hidden_width=args.predictor_hidden_width,
         depth=args.predictor_depth,
@@ -295,7 +289,6 @@ def main() -> None:
     dataset = LeWMReacherDataset(
         dataset_path,
         history_size=args.history_size,
-        action_history=args.action_history,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,
