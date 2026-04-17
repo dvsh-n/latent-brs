@@ -29,7 +29,8 @@ from shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
 DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
-DEFAULT_RUN_DIR = "models/lewm_reacher_mlp"
+DEFAULT_RUN_DIR = "models/lewm_reacher_mlpdyn_multistep"
+FIXED_FRAMESKIP = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,10 +45,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=24)
-    parser.add_argument("--history-size", type=int, default=3)
+    parser.add_argument("--history-size", type=int, default=2)
     parser.add_argument("--action-history", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--num-preds", type=int, default=1)
-    parser.add_argument("--frameskip", type=int, default=1)
+    parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=1024)
@@ -69,7 +69,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", default="auto")
     parser.add_argument("--precision", default="bf16-mixed")
     parser.add_argument("--save-object-every", type=int, default=1)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.frameskip = FIXED_FRAMESKIP
+    return args
 
 
 class LeWMReacherDataset(Dataset):
@@ -87,10 +89,10 @@ class LeWMReacherDataset(Dataset):
         self.dataset_path = dataset_path
         self.history_size = int(history_size)
         self.action_history = bool(action_history)
-        self.action_steps = self.history_size if self.action_history else 1
         self.num_preds = int(num_preds)
         self.frameskip = int(frameskip)
         self.num_steps = self.history_size + self.num_preds
+        self.action_steps = self.history_size + self.num_preds - 1 if self.action_history else self.num_preds
         self.img_size = int(img_size)
         self.action_dim = int(action_dim)
         self.effective_action_dim = self.frameskip * self.action_dim
@@ -206,12 +208,25 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     output = self.model.encode(batch)
 
     emb = output["emb"]
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = output["act_emb"][:, :ctx_len] if args.action_history else output["act_emb"]
-    tgt_emb = emb[:, ctx_len : ctx_len + n_preds]
-    pred_emb = self.model.predict(ctx_emb, ctx_act)
+    act_emb = output["act_emb"]
+    rollout_emb = emb[:, :ctx_len]
+    pred_losses = []
+    pred_embs = []
+    for step in range(n_preds):
+        ctx_emb = rollout_emb[:, -ctx_len:]
+        if args.action_history:
+            ctx_act = act_emb[:, step : step + ctx_len]
+        else:
+            ctx_act = act_emb[:, step : step + 1]
 
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+        pred_next = self.model.predict(ctx_emb, ctx_act)[:, 0]
+        tgt_next = emb[:, ctx_len + step]
+        pred_losses.append((pred_next - tgt_next).pow(2).mean())
+        pred_embs.append(pred_next)
+        rollout_emb = torch.cat((rollout_emb, pred_next.unsqueeze(1)), dim=1)
+
+    output["pred_emb"] = torch.stack(pred_embs, dim=1)
+    output["pred_loss"] = torch.stack(pred_losses).mean()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
@@ -238,7 +253,7 @@ def build_model(args: argparse.Namespace) -> JEPA:
         action_dim=effective_act_dim,
         history_size=args.history_size,
         action_history_size=args.history_size if args.action_history else 1,
-        num_preds=args.num_preds,
+        num_preds=1,
         hidden_width=args.predictor_hidden_width,
         depth=args.predictor_depth,
         dropout=args.predictor_dropout,

@@ -29,11 +29,13 @@ from eval.reacher_policy_viz import (
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTDIR = REPO_ROOT / "data" / "expert_data"
+DEFAULT_OUTDIR = REPO_ROOT / "data" / "expert_data_100hz"
 DEFAULT_OUTPUT_NAME = "reacher_expert.h5"
 
-CONTROL_FREQ_HZ = 50
-DEFAULT_MAX_STEPS_PER_EPISODE = 50
+# Local timing/video knobs.
+PHYSICS_FREQ_HZ = 100.0
+CONTROL_FREQ_HZ = 100.0
+DEFAULT_MAX_STEPS_PER_EPISODE = 100
 STATE_DIM = 6
 ACTION_DIM = 2
 
@@ -49,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=500_000,
+        default=1_000_000,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
@@ -60,13 +62,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--time-limit", type=float, default=10.0)
+    parser.add_argument("--physics-freq-hz", type=float, default=PHYSICS_FREQ_HZ)
+    parser.add_argument("--control-freq-hz", type=float, default=CONTROL_FREQ_HZ)
     parser.add_argument("--max-steps-per-episode", type=int, default=DEFAULT_MAX_STEPS_PER_EPISODE)
     parser.add_argument("--goal-threshold", type=float, default=0.03)
     parser.add_argument("--max-blank-steps", type=int, default=5)
     parser.add_argument("--min-steps", type=int, default=3)
-    parser.add_argument("--width", type=int, default=252)
-    parser.add_argument("--height", type=int, default=252)
-    parser.add_argument("--fps", type=int, default=CONTROL_FREQ_HZ)
+    parser.add_argument("--width", type=int, default=224)
+    parser.add_argument("--height", type=int, default=224)
     parser.add_argument("--quality", type=int, default=8)
     parser.add_argument("--compression", choices=("none", "lzf", "gzip"), default="lzf")
     parser.add_argument("--device", default="cuda")
@@ -93,6 +96,29 @@ def reached_goal(state: np.ndarray, threshold: float) -> bool:
     return bool(np.linalg.norm(state[2:4]) <= threshold)
 
 
+def compute_control_substeps(physics_freq_hz: float, control_freq_hz: float) -> int:
+    ratio = physics_freq_hz / control_freq_hz
+    substeps = int(round(ratio))
+    if substeps < 1 or not np.isclose(ratio, substeps, rtol=0.0, atol=1e-8):
+        raise ValueError(
+            "--physics-freq-hz must be an integer multiple of --control-freq-hz "
+            f"(got {physics_freq_hz:g} Hz and {control_freq_hz:g} Hz)."
+        )
+    return substeps
+
+
+def configure_dm_control_timing(
+    render_env: object,
+    *,
+    physics_timestep: float,
+    time_limit: float,
+) -> None:
+    dm_env = render_env._env
+    dm_env.physics.model.opt.timestep = physics_timestep
+    dm_env._n_sub_steps = 1
+    dm_env._step_limit = float("inf") if time_limit == float("inf") else time_limit / physics_timestep
+
+
 def collect_trajectory(
     *,
     model: SAC,
@@ -103,11 +129,19 @@ def collect_trajectory(
     width: int,
     height: int,
     max_steps: int,
+    physics_timestep: float,
+    control_substeps: int,
+    time_limit: float,
     goal_threshold: float,
     max_blank_steps: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
     env.seed(trajectory_seed)
     obs = env.reset()
+    configure_dm_control_timing(
+        render_env,
+        physics_timestep=physics_timestep,
+        time_limit=time_limit,
+    )
     hide_target(render_env)
     configure_offscreen_framebuffer(render_env, width, height)
 
@@ -120,9 +154,13 @@ def collect_trajectory(
     post_goal_steps = 0
     terminated = False
 
-    for _ in range(max_steps):
+    action: np.ndarray | None = None
+    for physics_step in range(max_steps):
         was_already_at_goal = goal_seen
-        action, _ = model.predict(obs, deterministic=deterministic)
+        if physics_step % control_substeps == 0:
+            action, _ = model.predict(obs, deterministic=deterministic)
+        if action is None:
+            raise RuntimeError("Policy action was not initialized.")
         obs, rewards, dones, _ = env.step(action)
         total_reward += float(rewards[0])
 
@@ -200,12 +238,20 @@ def main() -> None:
         raise ValueError("--num-trajectories must be positive.")
     if args.max_steps_per_episode < 1:
         raise ValueError("--max-steps-per-episode must be positive.")
+    if args.physics_freq_hz <= 0.0:
+        raise ValueError("--physics-freq-hz must be positive.")
+    if args.control_freq_hz <= 0.0:
+        raise ValueError("--control-freq-hz must be positive.")
     if args.max_blank_steps < 0:
         raise ValueError("--max-blank-steps cannot be negative.")
     if args.min_steps < 1:
         raise ValueError("--min-steps must be positive.")
 
     device = require_device(args.device)
+    physics_timestep = 1.0 / args.physics_freq_hz
+    control_timestep = 1.0 / args.control_freq_hz
+    control_substeps = compute_control_substeps(args.physics_freq_hz, args.control_freq_hz)
+    video_fps = args.physics_freq_hz
 
     model_path = args.model_path.expanduser().resolve()
     vecnormalize_path = args.vecnormalize_path.expanduser().resolve()
@@ -247,8 +293,13 @@ def main() -> None:
         h5.attrs["vecnormalize_path"] = str(vecnormalize_path)
         h5.attrs["video_dir"] = str(video_dir)
         h5.attrs["video_resolution"] = json.dumps([args.height, args.width])
-        h5.attrs["video_fps"] = args.fps
-        h5.attrs["control_freq_hz"] = CONTROL_FREQ_HZ
+        h5.attrs["video_fps"] = video_fps
+        h5.attrs["physics_freq_hz"] = args.physics_freq_hz
+        h5.attrs["control_freq_hz"] = args.control_freq_hz
+        h5.attrs["physics_timestep"] = physics_timestep
+        h5.attrs["control_timestep"] = control_timestep
+        h5.attrs["control_substeps"] = control_substeps
+        h5.attrs["frames_per_physics_step"] = 1
         h5.attrs["time_limit"] = args.time_limit
         h5.attrs["goal_threshold"] = args.goal_threshold
         h5.attrs["max_blank_steps"] = args.max_blank_steps
@@ -290,6 +341,9 @@ def main() -> None:
                     width=args.width,
                     height=args.height,
                     max_steps=args.max_steps_per_episode,
+                    physics_timestep=physics_timestep,
+                    control_substeps=control_substeps,
+                    time_limit=args.time_limit,
                     goal_threshold=args.goal_threshold,
                     max_blank_steps=args.max_blank_steps,
                 )
@@ -302,7 +356,7 @@ def main() -> None:
                 imageio.mimwrite(
                     video_path,
                     frames,
-                    fps=args.fps,
+                    fps=video_fps,
                     quality=args.quality,
                     macro_block_size=1,
                 )

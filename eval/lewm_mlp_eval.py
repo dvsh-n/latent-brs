@@ -29,8 +29,8 @@ if str(REPO_ROOT) not in sys.path:
 from train.lewm_train_mlp import LeWMReacherDataset
 
 DEFAULT_DATASET_PATH = "data/test_data/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "models/lewm_reacher_mlp"
-DEFAULT_OUT_DIR = "eval/lewm_mlp_eval"
+DEFAULT_MODEL_DIR = "models/lewm_reacher_mlpdyn_multistep"
+DEFAULT_OUT_DIR = "eval/lewm_mlpdyn_eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,7 +100,7 @@ def valid_episode_indices(dataset_path: Path, *, args: argparse.Namespace) -> np
     num_steps = int(args.history_size) + int(args.num_preds)
     required_last_frame_offset = (num_steps - 1) * int(args.frameskip)
     action_start_step = 0 if args.action_history else int(args.history_size) - 1
-    action_steps = int(args.history_size) if args.action_history else 1
+    action_steps = int(args.history_size) + int(args.num_preds) - 1 if args.action_history else int(args.num_preds)
     required_action_end_offset = (action_start_step + action_steps) * int(args.frameskip)
     required_offset = max(required_last_frame_offset, required_action_end_offset)
     return np.flatnonzero(ep_len - 1 - required_offset >= 0)
@@ -200,7 +200,7 @@ def rollout_latents(
             action_blocks.append(actions[action_start:action_stop].reshape(-1))
         act = torch.stack(action_blocks, dim=0).unsqueeze(0).to(device)
         act_emb = model.action_encoder(act)
-        pred = model.predict(emb[:, -history_size:], act_emb)[:, -1]
+        pred = model.predict(emb[:, -history_size:], act_emb)[:, 0]
         pred_latents.append(pred[0])
         emb = torch.cat([emb, pred.unsqueeze(1)], dim=1)
 
@@ -334,6 +334,7 @@ def main() -> None:
             "dataset_path": str(dataset_path),
             "history_size": args.history_size,
             "action_history": args.action_history,
+            "num_preds": args.num_preds,
             "frameskip": args.frameskip,
         }
     )
