@@ -25,10 +25,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from shared.models import VelocityPredictor
 from train.lewm_train_mlp import LeWMReacherDataset
 
 DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
-DEFAULT_CHECKPOINT = "models/lewm_reacher_mlp/lewm_epoch_50_object.ckpt"
+DEFAULT_CHECKPOINT = "models/lewm_reacher_velocity/lewm_vel_epoch_50_object.ckpt"
 DEFAULT_OUT_DIR = "eval/lewm_mlp_eval"
 
 
@@ -129,6 +130,28 @@ def rollout_latents(
     frameskip: int,
     max_rollout_steps: int | None,
 ) -> torch.Tensor:
+    if isinstance(model.predictor, VelocityPredictor):
+        return _rollout_velocity(
+            model, true_latents, actions,
+            history_size=history_size, frameskip=frameskip,
+            max_rollout_steps=max_rollout_steps,
+        )
+    return _rollout_ar(
+        model, true_latents, actions,
+        history_size=history_size, frameskip=frameskip,
+        max_rollout_steps=max_rollout_steps,
+    )
+
+
+def _rollout_ar(
+    model: torch.nn.Module,
+    true_latents: torch.Tensor,
+    actions: torch.Tensor,
+    *,
+    history_size: int,
+    frameskip: int,
+    max_rollout_steps: int | None,
+) -> torch.Tensor:
     device = true_latents.device
     rollout_steps = (actions.shape[0] - history_size * frameskip) // frameskip + 1
     if max_rollout_steps is not None:
@@ -150,6 +173,49 @@ def rollout_latents(
         pred = model.predict(emb[:, -history_size:], act_emb)[:, -1]
         pred_latents.append(pred[0])
         emb = torch.cat([emb, pred.unsqueeze(1)], dim=1)
+
+    return torch.stack(pred_latents, dim=0)
+
+
+def _rollout_velocity(
+    model: torch.nn.Module,
+    true_latents: torch.Tensor,
+    actions: torch.Tensor,
+    *,
+    history_size: int,
+    frameskip: int,
+    max_rollout_steps: int | None,
+) -> torch.Tensor:
+    device = true_latents.device
+    warmup = max(history_size, 2)
+    total_action_frames = actions.shape[0]
+    rollout_steps = (total_action_frames - warmup * frameskip) // frameskip + 1
+    if max_rollout_steps is not None:
+        rollout_steps = min(rollout_steps, max_rollout_steps)
+    if rollout_steps < 1:
+        raise ValueError("Not enough actions for a velocity rollout.")
+
+    pred_latents = [true_latents[t] for t in range(warmup)]
+
+    z_prev = true_latents[warmup - 2]
+    z_cur = true_latents[warmup - 1]
+    vel = z_cur - z_prev
+    aug = torch.cat([z_cur, vel], dim=-1).unsqueeze(0)
+
+    for step in range(rollout_steps):
+        action_start = (warmup - 1 + step) * frameskip
+        action_stop = action_start + frameskip
+        act_raw = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
+        act_emb = model.action_encoder(act_raw)[:, 0]
+
+        pred_aug = model.predict_velocity(aug, act_emb)
+        d = z_cur.size(-1)
+        z_next = pred_aug[0, :d]
+        pred_latents.append(z_next)
+
+        vel = z_next - z_cur
+        aug = torch.cat([z_next, vel], dim=-1).unsqueeze(0)
+        z_cur = z_next
 
     return torch.stack(pred_latents, dim=0)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train an LE-WM-style JEPA with a raw-action MLP dynamics predictor."""
+"""Train an LE-WM-style JEPA with a velocity-augmented MLP predictor."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import os
 import sys
 from functools import partial
 from pathlib import Path
+import hdf5plugin
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -25,35 +26,35 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
+from shared.models import JEPA, MLP, SIGReg, VelocityPredictor, compute_augmented_states
 
 
 DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
-DEFAULT_RUN_DIR = "models/lewm_reacher_mlp"
+DEFAULT_RUN_DIR = "models/lewm_reacher_velocity"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--output-model-name", default="lewm")
+    parser.add_argument("--output-model-name", default="lewm_vel")
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--train-split", type=float, default=0.9)
 
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=24)
+    parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--history-size", type=int, default=3)
     parser.add_argument("--num-preds", type=int, default=1)
     parser.add_argument("--frameskip", type=int, default=1)
     parser.add_argument("--action-dim", type=int, default=2)
 
-    parser.add_argument("--predictor-hidden-width", type=int, default=1024)
     parser.add_argument("--predictor-depth", type=int, default=4)
-    parser.add_argument("--predictor-dropout", type=float, default=0.0)
+    parser.add_argument("--predictor-hidden-width", type=int, default=1024)
+    parser.add_argument("--predictor-dropout", type=float, default=0.1)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.09)
+    parser.add_argument("--sigreg-weight", type=float, default=0.01)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
 
@@ -191,20 +192,29 @@ class ModelObjectCallback(Callback):
 
 
 def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
-    ctx_len = args.history_size
-    n_preds = args.num_preds
+    H = args.history_size
     lambd = args.sigreg_weight
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode(batch)
 
-    emb = output["emb"]
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = output["act_emb"][:, :ctx_len]
-    tgt_emb = emb[:, ctx_len : ctx_len + n_preds]
-    pred_emb = self.model.predict(ctx_emb, ctx_act)
+    emb = output["emb"]          # (B, T, D)  T = history_size + num_preds
+    act_emb = output["act_emb"]  # (B, H, D)
 
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+    aug = compute_augmented_states(emb)  # (B, T, 2D)
+
+    input_aug = aug[:, :H]               # (B, H, 2D)
+    target_aug = aug[:, 1 : H + 1]       # (B, H, 2D)
+    input_act = act_emb[:, :H]           # (B, H, D)
+
+    B = input_aug.size(0)
+    input_aug_flat = input_aug.reshape(B * H, -1)
+    input_act_flat = input_act.reshape(B * H, -1)
+    target_aug_flat = target_aug.reshape(B * H, -1)
+
+    pred_aug_flat = self.model.predict_velocity(input_aug_flat, input_act_flat)
+
+    output["pred_loss"] = (pred_aug_flat - target_aug_flat).pow(2).mean()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
@@ -226,11 +236,9 @@ def build_model(args: argparse.Namespace) -> JEPA:
     embed_dim = args.embed_dim
     effective_act_dim = args.frameskip * args.action_dim
 
-    predictor = MLPDynamicsPredictor(
+    predictor = VelocityPredictor(
         embed_dim=embed_dim,
         action_dim=effective_act_dim,
-        history_size=args.history_size,
-        num_preds=args.num_preds,
         hidden_width=args.predictor_hidden_width,
         depth=args.predictor_depth,
         dropout=args.predictor_dropout,
@@ -241,7 +249,6 @@ def build_model(args: argparse.Namespace) -> JEPA:
         predictor=predictor,
         action_encoder=torch.nn.Identity(),
         projector=projector,
-        pred_proj=torch.nn.Identity(),
     )
 
 

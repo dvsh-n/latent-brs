@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect expert DM Control Reacher trajectories with the same rollout path as policy viz."""
+"""Collect expert DM Control Reacher trajectories directly into LE-WM HDF5."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
+import h5py
 import imageio.v2 as imageio
 import numpy as np
-import torch
 from stable_baselines3 import SAC
 from tqdm.auto import tqdm
 
@@ -29,10 +29,11 @@ from eval.reacher_policy_viz import (
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTDIR = REPO_ROOT / "data" / "test_data"
+DEFAULT_OUTDIR = REPO_ROOT / "data" / "expert_data"
+DEFAULT_OUTPUT_NAME = "reacher_expert.h5"
 
 CONTROL_FREQ_HZ = 50
-STEPS_PER_EPISODE = 50
+DEFAULT_MAX_STEPS_PER_EPISODE = 50
 STATE_DIM = 6
 ACTION_DIM = 2
 
@@ -43,13 +44,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vecnormalize-path", type=Path, default=DEFAULT_VECNORMALIZE_PATH)
     parser.add_argument("--task", choices=("easy", "hard"), default="hard")
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
-    parser.add_argument("--num-trajectories", type=int, default=1_000)
+    parser.add_argument("--output-name", default=DEFAULT_OUTPUT_NAME)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--target-transitions",
+        type=int,
+        default=500_000,
+        help="Collect variable-length trajectories until this many action transitions are stored.",
+    )
+    parser.add_argument(
+        "--num-trajectories",
+        type=int,
+        default=10_000,
+        help="Fallback collection target when --target-transitions is omitted.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--time-limit", type=float, default=10.0)
+    parser.add_argument("--max-steps-per-episode", type=int, default=DEFAULT_MAX_STEPS_PER_EPISODE)
+    parser.add_argument("--goal-threshold", type=float, default=0.03)
+    parser.add_argument("--max-blank-steps", type=int, default=5)
+    parser.add_argument("--min-steps", type=int, default=3)
     parser.add_argument("--width", type=int, default=252)
     parser.add_argument("--height", type=int, default=252)
     parser.add_argument("--fps", type=int, default=CONTROL_FREQ_HZ)
     parser.add_argument("--quality", type=int, default=8)
+    parser.add_argument("--compression", choices=("none", "lzf", "gzip"), default="lzf")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--deterministic",
@@ -62,12 +81,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def get_original_obs(env: object) -> np.ndarray:
-    return np.asarray(env.get_original_obs()[0], dtype=np.float64)
+    return np.asarray(env.get_original_obs()[0], dtype=np.float32)
 
 
 def hide_target(render_env: object) -> None:
     target_geom_id = render_env._env.physics.model.name2id("target", "geom")
     render_env._env.physics.model.geom_rgba[target_geom_id] = [0, 0, 0, 0]
+
+
+def reached_goal(state: np.ndarray, threshold: float) -> bool:
+    return bool(np.linalg.norm(state[2:4]) <= threshold)
 
 
 def collect_trajectory(
@@ -80,47 +103,119 @@ def collect_trajectory(
     width: int,
     height: int,
     max_steps: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    goal_threshold: float,
+    max_blank_steps: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
     env.seed(trajectory_seed)
     obs = env.reset()
     hide_target(render_env)
     configure_offscreen_framebuffer(render_env, width, height)
 
-    states = np.empty((STEPS_PER_EPISODE + 1, STATE_DIM), dtype=np.float64)
-    actions = np.empty((STEPS_PER_EPISODE, ACTION_DIM), dtype=np.float64)
-    states[0] = get_original_obs(env)
+    states = [get_original_obs(env)]
+    actions: list[np.ndarray] = []
     frames = [render_env._env.physics.render(height=height, width=width, camera_id=0)]
 
     total_reward = 0.0
-    for step_idx in range(max_steps):
+    goal_seen = reached_goal(states[-1], goal_threshold)
+    post_goal_steps = 0
+    terminated = False
+
+    for _ in range(max_steps):
+        was_already_at_goal = goal_seen
         action, _ = model.predict(obs, deterministic=deterministic)
         obs, rewards, dones, _ = env.step(action)
         total_reward += float(rewards[0])
-        actions[step_idx] = np.asarray(action[0], dtype=np.float64)
-        states[step_idx + 1] = get_original_obs(env)
+
+        actions.append(np.asarray(action[0], dtype=np.float32))
+        state = get_original_obs(env)
+        states.append(state)
         frames.append(render_env._env.physics.render(height=height, width=width, camera_id=0))
+
+        if was_already_at_goal:
+            post_goal_steps += 1
+        elif reached_goal(state, goal_threshold):
+            goal_seen = True
+
         if bool(dones[0]):
+            terminated = True
+            break
+        if goal_seen and post_goal_steps >= max_blank_steps:
             break
 
-    if len(frames) != STEPS_PER_EPISODE + 1:
-        raise RuntimeError(
-            f"Trajectory for seed {trajectory_seed} produced {len(frames) - 1} steps; "
-            f"expected exactly {STEPS_PER_EPISODE}."
-        )
+    return (
+        np.stack(states, axis=0),
+        np.stack(actions, axis=0),
+        np.stack(frames, axis=0),
+        total_reward,
+        terminated,
+    )
 
-    return states, actions, np.stack(frames, axis=0), total_reward
+
+def create_resizable_dataset(
+    h5: h5py.File,
+    name: str,
+    shape_tail: tuple[int, ...],
+    dtype: np.dtype | type,
+    *,
+    compression: str | None = None,
+    chunks: tuple[int, ...] | bool | None = True,
+) -> h5py.Dataset:
+    return h5.create_dataset(
+        name,
+        shape=(0, *shape_tail),
+        maxshape=(None, *shape_tail),
+        dtype=dtype,
+        compression=compression,
+        chunks=chunks,
+    )
+
+
+def append_rows(dataset: h5py.Dataset, values: np.ndarray) -> tuple[int, int]:
+    start = int(dataset.shape[0])
+    end = start + int(values.shape[0])
+    dataset.resize((end, *dataset.shape[1:]))
+    dataset[start:end] = values
+    return start, end
+
+
+def valid_training_windows(ep_len: np.ndarray, *, history_size: int = 3, num_preds: int = 1, frameskip: int = 1) -> int:
+    num_steps = history_size + num_preds
+    required_last_frame_offset = (num_steps - 1) * frameskip
+    required_action_end_offset = history_size * frameskip
+    required_offset = max(required_last_frame_offset, required_action_end_offset)
+    return int(np.maximum(ep_len - 1 - required_offset + 1, 0).sum())
+
+
+def should_continue(args: argparse.Namespace, num_trajectories: int, total_transitions: int) -> bool:
+    if args.target_transitions is not None:
+        return total_transitions < args.target_transitions
+    return num_trajectories < args.num_trajectories
 
 
 def main() -> None:
     args = parse_args()
+    if args.target_transitions is not None and args.target_transitions < 1:
+        raise ValueError("--target-transitions must be positive when provided.")
+    if args.num_trajectories < 1:
+        raise ValueError("--num-trajectories must be positive.")
+    if args.max_steps_per_episode < 1:
+        raise ValueError("--max-steps-per-episode must be positive.")
+    if args.max_blank_steps < 0:
+        raise ValueError("--max-blank-steps cannot be negative.")
+    if args.min_steps < 1:
+        raise ValueError("--min-steps must be positive.")
+
     device = require_device(args.device)
 
     model_path = args.model_path.expanduser().resolve()
     vecnormalize_path = args.vecnormalize_path.expanduser().resolve()
     outdir = args.outdir.expanduser().resolve()
     video_dir = outdir / "videos"
+    output_path = outdir / args.output_name
     outdir.mkdir(parents=True, exist_ok=True)
     video_dir.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Output file already exists: {output_path}. Pass --overwrite to replace it.")
 
     env = make_eval_env(
         task=args.task,
@@ -131,73 +226,143 @@ def main() -> None:
     render_env = get_render_env(env)
     model = SAC.load(str(model_path), env=env, device=device)
 
-    states_np = np.empty((args.num_trajectories, STEPS_PER_EPISODE + 1, STATE_DIM), dtype=np.float64)
-    actions_np = np.empty((args.num_trajectories, STEPS_PER_EPISODE, ACTION_DIM), dtype=np.float64)
-    rewards_np = np.empty((args.num_trajectories,), dtype=np.float64)
+    compression = None if args.compression == "none" else args.compression
+    if output_path.exists():
+        output_path.unlink()
 
-    for traj_idx in tqdm(range(args.num_trajectories), desc="Collecting trajectories", unit="traj"):
-        trajectory_seed = args.seed + traj_idx
-        video_path = video_dir / f"trajectory_{traj_idx:07d}.mp4"
-        states, actions, frames, total_reward = collect_trajectory(
-            model=model,
-            env=env,
-            render_env=render_env,
-            trajectory_seed=trajectory_seed,
-            deterministic=args.deterministic,
-            width=args.width,
-            height=args.height,
-            max_steps=STEPS_PER_EPISODE,
+    rewards: list[float] = []
+    step_counts: list[int] = []
+    terminated_flags: list[bool] = []
+    skipped_short = 0
+    seed_offset = 0
+
+    with h5py.File(output_path, "w") as h5:
+        h5.attrs["format"] = "stable_worldmodel_hdf5"
+        h5.attrs["source"] = "data/reacher_data_gen.py"
+        h5.attrs["state_keys"] = json.dumps(["position(2)", "to_target(2)", "velocity(2)"])
+        h5.attrs["task"] = args.task
+        h5.attrs["deterministic"] = args.deterministic
+        h5.attrs["seed"] = args.seed
+        h5.attrs["model_path"] = str(model_path)
+        h5.attrs["vecnormalize_path"] = str(vecnormalize_path)
+        h5.attrs["video_dir"] = str(video_dir)
+        h5.attrs["video_resolution"] = json.dumps([args.height, args.width])
+        h5.attrs["video_fps"] = args.fps
+        h5.attrs["control_freq_hz"] = CONTROL_FREQ_HZ
+        h5.attrs["time_limit"] = args.time_limit
+        h5.attrs["goal_threshold"] = args.goal_threshold
+        h5.attrs["max_blank_steps"] = args.max_blank_steps
+        h5.attrs["max_steps_per_episode"] = args.max_steps_per_episode
+
+        ep_len_ds = create_resizable_dataset(h5, "ep_len", (), np.int64, chunks=True)
+        ep_offset_ds = create_resizable_dataset(h5, "ep_offset", (), np.int64, chunks=True)
+        reward_ds = create_resizable_dataset(h5, "reward", (), np.float32, chunks=True)
+        seed_ds = create_resizable_dataset(h5, "episode_seed", (), np.int64, chunks=True)
+        terminated_ds = create_resizable_dataset(h5, "terminated", (), np.bool_, chunks=True)
+        pixels_ds = create_resizable_dataset(
+            h5,
+            "pixels",
+            (args.height, args.width, 3),
+            np.uint8,
+            compression=compression,
+            chunks=(1, args.height, args.width, 3),
         )
-        imageio.mimwrite(
-            video_path,
-            frames,
-            fps=args.fps,
-            quality=args.quality,
-            macro_block_size=1,
-        )
-        states_np[traj_idx] = states
-        actions_np[traj_idx] = actions
-        rewards_np[traj_idx] = total_reward
+        action_ds = create_resizable_dataset(h5, "action", (ACTION_DIM,), np.float32, chunks=True)
+        obs_ds = create_resizable_dataset(h5, "observation", (STATE_DIM,), np.float32, chunks=True)
+        qpos_ds = create_resizable_dataset(h5, "qpos", (2,), np.float32, chunks=True)
+        qvel_ds = create_resizable_dataset(h5, "qvel", (2,), np.float32, chunks=True)
+        episode_idx_ds = create_resizable_dataset(h5, "episode_idx", (), np.int64, chunks=True)
+        step_idx_ds = create_resizable_dataset(h5, "step_idx", (), np.int64, chunks=True)
 
-    states_tensor = torch.from_numpy(states_np)
-    actions_tensor = torch.from_numpy(actions_np)
-    rewards_tensor = torch.from_numpy(rewards_np)
+        progress_total = args.target_transitions if args.target_transitions is not None else args.num_trajectories
+        progress_desc = "Collecting transitions" if args.target_transitions is not None else "Collecting trajectories"
+        progress_unit = "step" if args.target_transitions is not None else "traj"
+        with tqdm(total=progress_total, desc=progress_desc, unit=progress_unit) as progress:
+            while should_continue(args, len(step_counts), int(np.sum(step_counts, dtype=np.int64))):
+                trajectory_seed = args.seed + seed_offset
+                seed_offset += 1
+                states, actions, frames, total_reward, terminated = collect_trajectory(
+                    model=model,
+                    env=env,
+                    render_env=render_env,
+                    trajectory_seed=trajectory_seed,
+                    deterministic=args.deterministic,
+                    width=args.width,
+                    height=args.height,
+                    max_steps=args.max_steps_per_episode,
+                    goal_threshold=args.goal_threshold,
+                    max_blank_steps=args.max_blank_steps,
+                )
+                if actions.shape[0] < args.min_steps:
+                    skipped_short += 1
+                    continue
 
-    dataset = {
-        "states": states_tensor,
-        "actions": actions_tensor,
-        "rewards": rewards_tensor,
-        "num_trajectories": args.num_trajectories,
-        "steps_per_episode": STEPS_PER_EPISODE,
-        "control_freq_hz": CONTROL_FREQ_HZ,
-        "time_limit": args.time_limit,
-        "state_dim": int(states_tensor.shape[-1]),
-        "action_dim": int(actions_tensor.shape[-1]),
-        "state_dtype": str(states_tensor.dtype),
-        "action_dtype": str(actions_tensor.dtype),
-        "state_keys": ["position(2)", "to_target(2)", "velocity(2)"],
-        "task": args.task,
-        "deterministic": args.deterministic,
-        "seed": args.seed,
-        "model_path": str(model_path),
-        "vecnormalize_path": str(vecnormalize_path),
-        "video_dir": str(video_dir),
-        "video_resolution": [args.height, args.width],
-        "video_fps": args.fps,
-        "video_quality": args.quality,
-        "mean_reward": float(np.mean(rewards_np)) if len(rewards_np) else 0.0,
-    }
+                episode_idx = len(step_counts)
+                video_path = video_dir / f"trajectory_{episode_idx:07d}.mp4"
+                imageio.mimwrite(
+                    video_path,
+                    frames,
+                    fps=args.fps,
+                    quality=args.quality,
+                    macro_block_size=1,
+                )
 
-    output_path = outdir / "expert_data.pt"
-    torch.save(dataset, output_path)
-    print(f"Saved {args.num_trajectories} trajectories to {output_path}")
-    print(f"  states:  {tuple(states_tensor.shape)} {states_tensor.dtype}")
-    print(f"  actions: {tuple(actions_tensor.shape)} {actions_tensor.dtype}")
-    print(f"  rewards: {tuple(rewards_tensor.shape)} {rewards_tensor.dtype}")
-    print(f"  videos:  {video_dir}")
-    print(json.dumps({"mean_reward": dataset["mean_reward"], "time_limit": args.time_limit}, indent=2))
+                padded_actions = np.empty((states.shape[0], ACTION_DIM), dtype=np.float32)
+                padded_actions[:-1] = actions
+                padded_actions[-1] = np.nan
+
+                offset, _ = append_rows(pixels_ds, frames)
+                append_rows(action_ds, padded_actions)
+                append_rows(obs_ds, states)
+                append_rows(qpos_ds, states[:, :2])
+                append_rows(qvel_ds, states[:, 4:6])
+                append_rows(episode_idx_ds, np.full((states.shape[0],), episode_idx, dtype=np.int64))
+                append_rows(step_idx_ds, np.arange(states.shape[0], dtype=np.int64))
+                append_rows(ep_len_ds, np.asarray([states.shape[0]], dtype=np.int64))
+                append_rows(ep_offset_ds, np.asarray([offset], dtype=np.int64))
+                append_rows(reward_ds, np.asarray([total_reward], dtype=np.float32))
+                append_rows(seed_ds, np.asarray([trajectory_seed], dtype=np.int64))
+                append_rows(terminated_ds, np.asarray([terminated], dtype=np.bool_))
+
+                rewards.append(total_reward)
+                step_counts.append(int(actions.shape[0]))
+                terminated_flags.append(terminated)
+                progress.update(actions.shape[0] if args.target_transitions is not None else 1)
+                progress.set_postfix(
+                    episodes=len(step_counts),
+                    transitions=int(np.sum(step_counts, dtype=np.int64)),
+                    skipped=skipped_short,
+                )
+
+        ep_len = np.asarray(ep_len_ds[:], dtype=np.int64)
+        total_transitions = int(np.sum(step_counts, dtype=np.int64))
+        h5.attrs["num_episodes"] = len(step_counts)
+        h5.attrs["total_frames"] = int(pixels_ds.shape[0])
+        h5.attrs["total_transitions"] = total_transitions
+        h5.attrs["skipped_short_episodes"] = skipped_short
+        h5.attrs["mean_reward"] = float(np.mean(rewards)) if rewards else 0.0
+        h5.attrs["mean_episode_steps"] = float(np.mean(step_counts)) if step_counts else 0.0
+        h5.attrs["usable_train_windows_default"] = valid_training_windows(ep_len)
 
     env.close()
+
+    summary = {
+        "output_path": str(output_path),
+        "video_dir": str(video_dir),
+        "num_episodes": len(step_counts),
+        "total_transitions": int(np.sum(step_counts, dtype=np.int64)),
+        "total_frames": int(np.sum(step_counts, dtype=np.int64) + len(step_counts)),
+        "min_episode_steps": int(np.min(step_counts)) if step_counts else 0,
+        "mean_episode_steps": float(np.mean(step_counts)) if step_counts else 0.0,
+        "max_episode_steps": int(np.max(step_counts)) if step_counts else 0,
+        "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
+        "terminated_episodes": int(np.sum(terminated_flags, dtype=np.int64)),
+        "skipped_short_episodes": skipped_short,
+        "usable_train_windows_default": valid_training_windows(np.asarray(step_counts, dtype=np.int64) + 1)
+        if step_counts
+        else 0,
+    }
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

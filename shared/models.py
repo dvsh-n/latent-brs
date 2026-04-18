@@ -307,6 +307,69 @@ class MLPDynamicsPredictor(nn.Module):
         return pred.reshape(emb.shape[0], self.num_preds, self.embed_dim)
 
 
+def compute_augmented_states(emb: torch.Tensor) -> torch.Tensor:
+    """Build velocity-augmented states x_t = [z_t, z_t - z_{t-1}] from embeddings.
+
+    Args:
+        emb: (B, T, D) encoder embeddings.
+
+    Returns:
+        (B, T, 2*D) augmented states with zero velocity at t=0.
+    """
+    vel = torch.zeros_like(emb)
+    vel[:, 1:] = emb[:, 1:] - emb[:, :-1]
+    return torch.cat([emb, vel], dim=-1)
+
+
+class VelocityPredictor(nn.Module):
+    """Single-step MLP predictor on velocity-augmented latent states.
+
+    Takes x_t = [z_t, z_t - z_{t-1}] and an action (or action embedding),
+    and predicts x_{t+1} = [z_{t+1}, z_{t+1} - z_t].
+    """
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        action_dim: int | None = None,
+        hidden_width: int = 1024,
+        depth: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if depth < 1:
+            raise ValueError("depth must be at least 1.")
+
+        self.embed_dim = int(embed_dim)
+        self.action_dim = int(action_dim) if action_dim is not None else self.embed_dim
+        aug_dim = 2 * self.embed_dim
+        input_dim = aug_dim + self.action_dim
+
+        layers: list[nn.Module] = []
+        current_dim = input_dim
+        for _ in range(depth):
+            layers.append(nn.Linear(current_dim, hidden_width))
+            layers.append(nn.GELU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            current_dim = hidden_width
+        layers.append(nn.Linear(current_dim, aug_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, aug_state: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            aug_state: (B, 2*D) augmented state [z_t, z_t - z_{t-1}].
+            act_emb: (B, A) action (or action embedding) at time t, where
+                A matches ``action_dim`` passed at construction.
+
+        Returns:
+            (B, 2*D) predicted augmented state [z_{t+1}, z_{t+1} - z_t].
+        """
+        return self.net(torch.cat([aug_state, act_emb], dim=-1))
+
+
 class JEPA(nn.Module):
     """LE-WM joint-embedding predictive architecture."""
 
@@ -338,10 +401,26 @@ class JEPA(nn.Module):
             info["act_emb"] = self.action_encoder(info["action"])
         return info
 
+    @property
+    def _is_velocity_predictor(self) -> bool:
+        return isinstance(self.predictor, VelocityPredictor)
+
     def predict(self, emb: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
         preds = self.predictor(emb, act_emb)
         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
         return rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
+
+    def predict_velocity(self, aug_state: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
+        """Single-step prediction with VelocityPredictor.
+
+        Args:
+            aug_state: (B, 2*D) augmented state [z_t, delta_t].
+            act_emb: (B, D) action embedding.
+
+        Returns:
+            (B, 2*D) predicted augmented state.
+        """
+        return self.predictor(aug_state, act_emb)
 
     def rollout(self, info: dict[str, torch.Tensor], action_sequence: torch.Tensor, history_size: int = 3):
         assert "pixels" in info, "pixels not in info_dict"
@@ -360,7 +439,23 @@ class JEPA(nn.Module):
         act = rearrange(act_0, "b s ... -> (b s) ...")
         act_future = rearrange(act_future, "b s ... -> (b s) ...")
 
-        hs = history_size
+        if self._is_velocity_predictor:
+            self._rollout_velocity(emb, act, act_future, n_steps, info, b, s)
+        else:
+            self._rollout_ar(emb, act, act_future, n_steps, info, b, s, history_size)
+        return info
+
+    def _rollout_ar(
+        self,
+        emb: torch.Tensor,
+        act: torch.Tensor,
+        act_future: torch.Tensor,
+        n_steps: int,
+        info: dict[str, torch.Tensor],
+        b: int,
+        s: int,
+        hs: int,
+    ) -> None:
         for step in range(n_steps):
             act_emb = self.action_encoder(act)
             emb_trunc = emb[:, -hs:]
@@ -378,7 +473,40 @@ class JEPA(nn.Module):
         emb = torch.cat([emb, pred_emb], dim=1)
 
         info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=b, s=s)
-        return info
+
+    def _rollout_velocity(
+        self,
+        emb: torch.Tensor,
+        act: torch.Tensor,
+        act_future: torch.Tensor,
+        n_steps: int,
+        info: dict[str, torch.Tensor],
+        b: int,
+        s: int,
+    ) -> None:
+        d = emb.size(-1)
+        z_prev = emb[:, -2] if emb.size(1) >= 2 else emb[:, -1]
+        z_cur = emb[:, -1]
+        vel = z_cur - z_prev
+        aug = torch.cat([z_cur, vel], dim=-1)
+
+        for step in range(n_steps + 1):
+            if step < n_steps:
+                cur_act = act_future[:, step : step + 1, :]
+            else:
+                cur_act = act_future[:, -1:, :]
+
+            act_emb = self.action_encoder(cur_act)[:, 0]
+            pred_aug = self.predict_velocity(aug, act_emb)
+
+            z_next = pred_aug[:, :d]
+            emb = torch.cat([emb, z_next.unsqueeze(1)], dim=1)
+
+            vel = z_next - z_cur
+            aug = torch.cat([z_next, vel], dim=-1)
+            z_cur = z_next
+
+        info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=b, s=s)
 
     def criterion(self, info_dict: dict[str, torch.Tensor]) -> torch.Tensor:
         pred_emb = info_dict["predicted_emb"]
