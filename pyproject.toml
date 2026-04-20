@@ -8,5 +8,5 @@ version = "0.1.0"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["reacher", "reacher.*"]
+include = ["reacher", "reacher.*", "tpush", "tpush.*"]
 exclude = ["latent_brs_venv*", "third_party*"]
