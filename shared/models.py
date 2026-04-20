@@ -312,6 +312,73 @@ class MLPDynamicsPredictor(nn.Module):
         return pred.reshape(emb.shape[0], self.num_preds, self.embed_dim)
 
 
+class KoopmanDynamicsPredictor(nn.Module):
+    """Decoder-free Koopman predictor with lifted state z = [x, phi(x)]."""
+
+    def __init__(
+        self,
+        *,
+        state_dim: int,
+        action_dim: int,
+        koopman_embed_dim: int,
+        hidden_width: int = 1024,
+        depth: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if state_dim < 1:
+            raise ValueError("state_dim must be positive.")
+        if action_dim < 1:
+            raise ValueError("action_dim must be positive.")
+        if koopman_embed_dim < 1:
+            raise ValueError("koopman_embed_dim must be positive.")
+        if depth < 1:
+            raise ValueError("depth must be at least 1.")
+
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.koopman_embed_dim = int(koopman_embed_dim)
+        self.latent_dim = self.state_dim + self.koopman_embed_dim
+
+        layers: list[nn.Module] = []
+        current_dim = self.state_dim
+        for _ in range(depth):
+            layers.append(nn.Linear(current_dim, hidden_width))
+            layers.append(nn.GELU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            current_dim = hidden_width
+        layers.append(nn.Linear(current_dim, self.koopman_embed_dim))
+        self.encoder = nn.Sequential(*layers)
+
+        self.A = nn.Linear(self.latent_dim, self.latent_dim, bias=False)
+        self.B = nn.Linear(self.action_dim, self.latent_dim, bias=False)
+        nn.init.eye_(self.A.weight)
+        nn.init.xavier_uniform_(self.B.weight)
+
+    def lift_state(self, state: torch.Tensor) -> torch.Tensor:
+        return torch.cat((state, self.encoder(state)), dim=-1)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        if state.ndim != 3:
+            raise ValueError(f"Expected state with shape [batch, 1, dim], got {state.shape}.")
+        if action.ndim != 3:
+            raise ValueError(f"Expected action with shape [batch, horizon, dim], got {action.shape}.")
+        if state.shape[1] != 1:
+            raise ValueError(f"KoopmanDynamicsPredictor expects one initial state, got {state.shape[1]}.")
+        if state.shape[-1] != self.state_dim:
+            raise ValueError(f"Expected state_dim={self.state_dim}, got {state.shape[-1]}.")
+        if action.shape[-1] != self.action_dim:
+            raise ValueError(f"Expected action_dim={self.action_dim}, got {action.shape[-1]}.")
+
+        z_current = self.lift_state(state[:, 0])
+        z_pred = []
+        for step in range(action.shape[1]):
+            z_current = self.A(z_current) + self.B(action[:, step])
+            z_pred.append(z_current)
+        return torch.stack(z_pred, dim=1)
+
+
 class JEPA(nn.Module):
     """LE-WM joint-embedding predictive architecture."""
 
