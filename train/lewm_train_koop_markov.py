@@ -29,7 +29,7 @@ from shared.models import JEPA, KoopmanDynamicsPredictor, MLP, SIGReg
 
 
 DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
-DEFAULT_RUN_DIR = "models/lewm_reacher_koopdyn_markov"
+DEFAULT_RUN_DIR = "models/lewm_reacher_koopdyn_markov_1"
 FIXED_FRAMESKIP = 1
 
 
@@ -45,20 +45,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=18)
-    parser.add_argument("--koop-embedding-dim", "--koopman-embed-dim", dest="koop_embedding_dim", type=int, default=200)
+    parser.add_argument("--koop-embedding-dim", "--koopman-embed-dim", dest="koop_embedding_dim", type=int, default=400)
     parser.add_argument("--history-size", type=int, default=2)
     parser.add_argument("--num-preds", type=int, default=5, help="Linear Koopman rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
-    parser.add_argument("--predictor-hidden-width", type=int, default=512)
-    parser.add_argument("--predictor-depth", type=int, default=2)
+    parser.add_argument("--predictor-hidden-width", type=int, default=1024)
+    parser.add_argument("--predictor-depth", type=int, default=4)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.09)
+    parser.add_argument("--sigreg-weight", type=float, default=0.01)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
     parser.add_argument("--lambda-state", type=float, default=1.0)
-    parser.add_argument("--lambda-latent", type=float, default=0.1)
+    parser.add_argument("--lambda-latent", type=float, default=0.05)
 
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=120)
