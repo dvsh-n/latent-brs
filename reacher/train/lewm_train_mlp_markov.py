@@ -21,15 +21,11 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset, random_split
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
+from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
-DEFAULT_RUN_DIR = "models/lewm_reacher_mlpdyn_markov"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_RUN_DIR = "reacher/models/lewm_reacher_mlpdyn_markov"
 FIXED_FRAMESKIP = 1
 
 

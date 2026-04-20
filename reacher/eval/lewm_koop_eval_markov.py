@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate MLP-predictor LE-WM latent rollouts on one Reacher trajectory."""
+"""Evaluate Markov-state Koopman LE-WM latent rollouts on one Reacher trajectory."""
 
 from __future__ import annotations
 
@@ -20,17 +20,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from einops import rearrange
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from train.lewm_train_koop_markov import LeWMReacherDataset
 
-from train.lewm_train_mlp import LeWMReacherDataset
-
-DEFAULT_DATASET_PATH = "data/test_data/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "models/lewm_reacher_mlpdyn_multistep"
-DEFAULT_OUT_DIR = "eval/lewm_mlpdyn_eval"
+DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_expert_test.h5"
+DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koopdyn_markov"
+DEFAULT_OUT_DIR = "reacher/eval/lewm_koopdyn_markov_eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,7 +68,7 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
 
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -> None:
     defaults = {
-        "history_size": 3,
+        "history_size": 2,
         "num_preds": 1,
         "frameskip": 1,
         "img_size": 224,
@@ -93,6 +88,8 @@ def require_device(device_arg: str) -> torch.device:
 
 
 def valid_episode_indices(dataset_path: Path, *, args: argparse.Namespace) -> np.ndarray:
+    if int(args.history_size) < 2:
+        raise ValueError("history_size must be at least 2 for Markov latent states.")
     with h5py.File(dataset_path, "r") as h5:
         ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
     num_steps = int(args.history_size) + int(args.num_preds)
@@ -182,18 +179,26 @@ def rollout_latents(
         rollout_steps = min(rollout_steps, max_rollout_steps)
     if rollout_steps < 1:
         raise ValueError("Not enough actions for a rollout with the requested history/frameskip.")
+    if history_size < 2:
+        raise ValueError("history_size must be at least 2 for Markov latent states.")
 
-    emb = true_latents[:history_size].unsqueeze(0).clone()
-    pred_latents = [emb[0, step] for step in range(history_size)]
+    history = true_latents[:history_size].unsqueeze(0).clone()
+    pred_latents = [history[0, step] for step in range(history_size)]
+    embed_dim = true_latents.shape[-1]
+    current = history[:, -1]
+    past = history[:, -2]
+    state = torch.cat((current, current - past), dim=-1)
+    z_current = model.predictor.lift_state(state)
 
     for step in range(rollout_steps):
         action_start = (step + history_size - 1) * frameskip
         action_stop = action_start + frameskip
         act = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
         act_emb = model.action_encoder(act)
-        pred = model.predict(emb[:, -history_size:], act_emb)[:, 0]
+        z_current = model.predictor.A(z_current) + model.predictor.B(act_emb[:, 0])
+        pred_state = z_current[..., : 2 * embed_dim]
+        pred = pred_state[..., :embed_dim]
         pred_latents.append(pred[0])
-        emb = torch.cat([emb, pred.unsqueeze(1)], dim=1)
 
     return torch.stack(pred_latents, dim=0)
 
@@ -252,7 +257,7 @@ def plot_latents(
             axes[0].set_axis_off()
         axes[0].legend(loc="upper right")
         axes[-1].set_xlabel("trajectory frame")
-        fig.suptitle(f"MLP LE-WM latent rollout episode {episode_idx}, dims {start_dim}-{end_dim - 1}")
+        fig.suptitle(f"Markov Koopman LE-WM latent rollout episode {episode_idx}, dims {start_dim}-{end_dim - 1}")
         fig.tight_layout()
         path = out_dir / f"episode_{episode_idx:05d}_latents_part_{plot_idx}.png"
         fig.savefig(path, dpi=160)
@@ -324,6 +329,10 @@ def main() -> None:
             "dataset_path": str(dataset_path),
             "history_size": args.history_size,
             "action_history_size": 1,
+            "state_space": "latent_plus_latent_delta",
+            "markov_state_dim": int(true_latents.shape[-1] * 2),
+            "koop_embedding_dim": int(getattr(model.predictor, "koopman_embed_dim")),
+            "koopman_state_dim": int(getattr(model.predictor, "latent_dim")),
             "num_preds": args.num_preds,
             "frameskip": args.frameskip,
         }
@@ -347,6 +356,8 @@ def main() -> None:
                 "final_rmse": metrics["final_rmse"],
                 "checkpoint": str(checkpoint_path),
                 "action_history_size": 1,
+                "state_space": "latent_plus_latent_delta",
+                "koop_embedding_dim": metrics["koop_embedding_dim"],
                 "metrics_path": str(metrics_path),
                 "plot_paths": [str(path) for path in plot_paths],
             },

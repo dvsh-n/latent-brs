@@ -16,14 +16,11 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from reacher.train.lewm_train_mlp_markov import LeWMReacherDataset
 
-from train.lewm_train_mlp_markov import DEFAULT_DATASET_PATH, DEFAULT_RUN_DIR, LeWMReacherDataset
-
-
-DEFAULT_OUT_DIR = REPO_ROOT / "data"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_RUN_DIR = "reacher/models/lewm_reacher"
+DEFAULT_OUT_DIR = "reacher/data"
 
 
 def parse_args() -> argparse.Namespace:

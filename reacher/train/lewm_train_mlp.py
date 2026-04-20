@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train an LE-WM-style JEPA with decoder-free Koopman Markov latent dynamics."""
+"""Train an LE-WM-style JEPA with a raw-action MLP dynamics predictor."""
 
 from __future__ import annotations
 
@@ -21,15 +21,11 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset, random_split
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from shared.models import JEPA, KoopmanDynamicsPredictor, MLP, SIGReg
+from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "data/expert_data/reacher_expert.h5"
-DEFAULT_RUN_DIR = "models/lewm_reacher_koopdyn_markov_1"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_RUN_DIR = "reacher/models/lewm_reacher_mlpdyn_multistep"
 FIXED_FRAMESKIP = 1
 
 
@@ -44,24 +40,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=18)
-    parser.add_argument("--koop-embedding-dim", "--koopman-embed-dim", dest="koop_embedding_dim", type=int, default=400)
+    parser.add_argument("--embed-dim", type=int, default=24)
     parser.add_argument("--history-size", type=int, default=2)
-    parser.add_argument("--num-preds", type=int, default=5, help="Linear Koopman rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=1024)
     parser.add_argument("--predictor-depth", type=int, default=4)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.01)
+    parser.add_argument("--sigreg-weight", type=float, default=0.09)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--lambda-state", type=float, default=1.0)
-    parser.add_argument("--lambda-latent", type=float, default=0.05)
 
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=120)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=6)
     parser.add_argument("--prefetch-factor", type=int, default=3)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -73,8 +66,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-object-every", type=int, default=1)
     args = parser.parse_args()
     args.frameskip = FIXED_FRAMESKIP
-    args.markov_state_dim = 2 * args.embed_dim
-    args.koopman_state_dim = args.markov_state_dim + args.koop_embedding_dim
     return args
 
 
@@ -102,8 +93,6 @@ class LeWMReacherDataset(Dataset):
 
         if self.history_size < 1:
             raise ValueError("history_size must be positive.")
-        if self.history_size < 2:
-            raise ValueError("history_size must be at least 2 for Markov latent states.")
         if self.num_preds < 1:
             raise ValueError("num_preds must be positive.")
         if self.frameskip < 1:
@@ -206,33 +195,30 @@ class ModelObjectCallback(Callback):
 def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
     ctx_len = args.history_size
     n_preds = args.num_preds
-    embed_dim = args.embed_dim
+    lambd = args.sigreg_weight
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode(batch)
 
     emb = output["emb"]
     act_emb = output["act_emb"]
+    rollout_emb = emb[:, :ctx_len]
+    pred_losses = []
+    pred_embs = []
+    for step in range(n_preds):
+        ctx_emb = rollout_emb[:, -ctx_len:]
+        ctx_act = act_emb[:, step : step + 1]
 
-    current_emb = emb[:, ctx_len - 1]
-    past_emb = emb[:, ctx_len - 2]
-    init_state = torch.cat((current_emb, current_emb - past_emb), dim=-1)
+        pred_next = self.model.predict(ctx_emb, ctx_act)[:, 0]
+        tgt_next = emb[:, ctx_len + step]
+        pred_losses.append((pred_next - tgt_next).pow(2).mean())
+        pred_embs.append(pred_next)
+        rollout_emb = torch.cat((rollout_emb, pred_next.unsqueeze(1)), dim=1)
 
-    target_next = emb[:, ctx_len : ctx_len + n_preds]
-    target_prev = emb[:, ctx_len - 1 : ctx_len + n_preds - 1]
-    target_state = torch.cat((target_next, target_next - target_prev), dim=-1)
-
-    z_pred = self.model.predict(init_state.unsqueeze(1), act_emb[:, :n_preds])
-    pred_state = z_pred[..., : 2 * embed_dim]
-    z_target = self.model.predictor.lift_state(target_state.reshape(-1, 2 * embed_dim))
-    z_target = z_target.reshape(target_state.shape[0], target_state.shape[1], -1)
-
-    output["pred_emb"] = pred_state[..., :embed_dim]
-    output["loss_state"] = F.mse_loss(pred_state, target_state)
-    output["loss_latent"] = F.mse_loss(z_pred, z_target)
-    output["pred_loss"] = args.lambda_state * output["loss_state"] + args.lambda_latent * output["loss_latent"]
+    output["pred_emb"] = torch.stack(pred_embs, dim=1)
+    output["pred_loss"] = torch.stack(pred_losses).mean()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + args.sigreg_weight * output["sigreg_loss"]
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     log_prefix = "train" if stage == "fit" else stage
     losses = {f"{log_prefix}/{key}": value.detach() for key, value in output.items() if "loss" in key}
@@ -250,13 +236,14 @@ def build_model(args: argparse.Namespace) -> JEPA:
     )
     hidden_dim = encoder.config.hidden_size
     embed_dim = args.embed_dim
-    markov_state_dim = 2 * embed_dim
     effective_act_dim = args.frameskip * args.action_dim
 
-    predictor = KoopmanDynamicsPredictor(
-        state_dim=markov_state_dim,
+    predictor = MLPDynamicsPredictor(
+        embed_dim=embed_dim,
         action_dim=effective_act_dim,
-        koopman_embed_dim=args.koop_embedding_dim,
+        history_size=args.history_size,
+        action_history_size=1,
+        num_preds=1,
         hidden_width=args.predictor_hidden_width,
         depth=args.predictor_depth,
         dropout=args.predictor_dropout,

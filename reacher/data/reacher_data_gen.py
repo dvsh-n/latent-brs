@@ -18,18 +18,16 @@ import numpy as np
 from stable_baselines3 import SAC
 from tqdm.auto import tqdm
 
-from eval.reacher_policy_viz import (
-    DEFAULT_MODEL_PATH,
-    DEFAULT_VECNORMALIZE_PATH,
+from reacher.eval.reacher_policy_viz import (
     configure_offscreen_framebuffer,
     get_render_env,
     make_eval_env,
     require_device,
 )
 
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTDIR = REPO_ROOT / "data" / "test_data_100hz"
+DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"
+DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac/vecnormalize.pkl"
+DEFAULT_OUTDIR = "reacher/data/test_data_100hz"
 DEFAULT_OUTPUT_NAME = "reacher_expert_test.h5"
 
 # Local timing/video knobs.

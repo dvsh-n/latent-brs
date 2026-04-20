@@ -35,8 +35,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from tqdm.auto import tqdm
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "models" / "reacher-dm-control-sac-v3"
+DEFAULT_OUTPUT_DIR = "reacher/models/reacher-dm-control-sac-v3"
 
 
 def parse_args() -> argparse.Namespace:

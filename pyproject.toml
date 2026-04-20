@@ -8,4 +8,5 @@ version = "0.1.0"
 
 [tool.setuptools.packages.find]
 where = ["."]
-exclude = ["latent_brs_venv*", "third_party*", "waste*"]
+include = ["reacher", "reacher.*"]
+exclude = ["latent_brs_venv*", "third_party*"]

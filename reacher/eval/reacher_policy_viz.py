@@ -22,16 +22,12 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from tqdm.auto import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from reacher.train.reacher_train import DmControlGymEnv
 
-from train.reacher_train import DmControlGymEnv
-
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "models" / "reacher-dm-control-sac"
-DEFAULT_MODEL_PATH = DEFAULT_OUTPUT_DIR / "best_model" / "best_model.zip"
-DEFAULT_VECNORMALIZE_PATH = DEFAULT_OUTPUT_DIR / "vecnormalize.pkl"
-DEFAULT_OUTDIR = REPO_ROOT / "eval" / "reacher_videos"
+DEFAULT_OUTPUT_DIR = "reacher/models/reacher-dm-control-sac"
+DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"
+DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac/vecnormalize.pkl"
+DEFAULT_OUTDIR = "reacher/eval/reacher_videos"
 
 
 def parse_args() -> argparse.Namespace:

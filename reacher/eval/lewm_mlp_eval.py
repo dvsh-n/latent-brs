@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate LE-WM latent rollouts on one Reacher trajectory."""
+"""Evaluate MLP-predictor LE-WM latent rollouts on one Reacher trajectory."""
 
 from __future__ import annotations
 
@@ -22,15 +22,11 @@ import numpy as np
 import torch
 from einops import rearrange
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from reacher.train.lewm_train_mlp import LeWMReacherDataset
 
-from train.lewm_train import LeWMReacherDataset
-
-DEFAULT_DATASET_PATH = "data/test_data/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "models/lewm_reacher"
-DEFAULT_OUT_DIR = "eval/lewm_eval"
+DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_expert_test.h5"
+DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_mlpdyn_multistep"
+DEFAULT_OUT_DIR = "reacher/eval/lewm_mlpdyn_eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,9 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--episode-idx", type=int, default=None)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--history-size", type=int, default=None)
-    parser.add_argument("--action-history", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
     parser.add_argument("--frameskip", type=int, default=None)
     parser.add_argument("--img-size", type=int, default=None)
@@ -75,7 +70,6 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -> None:
     defaults = {
         "history_size": 3,
-        "action_history": True,
         "num_preds": 1,
         "frameskip": 1,
         "img_size": 224,
@@ -99,8 +93,8 @@ def valid_episode_indices(dataset_path: Path, *, args: argparse.Namespace) -> np
         ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
     num_steps = int(args.history_size) + int(args.num_preds)
     required_last_frame_offset = (num_steps - 1) * int(args.frameskip)
-    action_start_step = 0 if args.action_history else int(args.history_size) - 1
-    action_steps = int(args.history_size) if args.action_history else 1
+    action_start_step = int(args.history_size) - 1
+    action_steps = int(args.num_preds)
     required_action_end_offset = (action_start_step + action_steps) * int(args.frameskip)
     required_offset = max(required_last_frame_offset, required_action_end_offset)
     return np.flatnonzero(ep_len - 1 - required_offset >= 0)
@@ -125,7 +119,6 @@ def load_episode(
     dataset = LeWMReacherDataset(
         dataset_path,
         history_size=args.history_size,
-        action_history=args.action_history,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,
@@ -176,7 +169,6 @@ def rollout_latents(
     actions: torch.Tensor,
     *,
     history_size: int,
-    action_history: bool,
     frameskip: int,
     max_rollout_steps: int | None,
 ) -> torch.Tensor:
@@ -191,16 +183,11 @@ def rollout_latents(
     pred_latents = [emb[0, step] for step in range(history_size)]
 
     for step in range(rollout_steps):
-        action_blocks = []
-        first_action_idx = 0 if action_history else history_size - 1
-        action_steps = history_size if action_history else 1
-        for hist_idx in range(first_action_idx, first_action_idx + action_steps):
-            action_start = (step + hist_idx) * frameskip
-            action_stop = action_start + frameskip
-            action_blocks.append(actions[action_start:action_stop].reshape(-1))
-        act = torch.stack(action_blocks, dim=0).unsqueeze(0).to(device)
+        action_start = (step + history_size - 1) * frameskip
+        action_stop = action_start + frameskip
+        act = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
         act_emb = model.action_encoder(act)
-        pred = model.predict(emb[:, -history_size:], act_emb)[:, -1]
+        pred = model.predict(emb[:, -history_size:], act_emb)[:, 0]
         pred_latents.append(pred[0])
         emb = torch.cat([emb, pred.unsqueeze(1)], dim=1)
 
@@ -261,7 +248,7 @@ def plot_latents(
             axes[0].set_axis_off()
         axes[0].legend(loc="upper right")
         axes[-1].set_xlabel("trajectory frame")
-        fig.suptitle(f"LE-WM latent rollout episode {episode_idx}, dims {start_dim}-{end_dim - 1}")
+        fig.suptitle(f"MLP LE-WM latent rollout episode {episode_idx}, dims {start_dim}-{end_dim - 1}")
         fig.tight_layout()
         path = out_dir / f"episode_{episode_idx:05d}_latents_part_{plot_idx}.png"
         fig.savefig(path, dpi=160)
@@ -319,7 +306,6 @@ def main() -> None:
         true_latents,
         actions.to(device),
         history_size=args.history_size,
-        action_history=args.action_history,
         frameskip=args.frameskip,
         max_rollout_steps=args.max_rollout_steps,
     )
@@ -333,7 +319,8 @@ def main() -> None:
             "config_path": str(model_dir / "config.json"),
             "dataset_path": str(dataset_path),
             "history_size": args.history_size,
-            "action_history": args.action_history,
+            "action_history_size": 1,
+            "num_preds": args.num_preds,
             "frameskip": args.frameskip,
         }
     )
@@ -355,7 +342,7 @@ def main() -> None:
                 "mean_rmse": metrics["mean_rmse"],
                 "final_rmse": metrics["final_rmse"],
                 "checkpoint": str(checkpoint_path),
-                "action_history": args.action_history,
+                "action_history_size": 1,
                 "metrics_path": str(metrics_path),
                 "plot_paths": [str(path) for path in plot_paths],
             },

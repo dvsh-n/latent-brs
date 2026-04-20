@@ -17,14 +17,9 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-
-DEFAULT_DATASET_PATH = REPO_ROOT / "data" / "expert_data" / "reacher_expert.h5"
-DEFAULT_CHECKPOINT = REPO_ROOT / "models" / "lewm_reacher_mlp" / "lewm_epoch_50_object.ckpt"
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "data" / "expert_data" / "latent_traj_lewm_reacher_mlp.pt"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_CHECKPOINT = "reacher/models/lewm_reacher_mlp/lewm_epoch_50_object.ckpt"
+DEFAULT_OUTPUT_PATH = "reacher/data/expert_data/latent_traj_lewm_reacher_mlp.pt"
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
 

@@ -14,8 +14,8 @@ import torch
 from tqdm.auto import tqdm
 
 
-DEFAULT_DATASET_PATH = "data/test_data/test_data.pt"
-DEFAULT_OUTPUT_PATH = "data/test_data/reacher_expert_test.h5"
+DEFAULT_DATASET_PATH = "reacher/data/test_data/test_data.pt"
+DEFAULT_OUTPUT_PATH = "reacher/data/test_data/reacher_expert_test.h5"
 DEFAULT_DATASET_NAME = "reacher_expert_test"
 STATE_DIM = 6
 ACTION_DIM = 2
