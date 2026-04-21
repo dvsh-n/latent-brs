@@ -21,10 +21,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from train.lewm_train_koop_markov import LeWMReacherDataset
+from reacher.train.lewm_train_koop_nodec_markov import LeWMReacherDataset
 
 DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koopdyn_markov"
+DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koopdyn_markov_1"
 DEFAULT_OUT_DIR = "reacher/eval/lewm_koopdyn_markov_eval"
 
 

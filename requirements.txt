@@ -41,6 +41,7 @@ gitdb==4.0.12
 GitPython==3.1.46
 glfw==2.10.0
 grpcio==1.78.0
+gym-pusht==0.1.6
 gymnasium==1.2.3
 h11==0.16.0
 h5py==3.16.0
@@ -125,6 +126,7 @@ pydantic==2.12.5
 pydantic_core==2.41.5
 Pygments==2.20.0
 PyOpenGL==3.1.10
+pymunk==6.11.1
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 pytorch-lightning==2.6.1

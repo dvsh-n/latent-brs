@@ -1,10 +1,12 @@
 latent_brs_venv/
+temp_venv/
 /.codex
 .vscode/
 .claude/
 reacher/models/reacher-v5-sac-expert/
 reacher/models/reacher-dm-control-sac*/
 latent_brs.egg-info/
+*.safetensors
 *.pt
 *.pth
 *.h5
