@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate Markov-state Koopman LE-WM latent rollouts on one Reacher trajectory."""
+"""Evaluate Markov-state linear-decoder Koopman LE-WM latent rollouts on one Reacher trajectory."""
 
 from __future__ import annotations
 
@@ -21,11 +21,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from reacher.train.lewm_train_koop_nodec_markov import LeWMReacherDataset
+from reacher.train.lewm_train_koop_lindec_markov import LeWMReacherDataset
 
 DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koopdyn_markov_1"
-DEFAULT_OUT_DIR = "reacher/eval/lewm_koopdyn_markov_eval"
+DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koop_lindec_markov_1"
+DEFAULT_OUT_DIR = "reacher/eval/lewm_koop_lindec_markov_eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,9 +80,16 @@ def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -
         "img_size": 224,
         "action_dim": 2,
     }
-    for key, fallback in defaults.items():
-        if getattr(args, key) is None:
-            setattr(args, key, config.get(key, fallback))
+    if args.history_size is None:
+        args.history_size = config.get("history_size", defaults["history_size"])
+    if args.num_preds is None:
+        args.num_preds = config.get("num_preds", defaults["num_preds"])
+    if args.frameskip is None:
+        args.frameskip = config.get("frameskip", defaults["frameskip"])
+    if args.img_size is None:
+        args.img_size = config.get("img_size", defaults["img_size"])
+    if args.action_dim is None:
+        args.action_dim = config.get("action_dim", defaults["action_dim"])
 
 
 def require_device(device_arg: str) -> torch.device:
@@ -207,7 +214,7 @@ def rollout_latents(
         act = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
         act_emb = model.action_encoder(act)
         z_current = model.predictor.A(z_current) + model.predictor.B(act_emb[:, 0])
-        pred_state = z_current[..., : 2 * embed_dim]
+        pred_state = model.predictor.decode_state(z_current)
         pred = pred_state[..., :embed_dim]
         pred_latents.append(pred[0])
 
@@ -279,7 +286,7 @@ def plot_latents(
         axes[0].legend(loc="upper right")
         axes[-1].set_xlabel("trajectory frame")
         fig.suptitle(
-            f"Markov Koopman LE-WM latent rollout episode {episode_idx}, "
+            f"Markov linear-decoder Koopman LE-WM latent rollout episode {episode_idx}, "
             f"start {start_step}, dims {start_dim}-{end_dim - 1}"
         )
         fig.tight_layout()
@@ -369,7 +376,6 @@ def main() -> None:
             "state_space": "latent_plus_latent_delta",
             "markov_state_dim": int(true_latents.shape[-1] * 2),
             "koop_embedding_dim": int(getattr(model.predictor, "koopman_embed_dim")),
-            "koopman_state_dim": int(getattr(model.predictor, "latent_dim")),
             "num_preds": args.num_preds,
             "frameskip": args.frameskip,
         }
