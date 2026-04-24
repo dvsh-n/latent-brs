@@ -22,7 +22,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from tqdm.auto import tqdm
 
-from reacher.train.reacher_train import DmControlGymEnv
+from reacher.train.reacher_policy_train import DmControlGymEnv
 
 DEFAULT_OUTPUT_DIR = "reacher/models/reacher-dm-control-sac"
 DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"

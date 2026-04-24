@@ -23,9 +23,9 @@ import torch
 
 from reacher.train.lewm_train_koop_lindec_markov import LeWMReacherDataset
 
-DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koop_lindec_markov_1"
-DEFAULT_OUT_DIR = "reacher/eval/lewm_koop_lindec_markov_eval"
+DEFAULT_DATASET_PATH = "reacher/data/test_data_100hz/reacher_expert_test.h5"
+DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koop_lindec_markov_100hz_ms20"
+DEFAULT_OUT_DIR = "reacher/eval/lewm_koop_lindec_markov_eval_100hz"
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--start-step",
         type=int,
-        default=10,
+        default=0,
         help="Trajectory timestep where the warm-start history begins.",
     )
     return parser.parse_args()

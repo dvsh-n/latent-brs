@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate Markov-state Koopman LE-WM latent rollouts on one Reacher trajectory."""
+"""Evaluate LE-WM latent rollouts on one Reacher trajectory."""
 
 from __future__ import annotations
 
@@ -20,12 +20,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from einops import rearrange
 
-from reacher.train.lewm_train_koop_nodec_markov import LeWMReacherDataset
+from reacher.waste.lewm_train import LeWMReacherDataset
 
-DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koopdyn_markov_1"
-DEFAULT_OUT_DIR = "reacher/eval/lewm_koopdyn_markov_eval"
+DEFAULT_DATASET_PATH = "data/test_data/reacher_expert_test.h5"
+DEFAULT_MODEL_DIR = "models/lewm_reacher"
+DEFAULT_OUT_DIR = "eval/lewm_eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,20 +36,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--episode-idx", type=int, default=None)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--history-size", type=int, default=None)
+    parser.add_argument("--action-history", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
     parser.add_argument("--frameskip", type=int, default=None)
     parser.add_argument("--img-size", type=int, default=None)
     parser.add_argument("--action-dim", type=int, default=None)
     parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--max-rollout-steps", type=int, default=None)
-    parser.add_argument(
-        "--start-step",
-        type=int,
-        default=10,
-        help="Trajectory timestep where the warm-start history begins.",
-    )
     return parser.parse_args()
 
 
@@ -74,7 +70,8 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
 
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -> None:
     defaults = {
-        "history_size": 2,
+        "history_size": 3,
+        "action_history": True,
         "num_preds": 1,
         "frameskip": 1,
         "img_size": 224,
@@ -94,14 +91,12 @@ def require_device(device_arg: str) -> torch.device:
 
 
 def valid_episode_indices(dataset_path: Path, *, args: argparse.Namespace) -> np.ndarray:
-    if int(args.history_size) < 2:
-        raise ValueError("history_size must be at least 2 for Markov latent states.")
     with h5py.File(dataset_path, "r") as h5:
         ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
     num_steps = int(args.history_size) + int(args.num_preds)
     required_last_frame_offset = (num_steps - 1) * int(args.frameskip)
-    action_start_step = int(args.history_size) - 1
-    action_steps = int(args.num_preds)
+    action_start_step = 0 if args.action_history else int(args.history_size) - 1
+    action_steps = int(args.history_size) if args.action_history else 1
     required_action_end_offset = (action_start_step + action_steps) * int(args.frameskip)
     required_offset = max(required_last_frame_offset, required_action_end_offset)
     return np.flatnonzero(ep_len - 1 - required_offset >= 0)
@@ -126,6 +121,7 @@ def load_episode(
     dataset = LeWMReacherDataset(
         dataset_path,
         history_size=args.history_size,
+        action_history=args.action_history,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,
@@ -176,62 +172,47 @@ def rollout_latents(
     actions: torch.Tensor,
     *,
     history_size: int,
+    action_history: bool,
     frameskip: int,
     max_rollout_steps: int | None,
-    start_step: int,
 ) -> torch.Tensor:
     device = true_latents.device
-    rollout_steps = (actions.shape[0] - (start_step + history_size * frameskip)) // frameskip + 1
+    rollout_steps = (actions.shape[0] - history_size * frameskip) // frameskip + 1
     if max_rollout_steps is not None:
         rollout_steps = min(rollout_steps, max_rollout_steps)
     if rollout_steps < 1:
         raise ValueError("Not enough actions for a rollout with the requested history/frameskip.")
-    if history_size < 2:
-        raise ValueError("history_size must be at least 2 for Markov latent states.")
-    if start_step < 0:
-        raise ValueError("start_step must be non-negative.")
-    if start_step + history_size >= true_latents.shape[0]:
-        raise ValueError("start_step is too large for the requested history_size and episode length.")
 
-    history = true_latents[start_step : start_step + history_size].unsqueeze(0).clone()
-    pred_latents = [history[0, step] for step in range(history_size)]
-    embed_dim = true_latents.shape[-1]
-    current = history[:, -1]
-    past = history[:, -2]
-    state = torch.cat((current, current - past), dim=-1)
-    z_current = model.predictor.lift_state(state)
+    emb = true_latents[:history_size].unsqueeze(0).clone()
+    pred_latents = [emb[0, step] for step in range(history_size)]
 
     for step in range(rollout_steps):
-        action_start = start_step + (step + history_size - 1) * frameskip
-        action_stop = action_start + frameskip
-        act = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
+        action_blocks = []
+        first_action_idx = 0 if action_history else history_size - 1
+        action_steps = history_size if action_history else 1
+        for hist_idx in range(first_action_idx, first_action_idx + action_steps):
+            action_start = (step + hist_idx) * frameskip
+            action_stop = action_start + frameskip
+            action_blocks.append(actions[action_start:action_stop].reshape(-1))
+        act = torch.stack(action_blocks, dim=0).unsqueeze(0).to(device)
         act_emb = model.action_encoder(act)
-        z_current = model.predictor.A(z_current) + model.predictor.B(act_emb[:, 0])
-        pred_state = z_current[..., : 2 * embed_dim]
-        pred = pred_state[..., :embed_dim]
+        pred = model.predict(emb[:, -history_size:], act_emb)[:, -1]
         pred_latents.append(pred[0])
+        emb = torch.cat([emb, pred.unsqueeze(1)], dim=1)
 
     return torch.stack(pred_latents, dim=0)
 
 
-def compute_metrics(
-    true_latents: torch.Tensor,
-    pred_latents: torch.Tensor,
-    *,
-    history_size: int,
-    start_step: int,
-) -> dict[str, object]:
-    true_segment = true_latents[start_step:]
-    length = min(true_segment.shape[0], pred_latents.shape[0])
+def compute_metrics(true_latents: torch.Tensor, pred_latents: torch.Tensor, *, history_size: int) -> dict[str, object]:
+    length = min(true_latents.shape[0], pred_latents.shape[0])
     if length <= history_size:
         raise ValueError("Rollout is not longer than the warm-start history.")
-    true = true_segment[history_size:length].float().cpu()
+    true = true_latents[history_size:length].float().cpu()
     pred = pred_latents[history_size:length].float().cpu()
     err = pred - true
     rmse_per_step = err.pow(2).mean(dim=-1).sqrt()
     rmse_per_dim = err.pow(2).mean(dim=0).sqrt()
     return {
-        "start_step": int(start_step),
         "num_context_steps": int(history_size),
         "num_rollout_steps": int(true.shape[0]),
         "embed_dim": int(true.shape[-1]),
@@ -250,12 +231,10 @@ def plot_latents(
     out_dir: Path,
     episode_idx: int,
     history_size: int,
-    start_step: int,
 ) -> list[Path]:
-    true = true_latents.float().cpu().numpy()
-    pred = np.full_like(true, np.nan)
-    rollout_length = min(true.shape[0] - start_step, pred_latents.shape[0])
-    pred[start_step : start_step + rollout_length] = pred_latents[:rollout_length].float().cpu().numpy()
+    length = min(true_latents.shape[0], pred_latents.shape[0])
+    true = true_latents[:length].float().cpu().numpy()
+    pred = pred_latents[:length].float().cpu().numpy()
     embed_dim = true.shape[-1]
     midpoint = (embed_dim + 1) // 2
     splits = [(0, midpoint), (midpoint, embed_dim)]
@@ -266,11 +245,11 @@ def plot_latents(
         fig, axes = plt.subplots(num_dims, 1, figsize=(12, max(3, 1.8 * num_dims)), sharex=True)
         if num_dims == 1:
             axes = [axes]
-        steps = np.arange(true.shape[0])
+        steps = np.arange(length)
         for axis, dim in zip(axes, range(start_dim, end_dim)):
             axis.plot(steps, true[:, dim], label="true", linewidth=1.5)
             axis.plot(steps, pred[:, dim], label="rollout", linewidth=1.2, linestyle="--")
-            axis.axvline(start_step + history_size - 0.5, color="black", alpha=0.25, linewidth=1)
+            axis.axvline(history_size - 0.5, color="black", alpha=0.25, linewidth=1)
             axis.set_ylabel(f"z{dim}")
             axis.grid(True, alpha=0.25)
         if start_dim == end_dim:
@@ -278,12 +257,9 @@ def plot_latents(
             axes[0].set_axis_off()
         axes[0].legend(loc="upper right")
         axes[-1].set_xlabel("trajectory frame")
-        fig.suptitle(
-            f"Markov Koopman LE-WM latent rollout episode {episode_idx}, "
-            f"start {start_step}, dims {start_dim}-{end_dim - 1}"
-        )
+        fig.suptitle(f"LE-WM latent rollout episode {episode_idx}, dims {start_dim}-{end_dim - 1}")
         fig.tight_layout()
-        path = out_dir / f"episode_{episode_idx:05d}_start_{start_step:05d}_latents_part_{plot_idx}.png"
+        path = out_dir / f"episode_{episode_idx:05d}_latents_part_{plot_idx}.png"
         fig.savefig(path, dpi=160)
         plt.close(fig)
         paths.append(path)
@@ -328,13 +304,6 @@ def main() -> None:
 
     model = load_model(checkpoint_path, device)
     pixels, actions = load_episode(dataset_path, episode_idx, args=args)
-    if args.start_step < 0:
-        raise ValueError("start_step must be non-negative.")
-    if args.start_step + args.history_size >= pixels.shape[0]:
-        raise ValueError(
-            f"start_step {args.start_step} leaves no rollout target frames in episode {episode_idx} "
-            f"(length={pixels.shape[0]}, history_size={args.history_size})."
-        )
     true_latents = encode_frames(
         model,
         pixels,
@@ -346,17 +315,12 @@ def main() -> None:
         true_latents,
         actions.to(device),
         history_size=args.history_size,
+        action_history=args.action_history,
         frameskip=args.frameskip,
         max_rollout_steps=args.max_rollout_steps,
-        start_step=args.start_step,
     )
 
-    metrics = compute_metrics(
-        true_latents,
-        pred_latents,
-        history_size=args.history_size,
-        start_step=args.start_step,
-    )
+    metrics = compute_metrics(true_latents, pred_latents, history_size=args.history_size)
     metrics.update(
         {
             "episode_idx": episode_idx,
@@ -365,16 +329,11 @@ def main() -> None:
             "config_path": str(model_dir / "config.json"),
             "dataset_path": str(dataset_path),
             "history_size": args.history_size,
-            "action_history_size": 1,
-            "state_space": "latent_plus_latent_delta",
-            "markov_state_dim": int(true_latents.shape[-1] * 2),
-            "koop_embedding_dim": int(getattr(model.predictor, "koopman_embed_dim")),
-            "koopman_state_dim": int(getattr(model.predictor, "latent_dim")),
-            "num_preds": args.num_preds,
+            "action_history": args.action_history,
             "frameskip": args.frameskip,
         }
     )
-    metrics_path = out_dir / f"episode_{episode_idx:05d}_start_{args.start_step:05d}_metrics.json"
+    metrics_path = out_dir / f"episode_{episode_idx:05d}_metrics.json"
     with metrics_path.open("w") as f:
         json.dump(metrics, f, indent=2)
 
@@ -384,19 +343,15 @@ def main() -> None:
         out_dir=out_dir,
         episode_idx=episode_idx,
         history_size=args.history_size,
-        start_step=args.start_step,
     )
     print(
         json.dumps(
             {
                 "episode_idx": episode_idx,
-                "start_step": args.start_step,
                 "mean_rmse": metrics["mean_rmse"],
                 "final_rmse": metrics["final_rmse"],
                 "checkpoint": str(checkpoint_path),
-                "action_history_size": 1,
-                "state_space": "latent_plus_latent_delta",
-                "koop_embedding_dim": metrics["koop_embedding_dim"],
+                "action_history": args.action_history,
                 "metrics_path": str(metrics_path),
                 "plot_paths": [str(path) for path in plot_paths],
             },

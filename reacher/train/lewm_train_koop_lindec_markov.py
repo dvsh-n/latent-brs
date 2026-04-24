@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, KoopmanLinearDecoderPredictor, MLP, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
-DEFAULT_RUN_DIR = "reacher/models/lewm_reacher_koop_lindec_markov"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data_100hz/reacher_expert.h5"
+DEFAULT_RUN_DIR = "reacher/models/lewm_reacher_koop_lindec_markov_100hz_ms20"
 FIXED_FRAMESKIP = 1
 
 
@@ -35,15 +35,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--output-model-name", default="lewm")
     parser.add_argument("--seed", type=int, default=3072)
-    parser.add_argument("--train-split", type=float, default=0.9)
+    parser.add_argument("--train-split", type=float, default=0.95)
 
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=18)
-    parser.add_argument("--koop-embedding-dim", "--koopman-embed-dim", dest="koop_embedding_dim", type=int, default=400)
+    parser.add_argument("--koop-embedding-dim", "--koopman-embed-dim", dest="koop_embedding_dim", type=int, default=256)
     parser.add_argument("--history-size", type=int, default=2)
-    parser.add_argument("--num-preds", type=int, default=5, help="Linear Koopman rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=20, help="Linear Koopman rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=1024)
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-latent", type=float, default=0.05)
 
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=120)
+    parser.add_argument("--batch-size", type=int, default=35)
     parser.add_argument("--num-workers", type=int, default=6)
     parser.add_argument("--prefetch-factor", type=int, default=3)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -67,7 +67,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", default="auto")
     parser.add_argument("--precision", default="bf16-mixed")
     parser.add_argument("--save-object-every", type=int, default=1)
+    parser.add_argument("--accumulate-grad-batches", type=int, default=4)
     args = parser.parse_args()
+    if args.accumulate_grad_batches < 1:
+        parser.error("--accumulate-grad-batches must be at least 1.")
     args.frameskip = FIXED_FRAMESKIP
     args.markov_state_dim = 2 * args.embed_dim
     return args
@@ -347,6 +350,7 @@ def main() -> None:
         accelerator=args.accelerator,
         devices=args.devices,
         precision=args.precision,
+        accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=args.gradient_clip_val,
         callbacks=callbacks,
         default_root_dir=run_dir,
