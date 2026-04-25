@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--episode-idx", type=int, default=None)
+    parser.add_argument("--episode-idx", type=int, default=121)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--history-size", type=int, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--start-step",
         type=int,
-        default=0,
+        default=20,
         help="Trajectory timestep where the warm-start history begins.",
     )
     return parser.parse_args()
