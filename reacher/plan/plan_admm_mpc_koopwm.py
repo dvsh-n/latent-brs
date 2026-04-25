@@ -34,7 +34,7 @@ DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koop_lindec_markov_100hz_ms20"
 DEFAULT_OUT_DIR = "reacher/plan/admm_mpc_koopwm"
 
 DEVICE = "cuda"
-TASK = "hard"
+GOAL_QPOS_TOL = 1
 HORIZON = 25
 MAX_MPC_STEPS = 500
 
@@ -65,7 +65,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
-    parser.add_argument("--task", choices=("easy", "hard"), default=TASK)
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--horizon", type=int, default=HORIZON)
     parser.add_argument("--max-mpc-steps", type=int, default=MAX_MPC_STEPS)
@@ -208,6 +207,17 @@ def raw_to_normalized_bounds(
     low_norm = (low - action_mean.reshape(-1)) / action_std.reshape(-1)
     high_norm = (high - action_mean.reshape(-1)) / action_std.reshape(-1)
     return low_norm.astype(np.float32), high_norm.astype(np.float32)
+
+
+def goal_reached(
+    env: DmControlGymEnv,
+    goal_qpos: np.ndarray,
+) -> tuple[bool, float]:
+    physics = env._env.physics
+    current_qpos = np.asarray(physics.data.qpos[: goal_qpos.shape[0]], dtype=np.float32)
+    qpos_err = float(np.linalg.norm(current_qpos - goal_qpos))
+    reached = qpos_err <= GOAL_QPOS_TOL
+    return reached, qpos_err
 
 
 class GPUADMM_MPCSolver:
@@ -496,7 +506,6 @@ def load_dataset_episode(
 
 def make_render_env(
     *,
-    task: str,
     seed: int,
     time_limit: float,
     width: int,
@@ -505,7 +514,7 @@ def make_render_env(
 ) -> DmControlGymEnv:
     env = DmControlGymEnv(
         domain_name="reacher",
-        task_name=task,
+        task_name="hard",
         seed=seed,
         time_limit=time_limit,
         action_cost_weight=0.0,
@@ -638,7 +647,6 @@ def main() -> None:
     terminal_target = goal_emb_curr.detach().cpu().numpy().astype(np.float32) - c_bias[:embed_dim]
 
     env = make_render_env(
-        task=args.task,
         seed=episode_seed,
         time_limit=time_limit,
         width=width,
@@ -701,16 +709,9 @@ def main() -> None:
         initial_decoded = model.predictor.decode_state(initial_z.unsqueeze(0)).squeeze(0)
 
     rollout_frames = [render_start.copy()]
-    observed_embeddings = [current_emb.detach().cpu().numpy()]
-    latent_goal_distances = []
-    decoded_embedding_goal_distances = []
-    raw_goal_obs_distances = []
     solve_times = []
-    executed_actions_raw = []
-    executed_actions_norm = []
-    plan_terminal_decoded = []
-    terminal_embedding_goal_distances = []
     sim_observations = [start_obs.copy()]
+    num_executed_steps = 0
 
     timing_sums = {
         "encode": 0.0,
@@ -723,9 +724,18 @@ def main() -> None:
     goal_obs = obs_np[-1]
     goal_qpos = qpos_np[-1]
     goal_qvel = qvel_np[-1]
+    stop_reason = "max_mpc_steps"
+    initial_goal_latent_distance = float(torch.linalg.vector_norm(initial_z - z_goal).item())
+    initial_goal_decoded_embedding_distance = float(torch.linalg.vector_norm(initial_decoded[:embed_dim] - goal_emb_curr).item())
+    initial_goal_observation_distance = float(np.linalg.norm(start_obs - goal_obs))
 
     pbar = tqdm(range(args.max_mpc_steps), desc="MPC Steps")
     for _ in pbar:
+        reached_goal, qpos_err = goal_reached(env, goal_qpos)
+        if reached_goal:
+            stop_reason = "goal_reached"
+            break
+
         step_t0 = time.perf_counter()
 
         encode_t0 = time.perf_counter()
@@ -736,10 +746,7 @@ def main() -> None:
         maybe_cuda_synchronize(device)
         timing_sums["encode"] += time.perf_counter() - encode_t0
 
-        latent_goal_distances.append(float(torch.linalg.vector_norm(z_current - z_goal).item()))
-        decoded_current_emb = decoded_current[:embed_dim]
-        decoded_embedding_goal_distances.append(float(torch.linalg.vector_norm(decoded_current_emb - goal_emb_curr).item()))
-        raw_goal_obs_distances.append(float(np.linalg.norm(sim_observations[-1] - goal_obs)))
+        current_decoded_embedding_goal_distance = float(torch.linalg.vector_norm(decoded_current[:embed_dim] - goal_emb_curr).item())
 
         solve_t0 = time.perf_counter()
         z_traj_t, u_traj_t, solve_time = mpc_solver.solve_torch(z_current)
@@ -752,15 +759,9 @@ def main() -> None:
         maybe_cuda_synchronize(device)
         timing_sums["decode"] += time.perf_counter() - decode_t0
 
-        plan_terminal_decoded.append(decoded_terminal.detach().cpu().numpy())
-        terminal_embedding_goal_distances.append(
-            float(torch.linalg.vector_norm(decoded_terminal[:embed_dim] - goal_emb_curr).item())
-        )
-
         u0_norm = u_traj_t[0].detach().cpu().numpy()
         u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
-        executed_actions_norm.append(u0_norm.copy())
-        executed_actions_raw.append(u0_raw.copy())
+        num_executed_steps += 1
 
         step_env_t0 = time.perf_counter()
         obs, _, terminated, truncated, _ = env.step(u0_raw)
@@ -778,36 +779,31 @@ def main() -> None:
 
         rollout_frames.append(frame.copy())
         sim_observations.append(np.asarray(obs, dtype=np.float32).copy())
-        observed_embeddings.append(next_emb.detach().cpu().numpy())
 
         current_prev_emb = current_emb
         current_emb = next_emb
 
         timing_sums["total"] += time.perf_counter() - step_t0
 
-        qpos_err = float(np.linalg.norm(env._env.physics.data.qpos[: goal_qpos.shape[0]] - goal_qpos))
-        qvel_err = float(np.linalg.norm(env._env.physics.data.qvel[: goal_qvel.shape[0]] - goal_qvel))
+        reached_goal, qpos_err = goal_reached(env, goal_qpos)
         pbar.set_postfix(
             solve_ms=f"{solve_time * 1000.0:.2f}",
-            emb_goal=f"{decoded_embedding_goal_distances[-1]:.3f}",
+            emb_goal=f"{current_decoded_embedding_goal_distance:.3f}",
             qpos_goal=f"{qpos_err:.3f}",
         )
 
-        if terminated or truncated:
+        if reached_goal:
+            stop_reason = "goal_reached"
             break
 
-    executed_actions_raw_np = np.asarray(executed_actions_raw, dtype=np.float32)
-    executed_actions_norm_np = np.asarray(executed_actions_norm, dtype=np.float32)
-    latent_goal_distances_np = np.asarray(latent_goal_distances, dtype=np.float64)
-    decoded_embedding_goal_distances_np = np.asarray(decoded_embedding_goal_distances, dtype=np.float64)
-    raw_goal_obs_distances_np = np.asarray(raw_goal_obs_distances, dtype=np.float64)
-    plan_terminal_decoded_np = np.asarray(plan_terminal_decoded, dtype=np.float32)
-    terminal_embedding_goal_distances_np = np.asarray(terminal_embedding_goal_distances, dtype=np.float64)
+        if terminated or truncated:
+            stop_reason = "terminated" if terminated else "truncated"
+            break
 
     final_qpos = np.asarray(env._env.physics.data.qpos[: goal_qpos.shape[0]], dtype=np.float32)
     final_qvel = np.asarray(env._env.physics.data.qvel[: goal_qvel.shape[0]], dtype=np.float32)
-    final_frame = rollout_frames[-1]
     final_emb = current_emb
+    _, final_goal_qpos_distance = goal_reached(env, goal_qpos)
     with torch.inference_mode():
         final_markov = build_markov_state(final_emb, current_prev_emb)
         z_final = model.predictor.lift_state(final_markov.unsqueeze(0)).squeeze(0)
@@ -819,23 +815,23 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "dataset_path": str(dataset_path),
         "train_dataset_path": str(train_dataset_path),
-        "task": args.task,
+        "goal_qpos_tolerance": GOAL_QPOS_TOL,
         "history_size": history_size,
         "horizon": args.horizon,
         "max_mpc_steps": args.max_mpc_steps,
-        "num_executed_steps": int(executed_actions_raw_np.shape[0]),
+        "num_executed_steps": int(num_executed_steps),
+        "stop_reason": stop_reason,
+        "goal_reached": stop_reason == "goal_reached",
+        "final_goal_qpos_distance": float(final_goal_qpos_distance),
         "physics_freq_hz": physics_freq_hz,
-        "initial_goal_latent_distance": float(latent_goal_distances_np[0]) if latent_goal_distances_np.size else None,
+        "initial_goal_latent_distance": initial_goal_latent_distance,
         "final_goal_latent_distance": float(torch.linalg.vector_norm(z_final - z_goal).item()),
-        "initial_goal_decoded_embedding_distance": (
-            float(decoded_embedding_goal_distances_np[0]) if decoded_embedding_goal_distances_np.size else None
-        ),
+        "initial_goal_decoded_embedding_distance": initial_goal_decoded_embedding_distance,
         "final_goal_decoded_embedding_distance": float(torch.linalg.vector_norm(decoded_final[:embed_dim] - goal_emb_curr).item()),
         "initial_goal_decoded_state_distance": float(torch.linalg.vector_norm(initial_decoded - decoded_goal).item()),
         "final_goal_decoded_state_distance": float(torch.linalg.vector_norm(decoded_final - decoded_goal).item()),
-        "initial_goal_observation_distance": float(raw_goal_obs_distances_np[0]) if raw_goal_obs_distances_np.size else None,
+        "initial_goal_observation_distance": initial_goal_observation_distance,
         "final_goal_observation_distance": float(np.linalg.norm(sim_observations[-1] - goal_obs)),
-        "final_goal_qpos_distance": float(np.linalg.norm(final_qpos - goal_qpos)),
         "final_goal_qvel_distance": float(np.linalg.norm(final_qvel - goal_qvel)),
         "initial_render_vs_dataset_start_embedding_distance": float(torch.linalg.vector_norm(start_raw_emb - start_emb_curr).item()),
         "mean_solve_time_ms": float(np.mean(solve_times) * 1000.0) if solve_times else 0.0,
@@ -854,36 +850,7 @@ def main() -> None:
     with metrics_path.open("w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)
 
-    np.save(out_dir / "executed_actions_raw.npy", executed_actions_raw_np)
-    np.save(out_dir / "executed_actions_normalized.npy", executed_actions_norm_np)
-    np.save(out_dir / "latent_goal_distances.npy", latent_goal_distances_np)
-    np.save(out_dir / "decoded_embedding_goal_distances.npy", decoded_embedding_goal_distances_np)
-    np.save(out_dir / "observation_goal_distances.npy", raw_goal_obs_distances_np)
-    np.save(out_dir / "plan_terminal_decoded.npy", plan_terminal_decoded_np)
-    np.save(out_dir / "terminal_embedding_goal_distances.npy", terminal_embedding_goal_distances_np)
-    np.save(out_dir / "observed_embeddings.npy", np.asarray(observed_embeddings, dtype=np.float32))
-
     plot_paths: list[str] = []
-    if ENABLE_PLOTS and executed_actions_raw_np.size > 0:
-        plot_paths.append(str(plot_action_traces(executed_actions_raw_np, out_dir / "actions.png")))
-        plot_paths.append(
-            str(
-                plot_goal_distance_curve(
-                    latent_goal_distances_np,
-                    decoded_embedding_goal_distances_np,
-                    out_dir / "goal_distances.png",
-                )
-            )
-        )
-        plot_paths.append(
-            str(
-                plot_terminal_predictions(
-                    plan_terminal_decoded_np,
-                    decoded_goal.detach().cpu().numpy(),
-                    out_dir / "terminal_predictions.png",
-                )
-            )
-        )
 
     video_path = None
     if ENABLE_ROLLOUT_VIDEO and rollout_frames:
@@ -917,6 +884,8 @@ def main() -> None:
                 indent=2,
             )
         )
+
+    print(f"Saved to: {out_dir}")
 
     if SHOW_PLOTS:
         plt.show()
