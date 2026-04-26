@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
-DEFAULT_RUN_DIR = "reacher/models/lewm_reacher_mlpdyn_markov"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data_100hz/reacher_expert.h5"
+DEFAULT_RUN_DIR = "reacher/models/lewm_reacher_mlpdyn_markov_100hz_straighten"
 FIXED_FRAMESKIP = 1
 
 
@@ -40,18 +40,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=24)
-    parser.add_argument("--history-size", type=int, default=2)
+    parser.add_argument("--embed-dim", type=int, default=9)
+    parser.add_argument("--history-size", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
-    parser.add_argument("--predictor-hidden-width", type=int, default=1024)
-    parser.add_argument("--predictor-depth", type=int, default=4)
+    parser.add_argument("--predictor-hidden-width", type=int, default=512)
+    parser.add_argument("--predictor-depth", type=int, default=2)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.09)
+    parser.add_argument("--sigreg-weight", type=float, default=0.009)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
+    parser.add_argument("--straighten", action="store_true", help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -94,8 +96,6 @@ class LeWMReacherDataset(Dataset):
 
         if self.history_size < 1:
             raise ValueError("history_size must be positive.")
-        if self.history_size < 2:
-            raise ValueError("history_size must be at least 2 for Markov latent states.")
         if self.num_preds < 1:
             raise ValueError("num_preds must be positive.")
         if self.frameskip < 1:
@@ -195,6 +195,15 @@ class ModelObjectCallback(Callback):
         torch.save(pl_module.model, self.dirpath / f"{self.filename}_epoch_{epoch}_object.ckpt")
 
 
+def temporal_straightening_loss(emb: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    if emb.shape[1] < 3:
+        return emb.new_zeros(())
+    vel_prev = emb[:, 1:-1] - emb[:, :-2]
+    vel_next = emb[:, 2:] - emb[:, 1:-1]
+    cosine = F.cosine_similarity(vel_prev, vel_next, dim=-1, eps=eps)
+    return (1.0 - cosine).mean()
+
+
 def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
     ctx_len = args.history_size
     n_preds = args.num_preds
@@ -211,8 +220,11 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     pred_embs = []
     for step in range(n_preds):
         current_emb = rollout_emb[:, -1]
-        past_emb = rollout_emb[:, -2]
-        ctx_state = torch.cat((current_emb, current_emb - past_emb), dim=-1).unsqueeze(1)
+        if rollout_emb.shape[1] >= 2:
+            delta_emb = current_emb - rollout_emb[:, -2]
+        else:
+            delta_emb = torch.zeros_like(current_emb)
+        ctx_state = torch.cat((current_emb, delta_emb), dim=-1).unsqueeze(1)
         ctx_act = act_emb[:, step : step + 1]
 
         pred_state = self.model.predict(ctx_state, ctx_act)[:, 0]
@@ -227,7 +239,12 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     output["pred_emb"] = torch.stack(pred_embs, dim=1)
     output["pred_loss"] = torch.stack(pred_losses).mean()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+    output["straighten_loss"] = temporal_straightening_loss(emb) if args.straighten else emb.new_zeros(())
+    output["loss"] = (
+        output["pred_loss"]
+        + lambd * output["sigreg_loss"]
+        + args.straighten_weight * output["straighten_loss"]
+    )
 
     log_prefix = "train" if stage == "fit" else stage
     losses = {f"{log_prefix}/{key}": value.detach() for key, value in output.items() if "loss" in key}

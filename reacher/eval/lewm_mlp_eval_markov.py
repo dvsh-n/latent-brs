@@ -31,7 +31,7 @@ DEFAULT_OUT_DIR = "reacher/eval/lewm_mlpdyn_markov_eval"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, default=None)
+    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
@@ -69,7 +69,7 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
 
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -> None:
     defaults = {
-        "history_size": 2,
+        "history_size": 1,
         "num_preds": 1,
         "frameskip": 1,
         "img_size": 224,
@@ -89,8 +89,8 @@ def require_device(device_arg: str) -> torch.device:
 
 
 def valid_episode_indices(dataset_path: Path, *, args: argparse.Namespace) -> np.ndarray:
-    if int(args.history_size) < 2:
-        raise ValueError("history_size must be at least 2 for Markov latent states.")
+    if int(args.history_size) < 1:
+        raise ValueError("history_size must be positive.")
     with h5py.File(dataset_path, "r") as h5:
         ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
     num_steps = int(args.history_size) + int(args.num_preds)
@@ -175,13 +175,13 @@ def rollout_latents(
     max_rollout_steps: int | None,
 ) -> torch.Tensor:
     device = true_latents.device
-    rollout_steps = (actions.shape[0] - history_size * frameskip) // frameskip + 1
+    rollout_steps = (true_latents.shape[0] - 1 - (history_size - 1) * frameskip) // frameskip
     if max_rollout_steps is not None:
         rollout_steps = min(rollout_steps, max_rollout_steps)
     if rollout_steps < 1:
         raise ValueError("Not enough actions for a rollout with the requested history/frameskip.")
-    if history_size < 2:
-        raise ValueError("history_size must be at least 2 for Markov latent states.")
+    if history_size < 1:
+        raise ValueError("history_size must be positive.")
 
     emb = true_latents[:history_size].unsqueeze(0).clone()
     pred_latents = [emb[0, step] for step in range(history_size)]
@@ -193,8 +193,11 @@ def rollout_latents(
         act = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
         act_emb = model.action_encoder(act)
         current = emb[:, -1]
-        past = emb[:, -2]
-        state = torch.cat((current, current - past), dim=-1).unsqueeze(1)
+        if emb.shape[1] >= 2:
+            delta = current - emb[:, -2]
+        else:
+            delta = torch.zeros_like(current)
+        state = torch.cat((current, delta), dim=-1).unsqueeze(1)
         pred_state = model.predict(state, act_emb)[:, 0]
         pred = pred_state[..., :embed_dim]
         pred_latents.append(pred[0])

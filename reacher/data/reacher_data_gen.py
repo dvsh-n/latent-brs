@@ -27,13 +27,13 @@ from reacher.eval.reacher_policy_viz import (
 
 DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"
 DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac/vecnormalize.pkl"
-DEFAULT_OUTDIR = "reacher/data/test_data_100hz"
-DEFAULT_OUTPUT_NAME = "reacher_expert_test.h5"
+DEFAULT_OUTDIR = "reacher/data/try_data_100hz"
+DEFAULT_OUTPUT_NAME = "reacher_expert_try.h5"
 
 # Local timing/video knobs.
 PHYSICS_FREQ_HZ = 100.0
 CONTROL_FREQ_HZ = 100.0
-DEFAULT_MAX_STEPS_PER_EPISODE = 100
+DEFAULT_MAX_STEPS_PER_EPISODE = 200
 STATE_DIM = 6
 ACTION_DIM = 2
 
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=100_000,
+        default=1000,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-freq-hz", type=float, default=CONTROL_FREQ_HZ)
     parser.add_argument("--max-steps-per-episode", type=int, default=DEFAULT_MAX_STEPS_PER_EPISODE)
     parser.add_argument("--goal-threshold", type=float, default=0.03)
-    parser.add_argument("--max-blank-steps", type=int, default=5)
+    parser.add_argument("--max-blank-steps", type=int, default=15)
     parser.add_argument("--min-steps", type=int, default=3)
     parser.add_argument("--width", type=int, default=224)
     parser.add_argument("--height", type=int, default=224)
