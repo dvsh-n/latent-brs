@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from reacher.train.lewm_train_mlp_markov import LeWMReacherDataset
+from reacher.train.mlpdyn_train import LeWMReacherDataset
 
 DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
 DEFAULT_RUN_DIR = "reacher/models/lewm_reacher"

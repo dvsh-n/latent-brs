@@ -6,6 +6,7 @@ temp_venv/
 reacher/models/reacher-v5-sac-expert/
 reacher/models/reacher-dm-control-sac*/
 latent_brs.egg-info/
+models/
 *.safetensors
 *.pt
 *.pth

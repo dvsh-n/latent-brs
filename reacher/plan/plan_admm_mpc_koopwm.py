@@ -26,7 +26,7 @@ import torch
 from tqdm.auto import tqdm
 
 from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
-from reacher.train.lewm_train_koop_lindec_markov import LeWMReacherDataset
+from reacher.train.koopdyn_lindec_train import LeWMReacherDataset
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
 DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_100hz/reacher_expert_test.h5"

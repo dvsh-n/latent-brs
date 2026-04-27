@@ -27,8 +27,8 @@ from reacher.eval.reacher_policy_viz import (
 
 DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"
 DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac/vecnormalize.pkl"
-DEFAULT_OUTDIR = "reacher/data/try_data_100hz"
-DEFAULT_OUTPUT_NAME = "reacher_expert_try.h5"
+DEFAULT_OUTDIR = "reacher/data/test_data"
+DEFAULT_OUTPUT_NAME = "reacher_test.h5"
 
 # Local timing/video knobs.
 PHYSICS_FREQ_HZ = 100.0
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=1000,
+        default=100_000,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(

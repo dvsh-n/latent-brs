@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data_100hz/reacher_expert.h5"
-DEFAULT_RUN_DIR = "reacher/models/lewm_reacher_mlpdyn_markov_100hz_straighten"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_straighten"
 FIXED_FRAMESKIP = 1
 
 
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.009)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=50)

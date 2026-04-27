@@ -22,11 +22,11 @@ import numpy as np
 import torch
 from einops import rearrange
 
-from reacher.train.lewm_train_mlp_markov import LeWMReacherDataset
+from reacher.train.mlpdyn_train import LeWMReacherDataset
 
-DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_mlpdyn_markov"
-DEFAULT_OUT_DIR = "reacher/eval/lewm_mlpdyn_markov_eval"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_straighten"
+DEFAULT_OUT_DIR = "reacher/eval/mlpdyn_eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -252,7 +252,8 @@ def plot_latents(
         for axis, dim in zip(axes, range(start_dim, end_dim)):
             axis.plot(steps, true[:, dim], label="true", linewidth=1.5)
             axis.plot(steps, pred[:, dim], label="rollout", linewidth=1.2, linestyle="--")
-            axis.axvline(history_size - 0.5, color="black", alpha=0.25, linewidth=1)
+            if history_size > 1:
+                axis.axvline(history_size - 0.5, color="black", alpha=0.25, linewidth=1)
             axis.set_ylabel(f"z{dim}")
             axis.grid(True, alpha=0.25)
         if start_dim == end_dim:

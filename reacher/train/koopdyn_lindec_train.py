@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, KoopmanLinearDecoderPredictor, MLP, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data_100hz/reacher_expert.h5"
-DEFAULT_RUN_DIR = "reacher/models/lewm_reacher_koop_lindec_markov_100hz_ms20"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_RUN_DIR = "reacher/models/koopdyn_lindec_ms20"
 FIXED_FRAMESKIP = 1
 
 

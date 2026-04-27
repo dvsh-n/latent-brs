@@ -21,11 +21,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from reacher.train.lewm_train_koop_lindec_markov import LeWMReacherDataset
+from reacher.train.koopdyn_lindec_train import LeWMReacherDataset
 
-DEFAULT_DATASET_PATH = "reacher/data/test_data_100hz/reacher_expert_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/lewm_reacher_koop_lindec_markov_100hz_ms20"
-DEFAULT_OUT_DIR = "reacher/eval/lewm_koop_lindec_markov_eval_100hz"
+DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_test.h5"
+DEFAULT_MODEL_DIR = "reacher/models/koopdyn_lindec_ms20"
+DEFAULT_OUT_DIR = "reacher/eval/koopdyn_lindec_eval"
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--episode-idx", type=int, default=121)
+    parser.add_argument("--episode-idx", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--history-size", type=int, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
