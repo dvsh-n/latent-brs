@@ -1,0 +1,263 @@
+
+==== CONFIG ====
+cache_dir: null
+solver:
+  _target_: stable_worldmodel.solver.CEMSolver
+  model: ???
+  batch_size: 1
+  num_samples: 300
+  var_scale: 1.0
+  n_steps: 30
+  topk: 30
+  device: cuda
+  seed: ${seed}
+world:
+  env_name: swm/ReacherDMControl-v0
+  num_envs: ${eval.num_eval}
+  max_episode_steps: 100
+  history_size: 3
+  frame_skip: 1
+  task: qpos_match
+  image_size: 252
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+  - action
+  keys_to_load:
+  - action
+  - pixels
+  - qpos
+  - qvel
+  - observation
+  - episode_idx
+  - step_idx
+seed: 42
+policy: reacher/lewm_vel
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 1
+eval:
+  num_eval: 4
+  goal_offset_steps: 25
+  eval_budget: 50
+  img_size: 224
+  dataset_name: reacher_expert
+  callables:
+  - method: set_state
+    args:
+      qpos:
+        value: qpos
+      qvel:
+        value: qvel
+  - method: set_target_qpos
+    args:
+      target_qpos:
+        value: goal_qpos
+output:
+  filename: latentbrs_results.txt
+
+==== RESULTS ====
+metrics: {'success_rate': 25.0, 'episode_successes': array([False, False,  True, False]), 'seeds': None}
+evaluation_time: 173.24662041664124 seconds
+
+==== CONFIG ====
+cache_dir: null
+solver:
+  _target_: stable_worldmodel.solver.CEMSolver
+  model: ???
+  batch_size: 1
+  num_samples: 300
+  var_scale: 1.0
+  n_steps: 30
+  topk: 30
+  device: cuda
+  seed: ${seed}
+world:
+  env_name: swm/ReacherDMControl-v0
+  num_envs: ${eval.num_eval}
+  max_episode_steps: 100
+  history_size: 3
+  frame_skip: 1
+  task: qpos_match
+  image_size: 252
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+  - action
+  keys_to_load:
+  - action
+  - pixels
+  - qpos
+  - qvel
+  - observation
+  - episode_idx
+  - step_idx
+seed: 42
+policy: reacher/lewm_vel
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 1
+eval:
+  num_eval: 50
+  goal_offset_steps: 25
+  eval_budget: 50
+  img_size: 224
+  dataset_name: reacher_expert
+  callables:
+  - method: set_state
+    args:
+      qpos:
+        value: qpos
+      qvel:
+        value: qvel
+  - method: set_target_qpos
+    args:
+      target_qpos:
+        value: goal_qpos
+output:
+  filename: latentbrs_results.txt
+
+==== RESULTS ====
+metrics: {'success_rate': 2.0, 'episode_successes': array([ True, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False]), 'seeds': None}
+evaluation_time: 2005.9786252975464 seconds
+
+==== CONFIG ====
+cache_dir: null
+solver:
+  _target_: stable_worldmodel.solver.CEMSolver
+  model: ???
+  batch_size: 1
+  num_samples: 300
+  var_scale: 1.0
+  n_steps: 30
+  topk: 30
+  device: cuda
+  seed: ${seed}
+world:
+  env_name: swm/ReacherDMControl-v0
+  num_envs: ${eval.num_eval}
+  max_episode_steps: 100
+  history_size: 3
+  frame_skip: 1
+  task: qpos_match
+  image_size: 252
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+  - action
+  keys_to_load:
+  - action
+  - pixels
+  - qpos
+  - qvel
+  - observation
+  - episode_idx
+  - step_idx
+seed: 42
+policy: reacher/lewm_vel
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 1
+eval:
+  num_eval: 50
+  goal_offset_steps: 25
+  eval_budget: 50
+  img_size: 224
+  dataset_name: reacher_expert
+  callables:
+  - method: set_state
+    args:
+      qpos:
+        value: qpos
+      qvel:
+        value: qvel
+  - method: set_target_qpos
+    args:
+      target_qpos:
+        value: goal_qpos
+output:
+  filename: latentbrs_results.txt
+
+==== RESULTS ====
+metrics: {'success_rate': 12.0, 'episode_successes': array([False, False, False, False, False,  True, False, False,  True,
+       False,  True, False, False, False, False, False, False, False,
+       False, False, False, False, False, False,  True, False, False,
+       False, False, False, False, False,  True, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False,  True, False, False]), 'seeds': None}
+evaluation_time: 1978.4867219924927 seconds
+
+==== CONFIG ====
+cache_dir: null
+solver:
+  _target_: stable_worldmodel.solver.CEMSolver
+  model: ???
+  batch_size: 1
+  num_samples: 300
+  var_scale: 1.0
+  n_steps: 30
+  topk: 30
+  device: cuda
+  seed: ${seed}
+world:
+  env_name: swm/ReacherDMControl-v0
+  num_envs: ${eval.num_eval}
+  max_episode_steps: 100
+  history_size: 3
+  frame_skip: 1
+  task: qpos_match
+  image_size: 252
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+  - action
+  keys_to_load:
+  - action
+  - pixels
+  - qpos
+  - qvel
+  - observation
+  - episode_idx
+  - step_idx
+seed: 42
+policy: reacher/lewm_vel
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 1
+eval:
+  num_eval: 50
+  goal_offset_steps: 25
+  eval_budget: 50
+  img_size: 224
+  dataset_name: reacher_expert
+  callables:
+  - method: set_state
+    args:
+      qpos:
+        value: qpos
+      qvel:
+        value: qvel
+  - method: set_target_qpos
+    args:
+      target_qpos:
+        value: goal_qpos
+output:
+  filename: latentbrs_results.txt
+
+==== RESULTS ====
+metrics: {'success_rate': 4.0, 'episode_successes': array([False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False,  True, False, False, False, False, False, False,
+       False, False, False, False, False, False, False,  True, False,
+       False, False, False, False, False, False, False, False, False,
+       False, False, False, False, False]), 'seeds': None}
+evaluation_time: 1979.4175403118134 seconds

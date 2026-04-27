@@ -370,6 +370,69 @@ class VelocityPredictor(nn.Module):
         return self.net(torch.cat([aug_state, act_emb], dim=-1))
 
 
+def compute_history_states(emb: torch.Tensor, history_size: int) -> torch.Tensor:
+    """Build time-delayed embeddings by stacking a sliding window of latent states.
+
+    For each time step t, produces [z_{t-H+1}, ..., z_t] where H = history_size.
+    Steps before t=0 are zero-padded.
+
+    Args:
+        emb: (B, T, D) encoder embeddings.
+        history_size: Number of frames H to stack.
+
+    Returns:
+        (B, T, H*D) stacked history states for every time step.
+    """
+    if history_size < 1:
+        raise ValueError("history_size must be at least 1.")
+    B, T, D = emb.shape
+    padded = F.pad(emb, (0, 0, history_size - 1, 0))  # (B, T+H-1, D)
+    windows = padded.unfold(1, history_size, 1)  # (B, T, D, H)
+    windows = windows.permute(0, 1, 3, 2).contiguous()  # (B, T, H, D)
+    return windows.reshape(B, T, history_size * D)
+
+
+class KoopmanPredictor(nn.Module):
+    """HVOK-style linear Koopman predictor on time-delayed latent embeddings.
+
+    The lifted state is the raw stacked history [z_{t-H+1}, ..., z_t] with no
+    nonlinear encoder. Dynamics are purely linear: z_next = A @ z_lifted + B @ u.
+    """
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        action_dim: int,
+        history_size: int = 3,
+    ) -> None:
+        super().__init__()
+        if history_size < 1:
+            raise ValueError("history_size must be at least 1.")
+
+        self.embed_dim = int(embed_dim)
+        self.action_dim = int(action_dim)
+        self.history_size = int(history_size)
+        self.lifted_dim = self.history_size * self.embed_dim
+
+        self.A = nn.Linear(self.lifted_dim, self.lifted_dim, bias=False)
+        self.B = nn.Linear(self.action_dim, self.lifted_dim, bias=False)
+
+        nn.init.eye_(self.A.weight)
+        nn.init.xavier_uniform_(self.B.weight)
+
+    def forward(self, z_lifted: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z_lifted: (B, H*D) stacked history [z_{t-H+1}, ..., z_t].
+            action: (B, A) raw or embedded action at time t.
+
+        Returns:
+            (B, H*D) predicted next lifted state.
+        """
+        return self.A(z_lifted) + self.B(action)
+
+
 class JEPA(nn.Module):
     """LE-WM joint-embedding predictive architecture."""
 
@@ -405,6 +468,10 @@ class JEPA(nn.Module):
     def _is_velocity_predictor(self) -> bool:
         return isinstance(self.predictor, VelocityPredictor)
 
+    @property
+    def _is_koopman_predictor(self) -> bool:
+        return isinstance(self.predictor, KoopmanPredictor)
+
     def predict(self, emb: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
         preds = self.predictor(emb, act_emb)
         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
@@ -421,6 +488,18 @@ class JEPA(nn.Module):
             (B, 2*D) predicted augmented state.
         """
         return self.predictor(aug_state, act_emb)
+
+    def predict_koopman(self, z_lifted: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Single-step prediction with KoopmanPredictor.
+
+        Args:
+            z_lifted: (B, H*D) stacked history state.
+            action: (B, A) action at current time step.
+
+        Returns:
+            (B, H*D) predicted next lifted state.
+        """
+        return self.predictor(z_lifted, action)
 
     def rollout(self, info: dict[str, torch.Tensor], action_sequence: torch.Tensor, history_size: int = 3):
         assert "pixels" in info, "pixels not in info_dict"
@@ -439,7 +518,9 @@ class JEPA(nn.Module):
         act = rearrange(act_0, "b s ... -> (b s) ...")
         act_future = rearrange(act_future, "b s ... -> (b s) ...")
 
-        if self._is_velocity_predictor:
+        if self._is_koopman_predictor:
+            self._rollout_koopman(emb, act, act_future, n_steps, info, b, s)
+        elif self._is_velocity_predictor:
             self._rollout_velocity(emb, act, act_future, n_steps, info, b, s)
         else:
             self._rollout_ar(emb, act, act_future, n_steps, info, b, s, history_size)
@@ -505,6 +586,36 @@ class JEPA(nn.Module):
             vel = z_next - z_cur
             aug = torch.cat([z_next, vel], dim=-1)
             z_cur = z_next
+
+        info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=b, s=s)
+
+    def _rollout_koopman(
+        self,
+        emb: torch.Tensor,
+        act: torch.Tensor,
+        act_future: torch.Tensor,
+        n_steps: int,
+        info: dict[str, torch.Tensor],
+        b: int,
+        s: int,
+    ) -> None:
+        H = self.predictor.history_size
+        d = self.predictor.embed_dim
+
+        history = compute_history_states(emb, H)
+        z_lifted = history[:, -1]  # (B*S, H*D)
+
+        for step in range(n_steps + 1):
+            if step < n_steps:
+                cur_act = act_future[:, step : step + 1, :]
+            else:
+                cur_act = act_future[:, -1:, :]
+
+            act_emb = self.action_encoder(cur_act)[:, 0]
+            z_lifted = self.predict_koopman(z_lifted, act_emb)
+
+            z_next = z_lifted[:, -d:]
+            emb = torch.cat([emb, z_next.unsqueeze(1)], dim=1)
 
         info["predicted_emb"] = rearrange(emb, "(b s) ... -> b s ...", b=b, s=s)
 
