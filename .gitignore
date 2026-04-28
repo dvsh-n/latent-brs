@@ -17,3 +17,5 @@ reacher/models/lewm_reacher*/
 **/runs/
 **/__pycache__/
 reacher/models/sam3
+models/
+lerobot_venv/
