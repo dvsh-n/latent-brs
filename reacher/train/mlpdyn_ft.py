@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Train an LE-WM-style JEPA with a Markov latent-state MLP dynamics predictor."""
+"""Finetune an LE-WM-style JEPA by reusing only a pretrained ViT encoder."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import sys
+import re
 from functools import partial
 from pathlib import Path, PosixPath
 
@@ -25,16 +25,17 @@ from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
 DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
-DEFAULT_RUN_DIR = "reacher/models/mlpdyn_straighten"
-FINETUNE_DIR = None
+DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_straighten"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft"
 FIXED_FRAMESKIP = 1
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--init-run-dir", type=Path, default=DEFAULT_INIT_RUN_DIR)
+    parser.add_argument("--init-checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--finetune-dir", type=Path, default=FINETUNE_DIR)
     parser.add_argument("--output-model-name", default="lewm")
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--train-split", type=float, default=0.9)
@@ -42,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=9)
+    parser.add_argument("--embed-dim", type=int, default=18)
     parser.add_argument("--history-size", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
@@ -51,13 +52,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictor-depth", type=int, default=2)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.005)
+    parser.add_argument("--sigreg-weight", type=float, default=0.009)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
     parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
-    parser.add_argument("--straighten-weight", type=float, default=1e-3)
+    parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--freeze-encoder-epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=6)
     parser.add_argument("--prefetch-factor", type=int, default=3)
@@ -69,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", default="bf16-mixed")
     parser.add_argument("--save-object-every", type=int, default=1)
     args = parser.parse_args()
+    if args.freeze_encoder_epochs < 0:
+        parser.error("--freeze-encoder-epochs must be non-negative.")
     args.frameskip = FIXED_FRAMESKIP
     args.markov_state_dim = 2 * args.embed_dim
     return args
@@ -197,6 +201,30 @@ class ModelObjectCallback(Callback):
         torch.save(pl_module.model, self.dirpath / f"{self.filename}_epoch_{epoch}_object.ckpt")
 
 
+class FreezeEncoderCallback(Callback):
+    def __init__(self, freeze_epochs: int) -> None:
+        super().__init__()
+        self.freeze_epochs = int(freeze_epochs)
+        self._encoder_frozen = False
+
+    def _set_encoder_requires_grad(self, pl_module: pl.LightningModule, enabled: bool) -> None:
+        encoder = getattr(pl_module.model, "encoder", None)
+        if encoder is None:
+            raise AttributeError("Expected model.encoder to exist for finetuning.")
+        encoder.requires_grad_(enabled)
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self.freeze_epochs <= 0:
+            return
+        self._set_encoder_requires_grad(pl_module, enabled=False)
+        self._encoder_frozen = True
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self._encoder_frozen and trainer.current_epoch >= self.freeze_epochs:
+            self._set_encoder_requires_grad(pl_module, enabled=True)
+            self._encoder_frozen = False
+
+
 def temporal_straightening_loss(emb: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     if emb.shape[1] < 3:
         return emb.new_zeros(())
@@ -309,31 +337,52 @@ def sanitize_hparams(args: argparse.Namespace) -> dict[str, object]:
     return hparams
 
 
+def latest_object_checkpoint(model_dir: Path) -> Path:
+    pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
+    candidates: list[tuple[int, Path]] = []
+    for path in model_dir.glob("*_epoch_*_object.ckpt"):
+        match = pattern.match(path.name)
+        if match is not None:
+            candidates.append((int(match.group(1)), path))
+    if not candidates:
+        raise FileNotFoundError(f"No object checkpoints matching '*_epoch_N_object.ckpt' found in {model_dir}")
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def resolve_init_checkpoint(args: argparse.Namespace) -> Path:
+    if args.init_checkpoint is not None:
+        checkpoint_path = args.init_checkpoint.expanduser().resolve()
+    else:
+        checkpoint_path = latest_object_checkpoint(args.init_run_dir.expanduser().resolve()).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Init checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
+def load_pretrained_encoder(checkpoint_path: Path) -> torch.nn.Module:
+    source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(source_model, JEPA):
+        raise TypeError(f"Expected JEPA object checkpoint, got {type(source_model).__name__}.")
+    encoder = getattr(source_model, "encoder", None)
+    if encoder is None:
+        raise AttributeError("Source checkpoint does not contain model.encoder.")
+    return encoder
+
+
 def main() -> None:
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
 
     dataset_path = args.dataset_path.expanduser().resolve()
     run_dir = args.run_dir.expanduser().resolve()
-    finetune_dir = args.finetune_dir.expanduser().resolve() if args.finetune_dir is not None else None
-    if finetune_dir is None:
-        output_run_dir = run_dir
-        ckpt_path = output_run_dir / "last.ckpt"
-        if output_run_dir.exists() and not ckpt_path.is_file():
-            raise FileExistsError(
-                f"Run dir already exists but does not contain a resumable checkpoint: {output_run_dir}"
-            )
-    else:
-        ckpt_path = run_dir / "last.ckpt"
-        if not ckpt_path.is_file():
-            raise FileNotFoundError(f"Finetune source checkpoint not found: {ckpt_path}")
-        output_run_dir = finetune_dir
-        if output_run_dir.exists():
-            raise FileExistsError(f"Finetune output dir already exists: {output_run_dir}")
+    init_checkpoint_path = resolve_init_checkpoint(args)
 
-    spt.set(cache_dir=str(output_run_dir))
     if not dataset_path.is_file():
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+    if run_dir.exists():
+        raise FileExistsError(f"Run dir already exists: {run_dir}")
+
+    spt.set(cache_dir=str(run_dir))
 
     dataset = LeWMReacherDataset(
         dataset_path,
@@ -357,6 +406,15 @@ def main() -> None:
     val_loader = make_loader(val_set, args, shuffle=False, drop_last=False) if val_len else None
 
     world_model = build_model(args)
+    pretrained_encoder = load_pretrained_encoder(init_checkpoint_path)
+    try:
+        world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Failed to load encoder weights from the init checkpoint. "
+            "Check encoder-scale, patch-size, and encoder architecture compatibility."
+        ) from exc
+
     optimizers = {
         "model_opt": {
             "modules": "model",
@@ -373,24 +431,32 @@ def main() -> None:
         hparams=sanitize_hparams(args),
     )
 
-    output_run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=False)
     config = vars(args).copy()
+    config["init_checkpoint"] = str(init_checkpoint_path)
     config["run_dir"] = str(run_dir)
-    config["finetune_dir"] = str(finetune_dir) if finetune_dir is not None else None
-    config["output_run_dir"] = str(output_run_dir)
-    config["resume_checkpoint"] = str(ckpt_path) if ckpt_path.is_file() else None
-    with (output_run_dir / "config.json").open("w") as f:
+    with (run_dir / "config.json").open("w") as f:
         json.dump(config, f, indent=2, default=str)
 
+    init_report = {
+        "init_checkpoint": str(init_checkpoint_path),
+        "loaded_modules": ["encoder"],
+        "reinitialized_modules": ["projector", "predictor", "action_encoder", "pred_proj"],
+        "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
+    }
+    with (run_dir / "init_report.json").open("w") as f:
+        json.dump(init_report, f, indent=2)
+
     callbacks: list[Callback] = [
+        FreezeEncoderCallback(args.freeze_encoder_epochs),
         ModelCheckpoint(
-            dirpath=output_run_dir,
+            dirpath=run_dir,
             filename=f"{args.output_model_name}" + "_{epoch:03d}",
             save_last=True,
             save_top_k=-1,
             every_n_epochs=1,
         ),
-        ModelObjectCallback(output_run_dir, args.output_model_name, epoch_interval=args.save_object_every),
+        ModelObjectCallback(run_dir, args.output_model_name, epoch_interval=args.save_object_every),
     ]
     trainer = pl.Trainer(
         max_epochs=args.epochs,
@@ -399,7 +465,7 @@ def main() -> None:
         precision=args.precision,
         gradient_clip_val=args.gradient_clip_val,
         callbacks=callbacks,
-        default_root_dir=output_run_dir,
+        default_root_dir=run_dir,
         logger=False,
         num_sanity_val_steps=1 if val_loader is not None else 0,
         enable_checkpointing=True,
@@ -407,7 +473,7 @@ def main() -> None:
     data_module = spt.data.DataModule(train=train_loader, val=val_loader)
     if hasattr(torch.serialization, "add_safe_globals"):
         torch.serialization.add_safe_globals([PosixPath])
-    trainer.fit(module, datamodule=data_module, ckpt_path=str(ckpt_path) if ckpt_path.is_file() else None)
+    trainer.fit(module, datamodule=data_module)
 
 
 if __name__ == "__main__":
