@@ -25,3 +25,6 @@
 [submodule "third_party/stable-worldmodel"]
 	path = third_party/stable-worldmodel
 	url = https://github.com/galilai-group/stable-worldmodel.git
+[submodule "third_party/gpu_sls"]
+	path = third_party/gpu_sls
+	url = https://github.com/Jeff300fang/gpu_sls.git

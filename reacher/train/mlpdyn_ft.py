@@ -25,8 +25,8 @@ from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
 DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
-DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_straighten"
-DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft"
+DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_1"
 FIXED_FRAMESKIP = 1
 
 
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=18)
     parser.add_argument("--history-size", type=int, default=1)
-    parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=15, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
@@ -59,10 +59,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--freeze-encoder-epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=6)
-    parser.add_argument("--prefetch-factor", type=int, default=3)
+    parser.add_argument("--freeze-encoder-epochs", type=int, default=20)
+    parser.add_argument("--freeze-projector-epochs", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--num-workers", type=int, default=5)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        help="Keep training dataloader workers alive across epochs. Validation workers stay non-persistent to avoid doubled RAM usage.",
+    )
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--gradient-clip-val", type=float, default=1.0)
@@ -73,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.freeze_encoder_epochs < 0:
         parser.error("--freeze-encoder-epochs must be non-negative.")
+    if args.freeze_projector_epochs < 0:
+        parser.error("--freeze-projector-epochs must be non-negative.")
     args.frameskip = FIXED_FRAMESKIP
     args.markov_state_dim = 2 * args.embed_dim
     return args
@@ -201,28 +209,29 @@ class ModelObjectCallback(Callback):
         torch.save(pl_module.model, self.dirpath / f"{self.filename}_epoch_{epoch}_object.ckpt")
 
 
-class FreezeEncoderCallback(Callback):
-    def __init__(self, freeze_epochs: int) -> None:
+class FreezeModuleCallback(Callback):
+    def __init__(self, module_name: str, freeze_epochs: int) -> None:
         super().__init__()
+        self.module_name = module_name
         self.freeze_epochs = int(freeze_epochs)
-        self._encoder_frozen = False
+        self._module_frozen = False
 
-    def _set_encoder_requires_grad(self, pl_module: pl.LightningModule, enabled: bool) -> None:
-        encoder = getattr(pl_module.model, "encoder", None)
-        if encoder is None:
-            raise AttributeError("Expected model.encoder to exist for finetuning.")
-        encoder.requires_grad_(enabled)
+    def _set_module_requires_grad(self, pl_module: pl.LightningModule, enabled: bool) -> None:
+        module = getattr(pl_module.model, self.module_name, None)
+        if module is None:
+            raise AttributeError(f"Expected model.{self.module_name} to exist for finetuning.")
+        module.requires_grad_(enabled)
 
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self.freeze_epochs <= 0:
             return
-        self._set_encoder_requires_grad(pl_module, enabled=False)
-        self._encoder_frozen = True
+        self._set_module_requires_grad(pl_module, enabled=False)
+        self._module_frozen = True
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        if self._encoder_frozen and trainer.current_epoch >= self.freeze_epochs:
-            self._set_encoder_requires_grad(pl_module, enabled=True)
-            self._encoder_frozen = False
+        if self._module_frozen and trainer.current_epoch >= self.freeze_epochs:
+            self._set_module_requires_grad(pl_module, enabled=True)
+            self._module_frozen = False
 
 
 def temporal_straightening_loss(emb: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -315,14 +324,21 @@ def build_model(args: argparse.Namespace) -> JEPA:
     )
 
 
-def make_loader(dataset: Dataset, args: argparse.Namespace, *, shuffle: bool, drop_last: bool) -> DataLoader:
+def make_loader(
+    dataset: Dataset,
+    args: argparse.Namespace,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    persistent_workers: bool,
+) -> DataLoader:
     loader_kwargs = {
         "batch_size": args.batch_size,
         "shuffle": shuffle,
         "drop_last": drop_last,
         "num_workers": args.num_workers,
         "pin_memory": args.accelerator == "gpu",
-        "persistent_workers": args.num_workers > 0,
+        "persistent_workers": args.num_workers > 0 and persistent_workers,
     }
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -402,8 +418,24 @@ def main() -> None:
     generator = torch.Generator().manual_seed(args.seed)
     train_set, val_set = random_split(dataset, [train_len, val_len], generator=generator)
 
-    train_loader = make_loader(train_set, args, shuffle=True, drop_last=True)
-    val_loader = make_loader(val_set, args, shuffle=False, drop_last=False) if val_len else None
+    train_loader = make_loader(
+        train_set,
+        args,
+        shuffle=True,
+        drop_last=True,
+        persistent_workers=args.persistent_workers,
+    )
+    val_loader = (
+        make_loader(
+            val_set,
+            args,
+            shuffle=False,
+            drop_last=False,
+            persistent_workers=False,
+        )
+        if val_len
+        else None
+    )
 
     world_model = build_model(args)
     pretrained_encoder = load_pretrained_encoder(init_checkpoint_path)
@@ -443,12 +475,14 @@ def main() -> None:
         "loaded_modules": ["encoder"],
         "reinitialized_modules": ["projector", "predictor", "action_encoder", "pred_proj"],
         "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
+        "freeze_projector_epochs": int(args.freeze_projector_epochs),
     }
     with (run_dir / "init_report.json").open("w") as f:
         json.dump(init_report, f, indent=2)
 
     callbacks: list[Callback] = [
-        FreezeEncoderCallback(args.freeze_encoder_epochs),
+        FreezeModuleCallback("encoder", args.freeze_encoder_epochs),
+        FreezeModuleCallback("projector", args.freeze_projector_epochs),
         ModelCheckpoint(
             dirpath=run_dir,
             filename=f"{args.output_model_name}" + "_{epoch:03d}",
