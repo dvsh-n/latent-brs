@@ -312,75 +312,194 @@ class MLPDynamicsPredictor(nn.Module):
         return pred.reshape(emb.shape[0], self.num_preds, self.embed_dim)
 
 
-class KoopmanDynamicsPredictor(nn.Module):
-    """Decoder-free Koopman predictor with lifted state z = [x, phi(x)]."""
+def _build_koopman_encoder(
+    input_dim: int,
+    output_dim: int,
+    *,
+    hidden_width: int,
+    depth: int,
+    dropout: float = 0.0,
+    activation_fn: type[nn.Module] = nn.GELU,
+) -> nn.Sequential:
+    if depth < 1:
+        raise ValueError("depth must be at least 1.")
+
+    layers: list[nn.Module] = []
+    current_dim = input_dim
+    for _ in range(depth):
+        layers.append(nn.Linear(current_dim, hidden_width))
+        layers.append(activation_fn())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+        current_dim = hidden_width
+    layers.append(nn.Linear(current_dim, output_dim))
+    return nn.Sequential(*layers)
+
+
+class DeepKoopmanNoDec(nn.Module):
+    """Decoder-free Koopman model with lifted state z = [x, enc(x)]."""
 
     def __init__(
         self,
         *,
         state_dim: int,
-        action_dim: int,
-        koopman_embed_dim: int,
+        control_dim: int,
+        embedding_dim: int,
         hidden_width: int = 1024,
         depth: int = 4,
         dropout: float = 0.0,
+        activation_fn: type[nn.Module] = nn.GELU,
     ) -> None:
         super().__init__()
         if state_dim < 1:
             raise ValueError("state_dim must be positive.")
-        if action_dim < 1:
-            raise ValueError("action_dim must be positive.")
-        if koopman_embed_dim < 1:
-            raise ValueError("koopman_embed_dim must be positive.")
-        if depth < 1:
-            raise ValueError("depth must be at least 1.")
+        if control_dim < 1:
+            raise ValueError("control_dim must be positive.")
+        if embedding_dim < 1:
+            raise ValueError("embedding_dim must be positive.")
 
         self.state_dim = int(state_dim)
-        self.action_dim = int(action_dim)
-        self.koopman_embed_dim = int(koopman_embed_dim)
-        self.latent_dim = self.state_dim + self.koopman_embed_dim
+        self.control_dim = int(control_dim)
+        self.embedding_dim = int(embedding_dim)
+        self.latent_dim = self.state_dim + self.embedding_dim
 
-        layers: list[nn.Module] = []
-        current_dim = self.state_dim
-        for _ in range(depth):
-            layers.append(nn.Linear(current_dim, hidden_width))
-            layers.append(nn.GELU())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            current_dim = hidden_width
-        layers.append(nn.Linear(current_dim, self.koopman_embed_dim))
-        self.encoder = nn.Sequential(*layers)
-
+        self.encoder = _build_koopman_encoder(
+            self.state_dim,
+            self.embedding_dim,
+            hidden_width=hidden_width,
+            depth=depth,
+            dropout=dropout,
+            activation_fn=activation_fn,
+        )
         self.A = nn.Linear(self.latent_dim, self.latent_dim, bias=False)
-        self.B = nn.Linear(self.action_dim, self.latent_dim, bias=False)
-        nn.init.eye_(self.A.weight)
-        nn.init.xavier_uniform_(self.B.weight)
+        self.B = nn.Linear(self.control_dim, self.latent_dim, bias=False)
 
     def lift_state(self, state: torch.Tensor) -> torch.Tensor:
         return torch.cat((state, self.encoder(state)), dim=-1)
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        if state.ndim != 3:
-            raise ValueError(f"Expected state with shape [batch, 1, dim], got {state.shape}.")
-        if action.ndim != 3:
-            raise ValueError(f"Expected action with shape [batch, horizon, dim], got {action.shape}.")
-        if state.shape[1] != 1:
-            raise ValueError(f"KoopmanDynamicsPredictor expects one initial state, got {state.shape[1]}.")
-        if state.shape[-1] != self.state_dim:
-            raise ValueError(f"Expected state_dim={self.state_dim}, got {state.shape[-1]}.")
-        if action.shape[-1] != self.action_dim:
-            raise ValueError(f"Expected action_dim={self.action_dim}, got {action.shape[-1]}.")
-
-        z_current = self.lift_state(state[:, 0])
+    def _rollout_latent(self, z_current: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
         z_pred = []
-        for step in range(action.shape[1]):
-            z_current = self.A(z_current) + self.B(action[:, step])
+        for step in range(control.shape[1]):
+            z_current = self.A(z_current) + self.B(control[:, step])
             z_pred.append(z_current)
         return torch.stack(z_pred, dim=1)
 
+    def forward(
+        self,
+        x_k: torch.Tensor,
+        u_seq: torch.Tensor,
+        x_next_seq: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | torch.Tensor:
+        if x_k.ndim != 2:
+            raise ValueError(f"Expected x_k with shape [batch, state_dim], got {x_k.shape}.")
+        if u_seq.ndim != 3:
+            raise ValueError(f"Expected u_seq with shape [batch, horizon, control_dim], got {u_seq.shape}.")
+        if x_k.shape[-1] != self.state_dim:
+            raise ValueError(f"Expected state_dim={self.state_dim}, got {x_k.shape[-1]}.")
+        if u_seq.shape[-1] != self.control_dim:
+            raise ValueError(f"Expected control_dim={self.control_dim}, got {u_seq.shape[-1]}.")
 
-class KoopmanLinearDecoderPredictor(nn.Module):
-    """Koopman predictor with nonlinear encoder and linear decoder x = C z."""
+        z_k = self.lift_state(x_k)
+        z_pred_seq = self._rollout_latent(z_k, u_seq)
+        x_pred_seq = z_pred_seq[..., : self.state_dim]
+        if x_next_seq is None:
+            return z_pred_seq
+
+        if x_next_seq.ndim != 3:
+            raise ValueError(
+                f"Expected x_next_seq with shape [batch, horizon, state_dim], got {x_next_seq.shape}."
+            )
+        x_next_seq_flat = x_next_seq.reshape(-1, self.state_dim)
+        z_target_seq = self.lift_state(x_next_seq_flat).reshape(x_next_seq.shape[0], x_next_seq.shape[1], -1)
+        return z_pred_seq, x_pred_seq, z_target_seq
+
+
+class DeepKoopmanLinDec(nn.Module):
+    """Koopman model with nonlinear encoder and linear decoder x = C z."""
+
+    def __init__(
+        self,
+        *,
+        state_dim: int,
+        control_dim: int,
+        latent_dim: int,
+        hidden_width: int = 1024,
+        depth: int = 4,
+        dropout: float = 0.0,
+        activation_fn: type[nn.Module] = nn.GELU,
+    ) -> None:
+        super().__init__()
+        if state_dim < 1:
+            raise ValueError("state_dim must be positive.")
+        if control_dim < 1:
+            raise ValueError("control_dim must be positive.")
+        if latent_dim < 1:
+            raise ValueError("latent_dim must be positive.")
+
+        self.state_dim = int(state_dim)
+        self.control_dim = int(control_dim)
+        self.latent_dim = int(latent_dim)
+
+        self.encoder = _build_koopman_encoder(
+            self.state_dim,
+            self.latent_dim,
+            hidden_width=hidden_width,
+            depth=depth,
+            dropout=dropout,
+            activation_fn=activation_fn,
+        )
+        self.C = nn.Linear(self.latent_dim, self.state_dim, bias=True)
+        self.A = nn.Linear(self.latent_dim, self.latent_dim, bias=False)
+        self.B = nn.Linear(self.control_dim, self.latent_dim, bias=False)
+
+    def lift_state(self, state: torch.Tensor) -> torch.Tensor:
+        return self.encoder(state)
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.C(latent)
+
+    def decode_state(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.decode(latent)
+
+    def _rollout_latent(self, z_current: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
+        z_pred = []
+        for step in range(control.shape[1]):
+            z_current = self.A(z_current) + self.B(control[:, step])
+            z_pred.append(z_current)
+        return torch.stack(z_pred, dim=1)
+
+    def forward(
+        self,
+        x_k: torch.Tensor,
+        u_seq: torch.Tensor,
+        x_next_seq: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | torch.Tensor:
+        if x_k.ndim != 2:
+            raise ValueError(f"Expected x_k with shape [batch, state_dim], got {x_k.shape}.")
+        if u_seq.ndim != 3:
+            raise ValueError(f"Expected u_seq with shape [batch, horizon, control_dim], got {u_seq.shape}.")
+        if x_k.shape[-1] != self.state_dim:
+            raise ValueError(f"Expected state_dim={self.state_dim}, got {x_k.shape[-1]}.")
+        if u_seq.shape[-1] != self.control_dim:
+            raise ValueError(f"Expected control_dim={self.control_dim}, got {u_seq.shape[-1]}.")
+
+        z_k = self.lift_state(x_k)
+        z_pred_seq = self._rollout_latent(z_k, u_seq)
+        x_pred_seq = self.decode(z_pred_seq)
+        if x_next_seq is None:
+            return z_pred_seq
+
+        if x_next_seq.ndim != 3:
+            raise ValueError(
+                f"Expected x_next_seq with shape [batch, horizon, state_dim], got {x_next_seq.shape}."
+            )
+        x_next_seq_flat = x_next_seq.reshape(-1, self.state_dim)
+        z_target_seq = self.lift_state(x_next_seq_flat).reshape(x_next_seq.shape[0], x_next_seq.shape[1], -1)
+        return z_pred_seq, x_pred_seq, z_target_seq
+
+
+class KoopmanDynamicsPredictor(DeepKoopmanNoDec):
+    """Compatibility wrapper for one-step JEPA-style Koopman prediction."""
 
     def __init__(
         self,
@@ -392,61 +511,55 @@ class KoopmanLinearDecoderPredictor(nn.Module):
         depth: int = 4,
         dropout: float = 0.0,
     ) -> None:
-        super().__init__()
-        if state_dim < 1:
-            raise ValueError("state_dim must be positive.")
-        if action_dim < 1:
-            raise ValueError("action_dim must be positive.")
-        if koopman_embed_dim < 1:
-            raise ValueError("koopman_embed_dim must be positive.")
-        if depth < 1:
-            raise ValueError("depth must be at least 1.")
-
-        self.state_dim = int(state_dim)
-        self.action_dim = int(action_dim)
-        self.koopman_embed_dim = int(koopman_embed_dim)
-
-        layers: list[nn.Module] = []
-        current_dim = self.state_dim
-        for _ in range(depth):
-            layers.append(nn.Linear(current_dim, hidden_width))
-            layers.append(nn.GELU())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            current_dim = hidden_width
-        layers.append(nn.Linear(current_dim, self.koopman_embed_dim))
-        self.encoder = nn.Sequential(*layers)
-
-        self.C = nn.Linear(self.koopman_embed_dim, self.state_dim, bias=True)
-        self.A = nn.Linear(self.koopman_embed_dim, self.koopman_embed_dim, bias=False)
-        self.B = nn.Linear(self.action_dim, self.koopman_embed_dim, bias=False)
-        nn.init.eye_(self.A.weight)
-        nn.init.xavier_uniform_(self.B.weight)
-
-    def lift_state(self, state: torch.Tensor) -> torch.Tensor:
-        return self.encoder(state)
-
-    def decode_state(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.C(latent)
+        super().__init__(
+            state_dim=state_dim,
+            control_dim=action_dim,
+            embedding_dim=koopman_embed_dim,
+            hidden_width=hidden_width,
+            depth=depth,
+            dropout=dropout,
+        )
+        self.action_dim = self.control_dim
+        self.koopman_embed_dim = self.embedding_dim
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         if state.ndim != 3:
             raise ValueError(f"Expected state with shape [batch, 1, dim], got {state.shape}.")
-        if action.ndim != 3:
-            raise ValueError(f"Expected action with shape [batch, horizon, dim], got {action.shape}.")
+        if state.shape[1] != 1:
+            raise ValueError(f"KoopmanDynamicsPredictor expects one initial state, got {state.shape[1]}.")
+        return super().forward(state[:, 0], action)
+
+
+class KoopmanLinearDecoderPredictor(DeepKoopmanLinDec):
+    """Compatibility wrapper for one-step JEPA-style Koopman prediction."""
+
+    def __init__(
+        self,
+        *,
+        state_dim: int,
+        action_dim: int,
+        koopman_embed_dim: int,
+        hidden_width: int = 1024,
+        depth: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__(
+            state_dim=state_dim,
+            control_dim=action_dim,
+            latent_dim=koopman_embed_dim,
+            hidden_width=hidden_width,
+            depth=depth,
+            dropout=dropout,
+        )
+        self.action_dim = self.control_dim
+        self.koopman_embed_dim = self.latent_dim
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        if state.ndim != 3:
+            raise ValueError(f"Expected state with shape [batch, 1, dim], got {state.shape}.")
         if state.shape[1] != 1:
             raise ValueError(f"KoopmanLinearDecoderPredictor expects one initial state, got {state.shape[1]}.")
-        if state.shape[-1] != self.state_dim:
-            raise ValueError(f"Expected state_dim={self.state_dim}, got {state.shape[-1]}.")
-        if action.shape[-1] != self.action_dim:
-            raise ValueError(f"Expected action_dim={self.action_dim}, got {action.shape[-1]}.")
-
-        z_current = self.lift_state(state[:, 0])
-        z_pred = []
-        for step in range(action.shape[1]):
-            z_current = self.A(z_current) + self.B(action[:, step])
-            z_pred.append(z_current)
-        return torch.stack(z_pred, dim=1)
+        return super().forward(state[:, 0], action)
 
 
 class JEPA(nn.Module):
