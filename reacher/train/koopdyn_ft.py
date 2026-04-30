@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""Finetune a linear-decoder Koopman world model with a frozen pretrained ViT encoder."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from functools import partial
+from pathlib import Path, PosixPath
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+import h5py
+import lightning as pl
+import numpy as np
+import stable_pretraining as spt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
+from torch.utils.data import DataLoader, Dataset, random_split
+
+from reacher.shared.models import JEPA, KoopmanLinearDecoderPredictor, MLP, SIGReg
+
+
+DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft"
+DEFAULT_RUN_DIR = "reacher/models/koopdyn_ft"
+FIXED_FRAMESKIP = 1
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--init-run-dir", type=Path, default=DEFAULT_INIT_RUN_DIR)
+    parser.add_argument("--init-checkpoint", type=Path, default=None)
+    parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
+    parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
+    parser.add_argument("--output-model-name", default="lewm")
+    parser.add_argument("--seed", type=int, default=3072)
+    parser.add_argument("--train-split", type=float, default=1.0)
+
+    parser.add_argument("--img-size", type=int, default=224)
+    parser.add_argument("--patch-size", type=int, default=14)
+    parser.add_argument("--encoder-scale", default="tiny")
+    parser.add_argument("--embed-dim", type=int, default=18)
+    parser.add_argument("--history-size", type=int, default=2)
+    parser.add_argument("--num-preds", type=int, default=15, help="Autoregressive rollout horizon.")
+    parser.add_argument("--action-dim", type=int, default=2)
+
+    parser.add_argument("--koopman-latent-dim", type=int, default=200)
+    parser.add_argument("--predictor-hidden-width", type=int, default=1024)
+    parser.add_argument("--predictor-depth", type=int, default=3)
+    parser.add_argument("--predictor-dropout", type=float, default=0.0)
+
+    parser.add_argument("--sigreg-weight", type=float, default=0.009)
+    parser.add_argument("--sigreg-knots", type=int, default=17)
+    parser.add_argument("--sigreg-num-proj", type=int, default=1024)
+    parser.add_argument("--latent-loss-weight", type=float, default=0.1)
+
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--freeze-projector-epochs", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--num-workers", type=int, default=9)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        default=True,
+        help="Keep training dataloader workers alive across epochs. Validation workers stay non-persistent to avoid doubled RAM usage.",
+    )
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--gradient-clip-val", type=float, default=1.0)
+    parser.add_argument("--accelerator", default="gpu")
+    parser.add_argument("--devices", default="auto")
+    parser.add_argument("--precision", default="bf16-mixed")
+    parser.add_argument("--save-object-every", type=int, default=1)
+    args = parser.parse_args()
+    if args.history_size < 2:
+        parser.error("--history-size must be at least 2 so the Markov pair includes a nontrivial delta.")
+    if args.freeze_projector_epochs < 0:
+        parser.error("--freeze-projector-epochs must be non-negative.")
+    args.frameskip = FIXED_FRAMESKIP
+    args.markov_state_dim = 2 * args.embed_dim
+    return args
+
+
+class LeWMReacherDataset(Dataset):
+    def __init__(
+        self,
+        dataset_path: Path,
+        *,
+        history_size: int,
+        num_preds: int,
+        frameskip: int,
+        img_size: int,
+        action_dim: int,
+    ) -> None:
+        self.dataset_path = dataset_path
+        self.history_size = int(history_size)
+        self.num_preds = int(num_preds)
+        self.frameskip = int(frameskip)
+        self.num_steps = self.history_size + self.num_preds
+        self.action_steps = self.num_preds
+        self.img_size = int(img_size)
+        self.action_dim = int(action_dim)
+        self.effective_action_dim = self.frameskip * self.action_dim
+        self._h5: h5py.File | None = None
+
+        if self.history_size < 1:
+            raise ValueError("history_size must be positive.")
+        if self.num_preds < 1:
+            raise ValueError("num_preds must be positive.")
+        if self.frameskip < 1:
+            raise ValueError("frameskip must be positive.")
+
+        with h5py.File(self.dataset_path, "r") as h5:
+            self.ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
+            self.ep_offset = np.asarray(h5["ep_offset"][:], dtype=np.int64)
+            if int(h5["action"].shape[-1]) != self.action_dim:
+                raise ValueError(f"Expected action_dim={self.action_dim}, got {h5['action'].shape[-1]}.")
+            finite_actions = np.asarray(h5["action"][:], dtype=np.float32)
+            finite_actions = finite_actions[~np.isnan(finite_actions).any(axis=1)]
+            self.action_mean = finite_actions.mean(axis=0, keepdims=True).astype(np.float32)
+            self.action_std = finite_actions.std(axis=0, keepdims=True).astype(np.float32)
+            self.action_std = np.maximum(self.action_std, 1e-6)
+
+        self.samples: list[tuple[int, int]] = []
+        required_last_frame_offset = (self.num_steps - 1) * self.frameskip
+        action_start_step = self.history_size - 1
+        required_action_end_offset = (action_start_step + self.action_steps) * self.frameskip
+        required_offset = max(required_last_frame_offset, required_action_end_offset)
+        for ep_idx, ep_len in enumerate(self.ep_len.tolist()):
+            max_start = ep_len - 1 - required_offset
+            for start in range(max_start + 1):
+                self.samples.append((ep_idx, start))
+        if not self.samples:
+            raise ValueError("No valid training windows found. Check frameskip/history/num_preds.")
+
+        self.pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+        self.pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _file(self) -> h5py.File:
+        if self._h5 is None:
+            self._h5 = h5py.File(self.dataset_path, "r")
+        return self._h5
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        h5 = self._file()
+        ep_idx, start = self.samples[index]
+        base = int(self.ep_offset[ep_idx]) + start
+
+        frame_offsets = np.arange(self.num_steps, dtype=np.int64) * self.frameskip
+        pixel_rows = base + frame_offsets
+        pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
+        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).float().div_(255.0)
+        if pixels.shape[-2:] != (self.img_size, self.img_size):
+            pixels = F.interpolate(pixels, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+        pixels = (pixels - self.pixel_mean) / self.pixel_std
+
+        action_blocks = []
+        first_action_step = self.history_size - 1
+        for step in range(first_action_step, first_action_step + self.action_steps):
+            action_start = base + step * self.frameskip
+            action_stop = action_start + self.frameskip
+            block = np.asarray(h5["action"][action_start:action_stop], dtype=np.float32)
+            block = (np.nan_to_num(block, nan=0.0) - self.action_mean) / self.action_std
+            action_blocks.append(torch.from_numpy(block.reshape(-1)))
+
+        return {
+            "pixels": pixels,
+            "action": torch.stack(action_blocks, dim=0).float(),
+        }
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_h5"] = None
+        return state
+
+    def __del__(self) -> None:
+        h5 = getattr(self, "_h5", None)
+        if h5 is not None:
+            try:
+                h5.close()
+            except Exception:
+                pass
+            self._h5 = None
+
+
+class ModelObjectCallback(Callback):
+    def __init__(self, dirpath: Path, filename: str, epoch_interval: int = 1) -> None:
+        super().__init__()
+        self.dirpath = dirpath
+        self.filename = filename
+        self.epoch_interval = int(epoch_interval)
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        epoch = trainer.current_epoch + 1
+        if not trainer.is_global_zero:
+            return
+        if epoch % self.epoch_interval != 0 and epoch != trainer.max_epochs:
+            return
+        self.dirpath.mkdir(parents=True, exist_ok=True)
+        torch.save(pl_module.model, self.dirpath / f"{self.filename}_epoch_{epoch}_object.ckpt")
+
+
+class FreezeModuleCallback(Callback):
+    def __init__(self, module_name: str, freeze_epochs: int) -> None:
+        super().__init__()
+        self.module_name = module_name
+        self.freeze_epochs = int(freeze_epochs)
+        self._module_frozen = False
+
+    def _set_module_requires_grad(self, pl_module: pl.LightningModule, enabled: bool) -> None:
+        module = getattr(pl_module.model, self.module_name, None)
+        if module is None:
+            raise AttributeError(f"Expected model.{self.module_name} to exist for finetuning.")
+        module.requires_grad_(enabled)
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self.freeze_epochs <= 0:
+            return
+        self._set_module_requires_grad(pl_module, enabled=False)
+        self._module_frozen = True
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self._module_frozen and trainer.current_epoch >= self.freeze_epochs:
+            self._set_module_requires_grad(pl_module, enabled=True)
+            self._module_frozen = False
+
+
+def build_markov_pairs(emb: torch.Tensor) -> torch.Tensor:
+    current = emb[:, 1:]
+    previous = emb[:, :-1]
+    delta = current - previous
+    return torch.cat((current, delta), dim=-1)
+
+
+def koopman_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
+    lambd = args.sigreg_weight
+    latent_weight = args.latent_loss_weight
+
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+    output = self.model.encode(batch)
+    emb = output["emb"]
+    act_emb = output["act_emb"]
+
+    markov_states = build_markov_pairs(emb)
+    x_k = markov_states[:, args.history_size - 2]
+    x_next_seq = markov_states[:, args.history_size - 1 : args.history_size - 1 + args.num_preds]
+
+    predictor = self.model.predictor
+    z_k = predictor.lift_state(x_k)
+    z_pred_seq = predictor._rollout_latent(z_k, act_emb)
+    pred_markov = predictor.decode(z_pred_seq)[..., : args.markov_state_dim]
+    z_target_seq = predictor.lift_state(x_next_seq.reshape(-1, args.markov_state_dim)).reshape(
+        x_next_seq.shape[0],
+        x_next_seq.shape[1],
+        -1,
+    )
+    pred_emb = pred_markov[..., : args.embed_dim]
+
+    output["pred_emb"] = pred_emb
+    output["pred_loss"] = F.mse_loss(pred_markov, x_next_seq)
+    output["latent_loss"] = F.mse_loss(z_pred_seq, z_target_seq)
+    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+    output["loss"] = output["pred_loss"] + latent_weight * output["latent_loss"] + lambd * output["sigreg_loss"]
+
+    log_prefix = "train" if stage == "fit" else stage
+    losses = {f"{log_prefix}/{key}": value.detach() for key, value in output.items() if "loss" in key}
+    self.log_dict(losses, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
+    return output
+
+
+def build_model(args: argparse.Namespace) -> JEPA:
+    encoder = spt.backbone.utils.vit_hf(
+        args.encoder_scale,
+        patch_size=args.patch_size,
+        image_size=args.img_size,
+        pretrained=False,
+        use_mask_token=False,
+    )
+    hidden_dim = encoder.config.hidden_size
+    effective_act_dim = args.frameskip * args.action_dim
+    predictor = KoopmanLinearDecoderPredictor(
+        state_dim=args.markov_state_dim,
+        action_dim=effective_act_dim,
+        koopman_embed_dim=args.koopman_latent_dim,
+        hidden_width=args.predictor_hidden_width,
+        depth=args.predictor_depth,
+        dropout=args.predictor_dropout,
+    )
+    projector = MLP(input_dim=hidden_dim, output_dim=args.embed_dim, hidden_dim=2048, norm_fn=torch.nn.BatchNorm1d)
+    return JEPA(
+        encoder=encoder,
+        predictor=predictor,
+        action_encoder=nn.Identity(),
+        projector=projector,
+        pred_proj=nn.Identity(),
+    )
+
+
+def make_loader(
+    dataset: Dataset,
+    args: argparse.Namespace,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    persistent_workers: bool,
+) -> DataLoader:
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": shuffle,
+        "drop_last": drop_last,
+        "num_workers": args.num_workers,
+        "pin_memory": args.accelerator == "gpu",
+        "persistent_workers": args.num_workers > 0 and persistent_workers,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def sanitize_hparams(args: argparse.Namespace) -> dict[str, object]:
+    hparams = vars(args).copy()
+    for key, value in hparams.items():
+        if isinstance(value, Path):
+            hparams[key] = str(value)
+    return hparams
+
+
+def latest_object_checkpoint(model_dir: Path) -> Path:
+    pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
+    candidates: list[tuple[int, Path]] = []
+    for path in model_dir.glob("*_epoch_*_object.ckpt"):
+        match = pattern.match(path.name)
+        if match is not None:
+            candidates.append((int(match.group(1)), path))
+    if not candidates:
+        raise FileNotFoundError(f"No object checkpoints matching '*_epoch_N_object.ckpt' found in {model_dir}")
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def resolve_init_checkpoint(args: argparse.Namespace) -> Path:
+    if args.init_checkpoint is not None:
+        checkpoint_path = args.init_checkpoint.expanduser().resolve()
+    else:
+        checkpoint_path = latest_object_checkpoint(args.init_run_dir.expanduser().resolve()).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Init checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
+def load_pretrained_components(checkpoint_path: Path) -> tuple[torch.nn.Module, torch.nn.Module]:
+    source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(source_model, JEPA):
+        raise TypeError(f"Expected JEPA object checkpoint, got {type(source_model).__name__}.")
+    encoder = getattr(source_model, "encoder", None)
+    projector = getattr(source_model, "projector", None)
+    if encoder is None:
+        raise AttributeError("Source checkpoint does not contain model.encoder.")
+    if projector is None:
+        raise AttributeError("Source checkpoint does not contain model.projector.")
+    return encoder, projector
+
+
+def main() -> None:
+    args = parse_args()
+    pl.seed_everything(args.seed, workers=True)
+
+    dataset_path = args.dataset_path.expanduser().resolve()
+    run_dir = args.run_dir.expanduser().resolve()
+    init_checkpoint_path = resolve_init_checkpoint(args)
+
+    if not dataset_path.is_file():
+        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+    if run_dir.exists():
+        raise FileExistsError(f"Run dir already exists: {run_dir}")
+
+    spt.set(cache_dir=str(run_dir))
+
+    dataset = LeWMReacherDataset(
+        dataset_path,
+        history_size=args.history_size,
+        num_preds=args.num_preds,
+        frameskip=args.frameskip,
+        img_size=args.img_size,
+        action_dim=args.action_dim,
+    )
+    if len(dataset) < 2:
+        raise ValueError(f"Need at least 2 valid training windows for train/val splitting, got {len(dataset)}.")
+    train_len = int(len(dataset) * args.train_split)
+    val_len = len(dataset) - train_len
+    if train_len < 1:
+        train_len = 1
+        val_len = len(dataset) - train_len
+    generator = torch.Generator().manual_seed(args.seed)
+    train_set, val_set = random_split(dataset, [train_len, val_len], generator=generator)
+
+    train_loader = make_loader(
+        train_set,
+        args,
+        shuffle=True,
+        drop_last=True,
+        persistent_workers=args.persistent_workers,
+    )
+    val_loader = (
+        make_loader(
+            val_set,
+            args,
+            shuffle=False,
+            drop_last=False,
+            persistent_workers=False,
+        )
+        if val_len
+        else None
+    )
+
+    world_model = build_model(args)
+    pretrained_encoder, pretrained_projector = load_pretrained_components(init_checkpoint_path)
+    try:
+        world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
+        world_model.projector.load_state_dict(pretrained_projector.state_dict(), strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Failed to load encoder/projector weights from the init checkpoint. "
+            "Check encoder-scale, patch-size, embed-dim, and projector architecture compatibility."
+        ) from exc
+
+    world_model.encoder.requires_grad_(False)
+
+    nn.init.eye_(world_model.predictor.A.weight)
+    nn.init.xavier_uniform_(world_model.predictor.B.weight)
+
+    optimizers = {
+        "model_opt": {
+            "modules": "model",
+            "optimizer": {"type": "AdamW", "lr": args.lr, "weight_decay": args.weight_decay},
+            "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
+            "interval": "epoch",
+        },
+    }
+    module = spt.Module(
+        model=world_model,
+        sigreg=SIGReg(knots=args.sigreg_knots, num_proj=args.sigreg_num_proj),
+        forward=partial(koopman_forward, args=args),
+        optim=optimizers,
+        hparams=sanitize_hparams(args),
+    )
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    config = vars(args).copy()
+    config["init_checkpoint"] = str(init_checkpoint_path)
+    config["run_dir"] = str(run_dir)
+    with (run_dir / "config.json").open("w") as f:
+        json.dump(config, f, indent=2, default=str)
+
+    init_report = {
+        "init_checkpoint": str(init_checkpoint_path),
+        "loaded_modules": ["encoder", "projector"],
+        "reinitialized_modules": ["predictor", "action_encoder", "pred_proj"],
+        "frozen_modules": ["encoder"],
+        "freeze_projector_epochs": int(args.freeze_projector_epochs),
+    }
+    with (run_dir / "init_report.json").open("w") as f:
+        json.dump(init_report, f, indent=2)
+
+    callbacks: list[Callback] = [
+        FreezeModuleCallback("projector", args.freeze_projector_epochs),
+        ModelCheckpoint(
+            dirpath=run_dir,
+            filename=f"{args.output_model_name}" + "_{epoch:03d}",
+            save_last=True,
+            save_top_k=-1,
+            every_n_epochs=1,
+        ),
+        ModelObjectCallback(run_dir, args.output_model_name, epoch_interval=args.save_object_every),
+    ]
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        accelerator=args.accelerator,
+        devices=args.devices,
+        precision=args.precision,
+        gradient_clip_val=args.gradient_clip_val,
+        callbacks=callbacks,
+        default_root_dir=run_dir,
+        logger=False,
+        num_sanity_val_steps=1 if val_loader is not None else 0,
+        enable_checkpointing=True,
+    )
+    data_module = spt.data.DataModule(train=train_loader, val=val_loader)
+    if hasattr(torch.serialization, "add_safe_globals"):
+        torch.serialization.add_safe_globals([PosixPath])
+    trainer.fit(module, datamodule=data_module)
+
+
+if __name__ == "__main__":
+    main()
