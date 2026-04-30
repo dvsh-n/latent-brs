@@ -61,8 +61,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=200)
-    parser.add_argument("--num-workers", type=int, default=9)
+    parser.add_argument("--batch-size", type=int, default=380)
+    parser.add_argument("--num-workers", type=int, default=10)
     parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument(
         "--persistent-workers",
@@ -139,9 +139,6 @@ class LeWMReacherDataset(Dataset):
         if not self.samples:
             raise ValueError("No valid training windows found. Check frameskip/history/num_preds.")
 
-        self.pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
-        self.pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
-
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -158,10 +155,7 @@ class LeWMReacherDataset(Dataset):
         frame_offsets = np.arange(self.num_steps, dtype=np.int64) * self.frameskip
         pixel_rows = base + frame_offsets
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
-        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).float().div_(255.0)
-        if pixels.shape[-2:] != (self.img_size, self.img_size):
-            pixels = F.interpolate(pixels, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
-        pixels = (pixels - self.pixel_mean) / self.pixel_std
+        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
 
         action_blocks = []
         first_action_step = self.history_size - 1
@@ -245,6 +239,18 @@ def koopman_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argp
     lambd = args.sigreg_weight
     latent_weight = args.latent_loss_weight
 
+    pixels = batch["pixels"].float().div_(255.0)
+    if pixels.shape[-2:] != (args.img_size, args.img_size):
+        batch_size, time_steps = pixels.shape[:2]
+        pixels = F.interpolate(
+            pixels.view(batch_size * time_steps, *pixels.shape[2:]),
+            size=(args.img_size, args.img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).view(batch_size, time_steps, *pixels.shape[2:3], args.img_size, args.img_size)
+    pixel_mean = pixels.new_tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+    pixel_std = pixels.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+    batch["pixels"] = (pixels - pixel_mean) / pixel_std
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode(batch)
     emb = output["emb"]

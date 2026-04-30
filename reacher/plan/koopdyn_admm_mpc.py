@@ -26,15 +26,15 @@ from tqdm.auto import tqdm
 import json
 
 from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
-from reacher.shared.models import DeepKoopmanLinDec
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
+from reacher.shared.models import DeepKoopmanLinDec
 
 DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data/reacher_test.h5"
-DEFAULT_KOOPMAN_PATH = "reacher/models/koopdyn_lindec/koopman_lindec_1.pt"
+DEFAULT_KOOPMAN_PATH = "reacher/models/koopdyn_ft"
 DEFAULT_OUT_DIR = "reacher/plan/koopdyn_admm_mpc"
 
 DEVICE = "auto"
-HORIZON = 25
+HORIZON = 80
 MAX_MPC_STEPS = 250
 Q_TERMINAL = 10.0
 Q_STAGE = 0.005
@@ -117,16 +117,37 @@ def load_visual_model(checkpoint_path: Path, device: torch.device) -> torch.nn.M
     return model
 
 
-def load_koopman_model(checkpoint_path: Path, device: torch.device) -> tuple[DeepKoopmanLinDec, dict[str, object]]:
-    payload = load_torch_object(checkpoint_path, device)
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected Koopman checkpoint payload dict at {checkpoint_path}")
-    model_config = payload["model_config"]
-    model = DeepKoopmanLinDec(**model_config).to(device)
-    model.load_state_dict(payload["state_dict"])
+def load_run_config(model_dir: Path) -> dict[str, object]:
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Model config not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_model_assets(model_path: Path) -> tuple[Path, Path]:
+    model_path = model_path.expanduser().resolve()
+    if model_path.is_dir():
+        return model_path, latest_object_checkpoint(model_path).resolve()
+    if model_path.is_file():
+        return model_path.parent, model_path
+    raise FileNotFoundError(f"Model path not found: {model_path}")
+
+
+def load_koopman_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
+    model = load_torch_object(checkpoint_path, device)
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError(f"Expected torch module checkpoint at {checkpoint_path}")
+    model = model.to(device)
     model.eval()
     model.requires_grad_(False)
-    return model, payload
+    predictor = getattr(model, "predictor", None)
+    if predictor is None:
+        raise TypeError(f"Expected checkpoint with `.predictor`, got {type(model).__name__}.")
+    predictor = predictor.to(device)
+    predictor.eval()
+    predictor.requires_grad_(False)
+    return predictor
 
 
 def hide_target(env: DmControlGymEnv) -> None:
@@ -221,29 +242,25 @@ def make_markov_state(embedding: torch.Tensor, previous_embedding: torch.Tensor 
     return torch.cat((embedding, delta), dim=-1)
 
 
-class MinMaxNormalizer:
-    def __init__(self, stats: dict[str, torch.Tensor]) -> None:
-        self.min = torch.as_tensor(stats["min"], dtype=torch.float32)
-        self.range = torch.as_tensor(stats["range"], dtype=torch.float32)
-        self.range[self.range == 0] = 1e-6
-
-    def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return 2.0 * (x - self.min.to(x.device)) / self.range.to(x.device) - 1.0
-
-
 def normalized_to_raw_action(action_norm: np.ndarray, action_mean: np.ndarray, action_std: np.ndarray) -> np.ndarray:
     return (action_norm * action_std.reshape(-1) + action_mean.reshape(-1)).astype(np.float32)
 
 
 def preprocess_markov_state(
     state_raw: torch.Tensor,
-    *,
-    normalizer: MinMaxNormalizer,
-    enable_normalization: bool,
 ) -> torch.Tensor:
-    if enable_normalization:
-        return normalizer.normalize(state_raw)
     return state_raw
+
+
+def compute_action_stats(dataset_path: Path, action_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    with h5py.File(dataset_path, "r") as h5:
+        if int(h5["action"].shape[-1]) != action_dim:
+            raise ValueError(f"Expected action_dim={action_dim}, got {h5['action'].shape[-1]}.")
+        finite_actions = np.asarray(h5["action"][:], dtype=np.float32)
+    finite_actions = finite_actions[~np.isnan(finite_actions).any(axis=1)]
+    action_mean = finite_actions.mean(axis=0, keepdims=True).astype(np.float32)
+    action_std = finite_actions.std(axis=0, keepdims=True).astype(np.float32)
+    return action_mean, np.maximum(action_std, 1e-6)
 
 
 def load_dataset_episode(
@@ -320,7 +337,7 @@ def goal_reached(current_obs: np.ndarray, goal_obs: np.ndarray, threshold: float
 class KoopmanADMMPlanner:
     def __init__(
         self,
-        model: DeepKoopmanLinDec,
+        model: torch.nn.Module,
         *,
         goal_state_proc: torch.Tensor,
         horizon: int,
@@ -479,74 +496,41 @@ class KoopmanADMMPlanner:
             u_traj.detach().cpu().numpy().astype(np.float64),
             solve_time,
         )
-
-
-def resolve_visual_assets(
-    source_metadata: dict[str, object],
-    *,
-    visual_model_dir_arg: Path | None,
-    visual_checkpoint_arg: Path | None,
-) -> tuple[Path, Path]:
-    if visual_model_dir_arg is not None:
-        visual_model_dir = visual_model_dir_arg.expanduser().resolve()
-    else:
-        model_dir_str = source_metadata.get("model_dir")
-        if not model_dir_str:
-            raise ValueError("Koopman checkpoint metadata is missing source visual model_dir.")
-        visual_model_dir = Path(str(model_dir_str)).expanduser().resolve()
-
-    if visual_checkpoint_arg is not None:
-        visual_checkpoint = visual_checkpoint_arg.expanduser().resolve()
-    else:
-        checkpoint_str = source_metadata.get("checkpoint")
-        visual_checkpoint = Path(str(checkpoint_str)).expanduser().resolve() if checkpoint_str else None
-        if visual_checkpoint is None or not visual_checkpoint.is_file():
-            visual_checkpoint = latest_object_checkpoint(visual_model_dir).resolve()
-
-    return visual_model_dir, visual_checkpoint
-
-
 def main() -> None:
     args = parse_args()
     device = require_device(args.device)
-    model_save_path = args.model_save_path.expanduser().resolve()
+    model_dir, model_checkpoint = resolve_model_assets(args.model_save_path)
     dataset_path = args.dataset_path.expanduser().resolve()
     out_root = args.out_dir.expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    koopman_model, koopman_payload = load_koopman_model(model_save_path, device)
-    source_metadata = koopman_payload.get("source_metadata", {})
-    if not source_metadata:
-        raise ValueError("Koopman checkpoint is missing source_metadata needed for planning.")
+    model_config = load_run_config(model_dir)
+    koopman_model = load_koopman_model(model_checkpoint, device)
 
-    visual_model_dir, visual_checkpoint = resolve_visual_assets(
-        source_metadata,
-        visual_model_dir_arg=args.visual_model_dir,
-        visual_checkpoint_arg=args.visual_checkpoint,
-    )
+    visual_model_dir = args.visual_model_dir.expanduser().resolve() if args.visual_model_dir is not None else model_dir
+    if args.visual_checkpoint is not None:
+        visual_checkpoint = args.visual_checkpoint.expanduser().resolve()
+    else:
+        visual_checkpoint = model_checkpoint
     visual_config = load_visual_config(visual_model_dir)
     visual_model = load_visual_model(visual_checkpoint, device)
 
-    img_size = int(source_metadata.get("img_size", visual_config.get("img_size", 224)))
-    embed_dim = int(source_metadata.get("embed_dim", visual_config.get("embed_dim", 18)))
-    markov_state_dim = int(source_metadata.get("state_dim", 2 * embed_dim))
-    action_dim = int(source_metadata.get("action_dim", 2))
+    img_size = int(model_config.get("img_size", visual_config.get("img_size", 224)))
+    embed_dim = int(model_config.get("embed_dim", visual_config.get("embed_dim", 18)))
+    markov_state_dim = 2 * embed_dim
+    action_dim = int(model_config.get("action_dim", 2))
 
     if int(koopman_model.state_dim) != markov_state_dim:
         raise ValueError(
-            f"Koopman checkpoint state_dim={koopman_model.state_dim} does not match source metadata {markov_state_dim}."
+            f"Koopman checkpoint state_dim={koopman_model.state_dim} does not match config {markov_state_dim}."
         )
     if int(koopman_model.control_dim) != action_dim:
         raise ValueError(
-            f"Koopman checkpoint control_dim={koopman_model.control_dim} does not match source metadata {action_dim}."
+            f"Koopman checkpoint control_dim={koopman_model.control_dim} does not match config {action_dim}."
         )
 
-    training_config = koopman_payload.get("training_config", {})
-    enable_normalization = bool(training_config.get("enable_normalization", False))
-    normalizer = MinMaxNormalizer(koopman_payload["normalization_stats"])
-
-    action_mean = torch.as_tensor(source_metadata["action_mean"], dtype=torch.float32).cpu().numpy().reshape(1, -1)
-    action_std = torch.as_tensor(source_metadata["action_std"], dtype=torch.float32).cpu().numpy().reshape(1, -1)
+    action_stats_dataset_path = Path(str(model_config.get("dataset_path", dataset_path))).expanduser().resolve()
+    action_mean, action_std = compute_action_stats(action_stats_dataset_path, action_dim)
     if action_mean.shape[1] != action_dim or action_std.shape[1] != action_dim:
         raise ValueError("Action normalization stats do not match Koopman control dimension.")
 
@@ -605,13 +589,9 @@ def main() -> None:
 
     start_state_proc = preprocess_markov_state(
         start_state_raw,
-        normalizer=normalizer,
-        enable_normalization=enable_normalization,
     )
     goal_state_proc = preprocess_markov_state(
         goal_state_raw,
-        normalizer=normalizer,
-        enable_normalization=enable_normalization,
     )
 
     save_rgb_image(out_dir / "start_image.png", pixels_np[0])
@@ -658,8 +638,6 @@ def main() -> None:
     current_state_raw = make_markov_state(current_emb, previous_emb)
     current_state_proc = preprocess_markov_state(
         current_state_raw,
-        normalizer=normalizer,
-        enable_normalization=enable_normalization,
     )
     goal_obs = obs_np[-1].astype(np.float32)
     current_obs = flatten_observation(env._env.task.get_observation(env._env.physics)).astype(np.float32)
@@ -697,8 +675,6 @@ def main() -> None:
         current_state_raw = make_markov_state(next_emb, current_emb)
         current_state_proc = preprocess_markov_state(
             current_state_raw,
-            normalizer=normalizer,
-            enable_normalization=enable_normalization,
         )
         previous_emb = current_emb
         current_emb = next_emb
