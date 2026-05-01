@@ -29,13 +29,13 @@ from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 from reacher.shared.models import DeepKoopmanLinDec
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data/reacher_test.h5"
-DEFAULT_KOOPMAN_PATH = "reacher/models/koopdyn_ft"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
+DEFAULT_KOOPMAN_PATH = "reacher/models/koopdyn_full_ft_50hz"
 DEFAULT_OUT_DIR = "reacher/plan/koopdyn_admm_mpc"
 
 DEVICE = "auto"
-HORIZON = 80
-MAX_MPC_STEPS = 250
+HORIZON = 25
+MAX_MPC_STEPS = 200
 Q_TERMINAL = 10.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1

@@ -13,7 +13,6 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
-import h5py
 import imageio.v2 as imageio
 import numpy as np
 import torch
@@ -24,9 +23,8 @@ from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
 DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
-DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
+DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn_rand"
 
 DEVICE = "auto"
 HORIZON = 20
@@ -35,20 +33,23 @@ Q_TERMINAL = 10.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 60
-EPISODE_IDX = 615
+TIME_LIMIT = 10.0
+PHYSICS_FREQ_HZ = 50.0
+IMAGE_SIZE = 224
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=Path(DEFAULT_MODEL_DIR))
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--episode-idx", type=int, default=EPISODE_IDX)
+    parser.add_argument("--time-limit", type=float, default=TIME_LIMIT)
+    parser.add_argument("--physics-freq-hz", type=float, default=PHYSICS_FREQ_HZ)
+    parser.add_argument("--width", type=int, default=IMAGE_SIZE)
+    parser.add_argument("--height", type=int, default=IMAGE_SIZE)
     parser.add_argument("--horizon", type=int, default=HORIZON)
     parser.add_argument("--max-mpc-steps", type=int, default=MAX_MPC_STEPS)
-    parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--video-fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--q-terminal", type=float, default=Q_TERMINAL)
     parser.add_argument("--q-stage", type=float, default=Q_STAGE)
@@ -131,6 +132,12 @@ def save_rollout_video(frames: list[np.ndarray], out_dir: Path, fps: int) -> Pat
         return gif_path
 
 
+def save_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
 def preprocess_pixels(
     pixels: np.ndarray | torch.Tensor,
     *,
@@ -153,23 +160,6 @@ def preprocess_pixels(
             align_corners=False,
         )
     return (tensor - pixel_mean) / pixel_std
-
-
-@torch.no_grad()
-def encode_frames(
-    model: torch.nn.Module,
-    pixels: torch.Tensor,
-    *,
-    device: torch.device,
-    frame_batch_size: int,
-) -> torch.Tensor:
-    latents = []
-    for start in range(0, pixels.shape[0], frame_batch_size):
-        chunk = pixels[start : start + frame_batch_size].to(device)
-        output = model.encoder(chunk, interpolate_pos_encoding=True)
-        emb = model.projector(output.last_hidden_state[:, 0])
-        latents.append(emb)
-    return torch.cat(latents, dim=0)
 
 
 @torch.no_grad()
@@ -197,28 +187,6 @@ def make_markov_state(embedding: torch.Tensor, previous_embedding: torch.Tensor 
 
 def normalized_to_raw_action(action_norm: np.ndarray, action_mean: np.ndarray, action_std: np.ndarray) -> np.ndarray:
     return (action_norm * action_std.reshape(-1) + action_mean.reshape(-1)).astype(np.float32)
-
-
-def load_dataset_episode(
-    dataset_path: Path,
-    episode_idx: int,
-) -> dict[str, np.ndarray | int | float]:
-    with h5py.File(dataset_path, "r") as h5:
-        ep_len = int(h5["ep_len"][episode_idx])
-        ep_offset = int(h5["ep_offset"][episode_idx])
-        rows = np.arange(ep_offset, ep_offset + ep_len, dtype=np.int64)
-        return {
-            "pixels": np.asarray(h5["pixels"][rows], dtype=np.uint8),
-            "action": np.asarray(h5["action"][rows], dtype=np.float32),
-            "observation": np.asarray(h5["observation"][rows], dtype=np.float32),
-            "qpos": np.asarray(h5["qpos"][rows], dtype=np.float32),
-            "qvel": np.asarray(h5["qvel"][rows], dtype=np.float32),
-            "episode_seed": int(h5["episode_seed"][episode_idx]),
-            "physics_freq_hz": float(h5.attrs.get("physics_freq_hz", 100.0)),
-            "time_limit": float(h5.attrs.get("time_limit", 10.0)),
-            "height": int(h5["pixels"].shape[1]),
-            "width": int(h5["pixels"].shape[2]),
-        }
 
 
 def make_render_env(
@@ -253,7 +221,7 @@ def reset_env_to_state(
     qvel: np.ndarray,
     height: int,
     width: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     env.reset(seed=seed)
     hide_target(env)
     configure_offscreen_framebuffer(env, width, height)
@@ -262,7 +230,22 @@ def reset_env_to_state(
         physics.data.qpos[: qpos.shape[0]] = qpos
         physics.data.qvel[: qvel.shape[0]] = qvel
     env._last_action = np.zeros_like(env.action_space.low, dtype=np.float32)
-    return physics.render(height=height, width=width, camera_id=0)
+    frame = physics.render(height=height, width=width, camera_id=0)
+    obs = flatten_observation(env._env.task.get_observation(physics)).astype(np.float32)
+    return frame, obs
+
+
+def sample_random_qpos(env: DmControlGymEnv, rng: np.random.Generator) -> np.ndarray:
+    joint_ranges = np.asarray(env._env.physics.model.jnt_range, dtype=np.float32)
+    if joint_ranges.ndim != 2 or joint_ranges.shape[1] != 2:
+        raise ValueError(f"Expected joint ranges with shape (n, 2), got {joint_ranges.shape}.")
+    lower = joint_ranges[:, 0]
+    upper = joint_ranges[:, 1]
+    finite = np.isfinite(lower) & np.isfinite(upper)
+    if not np.all(finite):
+        lower = np.where(finite, lower, -np.pi)
+        upper = np.where(finite, upper, np.pi)
+    return rng.uniform(lower, upper).astype(np.float32)
 
 
 def goal_reached(current_obs: np.ndarray, goal_obs: np.ndarray, threshold: float = 0.05) -> tuple[bool, float]:
@@ -481,7 +464,6 @@ def main() -> None:
     args = parse_args()
     device = require_device(args.device)
     model_dir = args.model_dir.expanduser().resolve()
-    dataset_path = args.dataset_path.expanduser().resolve()
     out_root = args.out_dir.expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -502,7 +484,7 @@ def main() -> None:
     embed_dim = int(config.get("embed_dim", 18))
     markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
 
-    train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
+    train_dataset_path = Path(str(config["dataset_path"])).expanduser().resolve()
     train_stats_dataset = LeWMReacherDataset(
         train_dataset_path,
         history_size=history_size,
@@ -516,74 +498,61 @@ def main() -> None:
     action_mean = train_stats_dataset.action_mean.astype(np.float32)
     action_std = train_stats_dataset.action_std.astype(np.float32)
 
-    with h5py.File(dataset_path, "r") as h5:
-        ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
-    valid_episodes = np.flatnonzero(ep_len >= 2)
-    if valid_episodes.size == 0:
-        raise ValueError("Need at least one test trajectory with 2 or more frames.")
-
     rng = np.random.default_rng(args.seed)
-    if args.episode_idx is None:
-        episode_idx = int(rng.choice(valid_episodes))
-    else:
-        episode_idx = int(args.episode_idx)
-        if episode_idx < 0 or episode_idx >= ep_len.shape[0]:
-            raise ValueError(f"--episode-idx must be in [0, {ep_len.shape[0] - 1}], got {episode_idx}.")
-        if ep_len[episode_idx] < 2:
-            raise ValueError(f"--episode-idx {episode_idx} must have at least 2 frames, got {ep_len[episode_idx]}.")
+    env_seed = int(rng.integers(np.iinfo(np.int32).max))
+    time_limit = float(args.time_limit)
+    physics_freq_hz = float(args.physics_freq_hz)
+    height = int(args.height)
+    width = int(args.width)
 
-    episode = load_dataset_episode(dataset_path, episode_idx)
-    pixels_np = np.asarray(episode["pixels"])
-    qpos_np = np.asarray(episode["qpos"])
-    qvel_np = np.asarray(episode["qvel"])
-    obs_np = np.asarray(episode["observation"])
-    episode_seed = int(episode["episode_seed"])
-    physics_freq_hz = float(episode["physics_freq_hz"])
-    time_limit = float(episode["time_limit"])
-    height = int(episode["height"])
-    width = int(episode["width"])
-
-    run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
+    run_name = f"{int(time.time())}_seed_{env_seed}"
     out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pixels = preprocess_pixels(
-        pixels_np,
-        img_size=img_size,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
-    )
-    true_latents = encode_frames(
-        model,
-        pixels,
-        device=device,
-        frame_batch_size=args.frame_batch_size,
-    )
-    start_emb = true_latents[0]
-    goal_emb = true_latents[-1]
-    start_state = make_markov_state(start_emb)
-    goal_state = make_markov_state(goal_emb)
-    if int(start_state.numel()) != markov_state_dim:
-        raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {start_state.numel()}.")
-
-    save_rgb_image(out_dir / "start_image.png", pixels_np[0])
-    save_rgb_image(out_dir / "goal_image.png", pixels_np[-1])
-
     env = make_render_env(
-        seed=episode_seed,
+        seed=env_seed,
         time_limit=time_limit,
         width=width,
         height=height,
         physics_freq_hz=physics_freq_hz,
     )
-    render_start = reset_env_to_state(
+
+    start_qpos = sample_random_qpos(env, rng)
+    goal_qpos = sample_random_qpos(env, rng)
+    zero_qvel = np.zeros_like(start_qpos, dtype=np.float32)
+
+    goal_frame, goal_obs = reset_env_to_state(
         env,
-        seed=episode_seed,
-        qpos=qpos_np[0],
-        qvel=qvel_np[0],
+        seed=env_seed,
+        qpos=goal_qpos,
+        qvel=zero_qvel,
         height=height,
         width=width,
     )
+    start_frame, current_obs = reset_env_to_state(
+        env,
+        seed=env_seed,
+        qpos=start_qpos,
+        qvel=zero_qvel,
+        height=height,
+        width=width,
+    )
+
+    goal_emb = encode_single_frame(
+        model,
+        goal_frame,
+        device=device,
+        img_size=img_size,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+    )
+    goal_state = make_markov_state(goal_emb)
+    if int(goal_state.numel()) != markov_state_dim:
+        raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {goal_state.numel()}.")
+
+    save_rgb_image(out_dir / "start_image.png", start_frame)
+    save_rgb_image(out_dir / "goal_image.png", goal_frame)
+
     dynamics = MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
     mpc_solver = ILQRMPCSolver(
         dynamics,
@@ -597,7 +566,7 @@ def main() -> None:
         device=device,
     )
 
-    current_frame = render_start
+    current_frame = start_frame
     current_emb = encode_single_frame(
         model,
         current_frame,
@@ -608,8 +577,6 @@ def main() -> None:
     )
     current_state = make_markov_state(current_emb)
     goal_state_np = goal_state.detach().cpu().numpy().astype(np.float64)
-    goal_obs = obs_np[-1].astype(np.float32)
-    current_obs = flatten_observation(env._env.task.get_observation(env._env.physics)).astype(np.float32)
 
     rollout_frames = [current_frame.copy()]
     executed_actions_raw: list[np.ndarray] = []
@@ -672,11 +639,38 @@ def main() -> None:
             stop_reason = "terminated" if terminated else "truncated"
             break
 
-    final_qpos = np.asarray(env._env.physics.data.qpos[: qpos_np.shape[1]], dtype=np.float32)
-    final_qvel = np.asarray(env._env.physics.data.qvel[: qvel_np.shape[1]], dtype=np.float32)
+    final_qpos = np.asarray(env._env.physics.data.qpos[: start_qpos.shape[0]], dtype=np.float32)
+    final_qvel = np.asarray(env._env.physics.data.qvel[: zero_qvel.shape[0]], dtype=np.float32)
     final_obs = flatten_observation(env._env.task.get_observation(env._env.physics)).astype(np.float32)
     video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
     env.close()
+
+    save_json(
+        out_dir / "metrics.json",
+        {
+            "seed": int(args.seed) if args.seed is not None else None,
+            "env_seed": env_seed,
+            "time_limit": time_limit,
+            "physics_freq_hz": physics_freq_hz,
+            "start_qpos": start_qpos.tolist(),
+            "goal_qpos": goal_qpos.tolist(),
+            "start_qvel": zero_qvel.tolist(),
+            "goal_qvel": zero_qvel.tolist(),
+            "final_qpos": final_qpos.tolist(),
+            "final_qvel": final_qvel.tolist(),
+            "goal_obs": goal_obs.tolist(),
+            "final_obs": final_obs.tolist(),
+            "stop_reason": stop_reason,
+            "num_mpc_steps": len(executed_actions_raw),
+            "video_path": video_path,
+            "latent_goal_distances": latent_goal_distances,
+            "embedding_goal_distances": embedding_goal_distances,
+            "observation_goal_distances": observation_goal_distances,
+            "solve_times_ms": solve_times_ms,
+            "ilqr_iterations": ilqr_iterations,
+            "ilqr_costs": ilqr_costs,
+        },
+    )
 
     print(f"Saved to: {out_dir}")
 

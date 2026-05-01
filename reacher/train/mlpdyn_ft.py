@@ -162,6 +162,10 @@ class LeWMReacherDataset(Dataset):
         pixel_rows = base + frame_offsets
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
         pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
+        has_prev = start >= self.frameskip
+        prev_row = base - self.frameskip if has_prev else base
+        prev_pixels_np = np.asarray(h5["pixels"][prev_row], dtype=np.uint8)
+        prev_pixels = torch.from_numpy(prev_pixels_np).permute(2, 0, 1).contiguous()
 
         action_blocks = []
         first_action_step = self.history_size - 1
@@ -174,6 +178,8 @@ class LeWMReacherDataset(Dataset):
 
         return {
             "pixels": pixels,
+            "prev_pixels": prev_pixels,
+            "has_prev": torch.tensor(has_prev, dtype=torch.bool),
             "action": torch.stack(action_blocks, dim=0).float(),
         }
 
@@ -243,29 +249,37 @@ def temporal_straightening_loss(emb: torch.Tensor, eps: float = 1e-8) -> torch.T
     return (1.0 - cosine).mean()
 
 
+def preprocess_pixels(pixels: torch.Tensor, img_size: int) -> torch.Tensor:
+    pixels = pixels.float().div_(255.0)
+    if pixels.shape[-2:] != (img_size, img_size):
+        batch_size, time_steps = pixels.shape[:2]
+        pixels = F.interpolate(
+            pixels.view(batch_size * time_steps, *pixels.shape[2:]),
+            size=(img_size, img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).view(batch_size, time_steps, *pixels.shape[2:3], img_size, img_size)
+    pixel_mean = pixels.new_tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+    pixel_std = pixels.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+    return (pixels - pixel_mean) / pixel_std
+
+
 def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
     ctx_len = args.history_size
     n_preds = args.num_preds
     lambd = args.sigreg_weight
     embed_dim = args.embed_dim
 
-    pixels = batch["pixels"].float().div_(255.0)
-    if pixels.shape[-2:] != (args.img_size, args.img_size):
-        batch_size, time_steps = pixels.shape[:2]
-        pixels = F.interpolate(
-            pixels.view(batch_size * time_steps, *pixels.shape[2:]),
-            size=(args.img_size, args.img_size),
-            mode="bilinear",
-            align_corners=False,
-        ).view(batch_size, time_steps, *pixels.shape[2:3], args.img_size, args.img_size)
-    pixel_mean = pixels.new_tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
-    pixel_std = pixels.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
-    batch["pixels"] = (pixels - pixel_mean) / pixel_std
+    prev_pixels = batch["prev_pixels"].unsqueeze(1)
+    all_pixels = torch.cat((prev_pixels, batch["pixels"]), dim=1)
+    all_pixels = preprocess_pixels(all_pixels, args.img_size)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
-    output = self.model.encode(batch)
-
-    emb = output["emb"]
+    output = self.model.encode({"pixels": all_pixels, "action": batch["action"]})
+    prev_emb = output["emb"][:, 0]
+    emb = output["emb"][:, 1:]
+    output["emb"] = emb
     act_emb = output["act_emb"]
+    has_prev = batch["has_prev"].to(device=emb.device, dtype=torch.bool)
     rollout_emb = emb[:, :ctx_len]
     pred_losses = []
     pred_embs = []
@@ -274,7 +288,7 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
         if rollout_emb.shape[1] >= 2:
             delta_emb = current_emb - rollout_emb[:, -2]
         else:
-            delta_emb = torch.zeros_like(current_emb)
+            delta_emb = torch.where(has_prev[:, None], current_emb - prev_emb, torch.zeros_like(current_emb))
         ctx_state = torch.cat((current_emb, delta_emb), dim=-1).unsqueeze(1)
         ctx_act = act_emb[:, step : step + 1]
 
