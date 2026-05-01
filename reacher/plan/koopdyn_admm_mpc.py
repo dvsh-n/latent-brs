@@ -35,8 +35,8 @@ DEFAULT_OUT_DIR = "reacher/plan/koopdyn_admm_mpc"
 
 DEVICE = "auto"
 HORIZON = 25
-MAX_MPC_STEPS = 200
-Q_TERMINAL = 10.0
+MAX_MPC_STEPS = 500
+Q_TERMINAL = 1.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 60
@@ -366,9 +366,6 @@ class KoopmanADMMPlanner:
 
         self.A = model.A.weight.detach().to(device=device, dtype=torch.float32)
         self.B = model.B.weight.detach().to(device=device, dtype=torch.float32)
-        self.C = model.C.weight.detach().to(device=device, dtype=torch.float32)
-        self.c_bias = model.C.bias.detach().to(device=device, dtype=torch.float32)
-        self.x_goal = goal_state_proc.to(device=device, dtype=torch.float32)
 
         self.nz_total = (self.horizon + 1) * self.latent_dim
         self.nu_total = self.horizon * self.control_dim
@@ -393,9 +390,8 @@ class KoopmanADMMPlanner:
                 torch.zeros((self.latent_dim, self.latent_dim), dtype=torch.float32, device=self.device),
                 torch.zeros(self.latent_dim, dtype=torch.float32, device=self.device),
             )
-        residual_offset = self.c_bias - self.x_goal
-        p = 2.0 * weight * (self.C.T @ self.C)
-        q = 2.0 * weight * (self.C.T @ residual_offset)
+        p = 2.0 * weight * torch.eye(self.latent_dim, dtype=torch.float32, device=self.device)
+        q = -2.0 * weight * self.z_goal
         return p, q
 
     def _build_quadratic_terms(self) -> None:

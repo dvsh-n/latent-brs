@@ -29,13 +29,13 @@ DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-HORIZON = 20
-MAX_MPC_STEPS = 100
-Q_TERMINAL = 10.0
+HORIZON = 35
+MAX_MPC_STEPS = 120
+Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 60
-EPISODE_IDX = 615
+EPISODE_IDX = None
 
 
 def parse_args() -> argparse.Namespace:

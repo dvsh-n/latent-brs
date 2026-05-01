@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume-checkpoint",
         type=Path,
-        default=None,
+        default="reacher/models/mlpdyn_ft_1/last.ckpt",
         help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
     )
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
@@ -64,10 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=124)
+    parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=10)
     parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument(
