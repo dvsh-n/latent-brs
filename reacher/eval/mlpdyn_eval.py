@@ -24,8 +24,8 @@ from einops import rearrange
 
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 
-DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data_50hz/reacher_expert.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
 DEFAULT_OUT_DIR = "reacher/eval/mlpdyn_eval"
 
 

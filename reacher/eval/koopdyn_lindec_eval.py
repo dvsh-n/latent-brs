@@ -21,8 +21,8 @@ import numpy as np
 import torch
 
 
-DEFAULT_DATASET_PATH = "reacher/data/test_data/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/koopdyn_ft"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data_50hz/reacher_expert.h5"
+DEFAULT_MODEL_DIR = "reacher/models/koopdyn_full_ft_50hz"
 DEFAULT_OUT_DIR = "reacher/eval/koopdyn_lindec_eval"
 DEFAULT_OVERALL_RMSE_STEPS = (1, 10, 25, 50, 100)
 
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-dim", type=int, default=None)
     parser.add_argument("--embed-dim", type=int, default=None)
     parser.add_argument("--frame-batch-size", type=int, default=64)
-    parser.add_argument("--n-eval-episodes", type=int, default=25)
+    parser.add_argument("--n-eval-episodes", type=int, default=5)
     parser.add_argument("--max-rollout-steps", type=int, default=None)
     parser.add_argument(
         "--pure-latent-rollout",
@@ -75,7 +75,7 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
 
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -> None:
     defaults = {
-        "history_size": 2,
+        "history_size": 1,
         "num_preds": 15,
         "frameskip": 1,
         "img_size": 224,
@@ -143,11 +143,11 @@ def load_episode(
     return pixels, actions
 
 
-def build_markov_pairs(emb: torch.Tensor) -> torch.Tensor:
-    current = emb[1:]
-    previous = emb[:-1]
-    delta = current - previous
-    return torch.cat((current, delta), dim=-1)
+def build_markov_states(emb: torch.Tensor) -> torch.Tensor:
+    delta = torch.zeros_like(emb)
+    if emb.shape[0] > 1:
+        delta[1:] = emb[1:] - emb[:-1]
+    return torch.cat((emb, delta), dim=-1)
 
 
 @torch.no_grad()
@@ -189,7 +189,7 @@ def rollout_markov_states(
     pure_latent_rollout: bool,
 ) -> tuple[torch.Tensor, int]:
     predictor = model.predictor
-    start_idx = history_size - 2
+    start_idx = history_size - 1
     total_future_steps = (true_markov_states.shape[0] - 1 - start_idx) // frameskip
     if max_rollout_steps is not None:
         total_future_steps = min(total_future_steps, max_rollout_steps)
@@ -303,8 +303,8 @@ def main() -> None:
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.history_size < 2:
-        raise ValueError("history_size must be at least 2 for Koopman markov-state evaluation.")
+    if args.history_size < 1:
+        raise ValueError("history_size must be positive for Koopman markov-state evaluation.")
     device = require_device(args.device)
     model = load_model(checkpoint_path, device)
     action_mean, action_std = compute_action_stats(action_stats_dataset_path, args.action_dim)
@@ -337,7 +337,7 @@ def main() -> None:
             frame_batch_size=args.frame_batch_size,
             img_size=args.img_size,
         )
-        markov_states = build_markov_pairs(latents)
+        markov_states = build_markov_states(latents)
         pred_markov_states, start_idx = rollout_markov_states(
             model,
             markov_states,

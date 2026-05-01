@@ -25,9 +25,9 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, KoopmanLinearDecoderPredictor, MLP, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data_50hz/reacher_expert.h5"
 DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft"
-DEFAULT_RUN_DIR = "reacher/models/koopdyn_ft"
+DEFAULT_RUN_DIR = "reacher/models/koopdyn_full_ft_50hz"
 FIXED_FRAMESKIP = 1
 
 
@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--init-run-dir", type=Path, default=DEFAULT_INIT_RUN_DIR)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default="reacher/models/koopdyn_full_ft_50hz/last.ckpt",
+        help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
+    )
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--output-model-name", default="lewm")
@@ -45,8 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=18)
-    parser.add_argument("--history-size", type=int, default=2)
-    parser.add_argument("--num-preds", type=int, default=15, help="Autoregressive rollout horizon.")
+    parser.add_argument("--history-size", type=int, default=1)
+    parser.add_argument("--num-preds", type=int, default=10, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--koopman-latent-dim", type=int, default=200)
@@ -54,14 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictor-depth", type=int, default=3)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.009)
+    parser.add_argument("--sigreg-weight", type=float, default=0.0005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
     parser.add_argument("--latent-loss-weight", type=float, default=0.1)
 
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--freeze-vit-epochs", type=int, default=0)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=380)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=10)
     parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument(
@@ -78,8 +85,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", default="bf16-mixed")
     parser.add_argument("--save-object-every", type=int, default=1)
     args = parser.parse_args()
-    if args.history_size < 2:
-        parser.error("--history-size must be at least 2 so the Markov pair includes a nontrivial delta.")
+    if args.history_size < 1:
+        parser.error("--history-size must be positive.")
+    if args.freeze_vit_epochs < 0:
+        parser.error("--freeze-vit-epochs must be non-negative.")
     if args.freeze_projector_epochs < 0:
         parser.error("--freeze-projector-epochs must be non-negative.")
     args.frameskip = FIXED_FRAMESKIP
@@ -228,11 +237,11 @@ class FreezeModuleCallback(Callback):
             self._module_frozen = False
 
 
-def build_markov_pairs(emb: torch.Tensor) -> torch.Tensor:
-    current = emb[:, 1:]
-    previous = emb[:, :-1]
-    delta = current - previous
-    return torch.cat((current, delta), dim=-1)
+def build_markov_states(emb: torch.Tensor) -> torch.Tensor:
+    delta = torch.zeros_like(emb)
+    if emb.shape[1] > 1:
+        delta[:, 1:] = emb[:, 1:] - emb[:, :-1]
+    return torch.cat((emb, delta), dim=-1)
 
 
 def koopman_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
@@ -256,9 +265,9 @@ def koopman_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argp
     emb = output["emb"]
     act_emb = output["act_emb"]
 
-    markov_states = build_markov_pairs(emb)
-    x_k = markov_states[:, args.history_size - 2]
-    x_next_seq = markov_states[:, args.history_size - 1 : args.history_size - 1 + args.num_preds]
+    markov_states = build_markov_states(emb)
+    x_k = markov_states[:, args.history_size - 1]
+    x_next_seq = markov_states[:, args.history_size : args.history_size + args.num_preds]
 
     predictor = self.model.predictor
     z_k = predictor.lift_state(x_k)
@@ -362,6 +371,19 @@ def resolve_init_checkpoint(args: argparse.Namespace) -> Path:
     return checkpoint_path
 
 
+def resolve_resume_checkpoint(args: argparse.Namespace, run_dir: Path) -> Path | None:
+    if args.resume_checkpoint is not None:
+        checkpoint_path = args.resume_checkpoint.expanduser().resolve()
+    else:
+        candidate = run_dir / "last.ckpt"
+        checkpoint_path = candidate.resolve() if candidate.is_file() else None
+    if checkpoint_path is None:
+        return None
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
 def load_pretrained_components(checkpoint_path: Path) -> tuple[torch.nn.Module, torch.nn.Module]:
     source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(source_model, JEPA):
@@ -381,12 +403,15 @@ def main() -> None:
 
     dataset_path = args.dataset_path.expanduser().resolve()
     run_dir = args.run_dir.expanduser().resolve()
-    init_checkpoint_path = resolve_init_checkpoint(args)
+    resume_checkpoint_path = resolve_resume_checkpoint(args, run_dir)
+    init_checkpoint_path = None if resume_checkpoint_path is not None else resolve_init_checkpoint(args)
 
     if not dataset_path.is_file():
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
-    if run_dir.exists():
+    if run_dir.exists() and resume_checkpoint_path is None:
         raise FileExistsError(f"Run dir already exists: {run_dir}")
+    if not run_dir.exists() and resume_checkpoint_path is not None:
+        raise FileNotFoundError(f"Run dir does not exist for resume: {run_dir}")
 
     spt.set(cache_dir=str(run_dir))
 
@@ -428,20 +453,19 @@ def main() -> None:
     )
 
     world_model = build_model(args)
-    pretrained_encoder, pretrained_projector = load_pretrained_components(init_checkpoint_path)
-    try:
-        world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
-        world_model.projector.load_state_dict(pretrained_projector.state_dict(), strict=True)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "Failed to load encoder/projector weights from the init checkpoint. "
-            "Check encoder-scale, patch-size, embed-dim, and projector architecture compatibility."
-        ) from exc
+    if resume_checkpoint_path is None:
+        pretrained_encoder, pretrained_projector = load_pretrained_components(init_checkpoint_path)
+        try:
+            world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
+            world_model.projector.load_state_dict(pretrained_projector.state_dict(), strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to load encoder/projector weights from the init checkpoint. "
+                "Check encoder-scale, patch-size, embed-dim, and projector architecture compatibility."
+            ) from exc
 
-    world_model.encoder.requires_grad_(False)
-
-    nn.init.eye_(world_model.predictor.A.weight)
-    nn.init.xavier_uniform_(world_model.predictor.B.weight)
+        nn.init.eye_(world_model.predictor.A.weight)
+        nn.init.xavier_uniform_(world_model.predictor.B.weight)
 
     optimizers = {
         "model_opt": {
@@ -459,24 +483,37 @@ def main() -> None:
         hparams=sanitize_hparams(args),
     )
 
-    run_dir.mkdir(parents=True, exist_ok=False)
-    config = vars(args).copy()
-    config["init_checkpoint"] = str(init_checkpoint_path)
-    config["run_dir"] = str(run_dir)
-    with (run_dir / "config.json").open("w") as f:
-        json.dump(config, f, indent=2, default=str)
+    if resume_checkpoint_path is None:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        config = vars(args).copy()
+        config["init_checkpoint"] = str(init_checkpoint_path)
+        config["run_dir"] = str(run_dir)
+        with (run_dir / "config.json").open("w") as f:
+            json.dump(config, f, indent=2, default=str)
 
-    init_report = {
-        "init_checkpoint": str(init_checkpoint_path),
-        "loaded_modules": ["encoder", "projector"],
-        "reinitialized_modules": ["predictor", "action_encoder", "pred_proj"],
-        "frozen_modules": ["encoder"],
-        "freeze_projector_epochs": int(args.freeze_projector_epochs),
-    }
-    with (run_dir / "init_report.json").open("w") as f:
-        json.dump(init_report, f, indent=2)
+        init_report = {
+            "init_checkpoint": str(init_checkpoint_path),
+            "loaded_modules": ["encoder", "projector"],
+            "reinitialized_modules": ["predictor", "action_encoder", "pred_proj"],
+            "frozen_modules": ["encoder"] if args.freeze_vit_epochs > 0 else [],
+            "freeze_vit_epochs": int(args.freeze_vit_epochs),
+            "freeze_projector_epochs": int(args.freeze_projector_epochs),
+        }
+        with (run_dir / "init_report.json").open("w") as f:
+            json.dump(init_report, f, indent=2)
+    else:
+        resume_report = {
+            "resume_checkpoint": str(resume_checkpoint_path),
+            "run_dir": str(run_dir),
+            "sigreg_weight": float(args.sigreg_weight),
+            "freeze_vit_epochs": int(args.freeze_vit_epochs),
+            "freeze_projector_epochs": int(args.freeze_projector_epochs),
+        }
+        with (run_dir / "resume_report.json").open("w") as f:
+            json.dump(resume_report, f, indent=2)
 
     callbacks: list[Callback] = [
+        FreezeModuleCallback("encoder", args.freeze_vit_epochs),
         FreezeModuleCallback("projector", args.freeze_projector_epochs),
         ModelCheckpoint(
             dirpath=run_dir,
@@ -502,7 +539,7 @@ def main() -> None:
     data_module = spt.data.DataModule(train=train_loader, val=val_loader)
     if hasattr(torch.serialization, "add_safe_globals"):
         torch.serialization.add_safe_globals([PosixPath])
-    trainer.fit(module, datamodule=data_module)
+    trainer.fit(module, datamodule=data_module, ckpt_path=str(resume_checkpoint_path) if resume_checkpoint_path else None)
 
 
 if __name__ == "__main__":

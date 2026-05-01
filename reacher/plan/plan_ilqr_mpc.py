@@ -24,18 +24,18 @@ from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-HORIZON = 35
-MAX_MPC_STEPS = 120
+HORIZON = 15
+MAX_MPC_STEPS = 60
 Q_TERMINAL = 10.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 60
-EPISODE_IDX = 943
+EPISODE_IDX = None
 
 
 def parse_args() -> argparse.Namespace:

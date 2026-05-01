@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data_50hz/reacher_expert.h5"
 DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft"
 DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_1"
 FIXED_FRAMESKIP = 1
@@ -34,39 +34,46 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--init-run-dir", type=Path, default=DEFAULT_INIT_RUN_DIR)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
+    )
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--output-model-name", default="lewm")
     parser.add_argument("--seed", type=int, default=3072)
-    parser.add_argument("--train-split", type=float, default=0.9)
+    parser.add_argument("--train-split", type=float, default=1.0)
 
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=18)
     parser.add_argument("--history-size", type=int, default=1)
-    parser.add_argument("--num-preds", type=int, default=15, help="Autoregressive rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=6, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
     parser.add_argument("--predictor-depth", type=int, default=2)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.009)
+    parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--freeze-encoder-epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=200)
-    parser.add_argument("--num-workers", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=124)
+    parser.add_argument("--num-workers", type=int, default=10)
     parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument(
         "--persistent-workers",
         action="store_true",
+        default=True,
         help="Keep training dataloader workers alive across epochs. Validation workers stay non-persistent to avoid doubled RAM usage.",
     )
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -137,10 +144,6 @@ class LeWMReacherDataset(Dataset):
                 self.samples.append((ep_idx, start))
         if not self.samples:
             raise ValueError("No valid training windows found. Check frameskip/history/num_preds.")
-        self.num_valid_episodes = len({ep_idx for ep_idx, _ in self.samples})
-
-        self.pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
-        self.pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -158,10 +161,7 @@ class LeWMReacherDataset(Dataset):
         frame_offsets = np.arange(self.num_steps, dtype=np.int64) * self.frameskip
         pixel_rows = base + frame_offsets
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
-        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).float().div_(255.0)
-        if pixels.shape[-2:] != (self.img_size, self.img_size):
-            pixels = F.interpolate(pixels, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
-        pixels = (pixels - self.pixel_mean) / self.pixel_std
+        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
 
         action_blocks = []
         first_action_step = self.history_size - 1
@@ -249,6 +249,18 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     lambd = args.sigreg_weight
     embed_dim = args.embed_dim
 
+    pixels = batch["pixels"].float().div_(255.0)
+    if pixels.shape[-2:] != (args.img_size, args.img_size):
+        batch_size, time_steps = pixels.shape[:2]
+        pixels = F.interpolate(
+            pixels.view(batch_size * time_steps, *pixels.shape[2:]),
+            size=(args.img_size, args.img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).view(batch_size, time_steps, *pixels.shape[2:3], args.img_size, args.img_size)
+    pixel_mean = pixels.new_tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+    pixel_std = pixels.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+    batch["pixels"] = (pixels - pixel_mean) / pixel_std
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode(batch)
 
@@ -375,6 +387,18 @@ def resolve_init_checkpoint(args: argparse.Namespace) -> Path:
     return checkpoint_path
 
 
+def resolve_resume_checkpoint(args: argparse.Namespace, run_dir: Path) -> Path | None:
+    if args.resume_checkpoint is not None:
+        checkpoint_path = args.resume_checkpoint.expanduser().resolve()
+    else:
+        checkpoint_path = None
+    if checkpoint_path is None:
+        return None
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
 def load_pretrained_encoder(checkpoint_path: Path) -> torch.nn.Module:
     source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(source_model, JEPA):
@@ -391,12 +415,15 @@ def main() -> None:
 
     dataset_path = args.dataset_path.expanduser().resolve()
     run_dir = args.run_dir.expanduser().resolve()
-    init_checkpoint_path = resolve_init_checkpoint(args)
+    resume_checkpoint_path = resolve_resume_checkpoint(args, run_dir)
+    init_checkpoint_path = None if resume_checkpoint_path is not None else resolve_init_checkpoint(args)
 
     if not dataset_path.is_file():
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
-    if run_dir.exists():
+    if run_dir.exists() and resume_checkpoint_path is None:
         raise FileExistsError(f"Run dir already exists: {run_dir}")
+    if not run_dir.exists() and resume_checkpoint_path is not None:
+        raise FileNotFoundError(f"Run dir does not exist for resume: {run_dir}")
 
     spt.set(cache_dir=str(run_dir))
 
@@ -438,14 +465,15 @@ def main() -> None:
     )
 
     world_model = build_model(args)
-    pretrained_encoder = load_pretrained_encoder(init_checkpoint_path)
-    try:
-        world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "Failed to load encoder weights from the init checkpoint. "
-            "Check encoder-scale, patch-size, and encoder architecture compatibility."
-        ) from exc
+    if resume_checkpoint_path is None:
+        pretrained_encoder = load_pretrained_encoder(init_checkpoint_path)
+        try:
+            world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to load encoder weights from the init checkpoint. "
+                "Check encoder-scale, patch-size, and encoder architecture compatibility."
+            ) from exc
 
     optimizers = {
         "model_opt": {
@@ -463,22 +491,33 @@ def main() -> None:
         hparams=sanitize_hparams(args),
     )
 
-    run_dir.mkdir(parents=True, exist_ok=False)
-    config = vars(args).copy()
-    config["init_checkpoint"] = str(init_checkpoint_path)
-    config["run_dir"] = str(run_dir)
-    with (run_dir / "config.json").open("w") as f:
-        json.dump(config, f, indent=2, default=str)
+    if resume_checkpoint_path is None:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        config = vars(args).copy()
+        config["init_checkpoint"] = str(init_checkpoint_path)
+        config["run_dir"] = str(run_dir)
+        with (run_dir / "config.json").open("w") as f:
+            json.dump(config, f, indent=2, default=str)
 
-    init_report = {
-        "init_checkpoint": str(init_checkpoint_path),
-        "loaded_modules": ["encoder"],
-        "reinitialized_modules": ["projector", "predictor", "action_encoder", "pred_proj"],
-        "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
-        "freeze_projector_epochs": int(args.freeze_projector_epochs),
-    }
-    with (run_dir / "init_report.json").open("w") as f:
-        json.dump(init_report, f, indent=2)
+        init_report = {
+            "init_checkpoint": str(init_checkpoint_path),
+            "loaded_modules": ["encoder"],
+            "reinitialized_modules": ["projector", "predictor", "action_encoder", "pred_proj"],
+            "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
+            "freeze_projector_epochs": int(args.freeze_projector_epochs),
+        }
+        with (run_dir / "init_report.json").open("w") as f:
+            json.dump(init_report, f, indent=2)
+    else:
+        resume_report = {
+            "resume_checkpoint": str(resume_checkpoint_path),
+            "run_dir": str(run_dir),
+            "sigreg_weight": float(args.sigreg_weight),
+            "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
+            "freeze_projector_epochs": int(args.freeze_projector_epochs),
+        }
+        with (run_dir / "resume_report.json").open("w") as f:
+            json.dump(resume_report, f, indent=2)
 
     callbacks: list[Callback] = [
         FreezeModuleCallback("encoder", args.freeze_encoder_epochs),
@@ -507,7 +546,7 @@ def main() -> None:
     data_module = spt.data.DataModule(train=train_loader, val=val_loader)
     if hasattr(torch.serialization, "add_safe_globals"):
         torch.serialization.add_safe_globals([PosixPath])
-    trainer.fit(module, datamodule=data_module)
+    trainer.fit(module, datamodule=data_module, ckpt_path=str(resume_checkpoint_path) if resume_checkpoint_path else None)
 
 
 if __name__ == "__main__":
