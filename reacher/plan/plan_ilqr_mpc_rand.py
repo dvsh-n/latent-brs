@@ -27,9 +27,9 @@ DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn_rand"
 
 DEVICE = "auto"
-HORIZON = 20
+HORIZON = 35
 MAX_MPC_STEPS = 100
-Q_TERMINAL = 10.0
+Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 60
@@ -235,16 +235,22 @@ def reset_env_to_state(
     return frame, obs
 
 
-def sample_random_qpos(env: DmControlGymEnv, rng: np.random.Generator) -> np.ndarray:
-    joint_ranges = np.asarray(env._env.physics.model.jnt_range, dtype=np.float32)
+def sample_random_qpos(
+    env: DmControlGymEnv,
+    rng: np.random.Generator,
+    *,
+    num_qpos: int,
+) -> np.ndarray:
+    model = env._env.physics.model
+    joint_ranges = np.asarray(model.jnt_range[:num_qpos], dtype=np.float32)
+    joint_limited = np.asarray(model.jnt_limited[:num_qpos], dtype=bool)
     if joint_ranges.ndim != 2 or joint_ranges.shape[1] != 2:
         raise ValueError(f"Expected joint ranges with shape (n, 2), got {joint_ranges.shape}.")
     lower = joint_ranges[:, 0]
     upper = joint_ranges[:, 1]
-    finite = np.isfinite(lower) & np.isfinite(upper)
-    if not np.all(finite):
-        lower = np.where(finite, lower, -np.pi)
-        upper = np.where(finite, upper, np.pi)
+    valid_limited = joint_limited & np.isfinite(lower) & np.isfinite(upper) & (upper > lower)
+    lower = np.where(valid_limited, lower, -np.pi)
+    upper = np.where(valid_limited, upper, np.pi)
     return rng.uniform(lower, upper).astype(np.float32)
 
 
@@ -517,13 +523,18 @@ def main() -> None:
         physics_freq_hz=physics_freq_hz,
     )
 
-    start_qpos = sample_random_qpos(env, rng)
-    goal_qpos = sample_random_qpos(env, rng)
+    # The training state stores only the 2 arm joint angles, not the full MuJoCo qpos.
+    # Sampling only the controllable arm joints avoids coupling the sample to hidden task state.
+    arm_qpos_dim = action_dim
+    start_qpos = sample_random_qpos(env, rng, num_qpos=arm_qpos_dim)
+    goal_qpos = sample_random_qpos(env, rng, num_qpos=arm_qpos_dim)
     zero_qvel = np.zeros_like(start_qpos, dtype=np.float32)
+    goal_reset_seed = int(rng.integers(np.iinfo(np.int32).max))
+    start_reset_seed = int(rng.integers(np.iinfo(np.int32).max))
 
     goal_frame, goal_obs = reset_env_to_state(
         env,
-        seed=env_seed,
+        seed=goal_reset_seed,
         qpos=goal_qpos,
         qvel=zero_qvel,
         height=height,
@@ -531,7 +542,7 @@ def main() -> None:
     )
     start_frame, current_obs = reset_env_to_state(
         env,
-        seed=env_seed,
+        seed=start_reset_seed,
         qpos=start_qpos,
         qvel=zero_qvel,
         height=height,
@@ -650,6 +661,8 @@ def main() -> None:
         {
             "seed": int(args.seed) if args.seed is not None else None,
             "env_seed": env_seed,
+            "start_reset_seed": start_reset_seed,
+            "goal_reset_seed": goal_reset_seed,
             "time_limit": time_limit,
             "physics_freq_hz": physics_freq_hz,
             "start_qpos": start_qpos.tolist(),
