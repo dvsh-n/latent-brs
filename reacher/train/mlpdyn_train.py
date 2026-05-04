@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data/reacher_expert.h5"
+DEFAULT_DATASET_PATH = "reacher/data/expert_data_50hz/reacher_expert.h5"
 DEFAULT_RUN_DIR = "reacher/models/mlpdyn_straighten"
 FINETUNE_DIR = None
 FIXED_FRAMESKIP = 1
@@ -37,14 +37,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finetune-dir", type=Path, default=FINETUNE_DIR)
     parser.add_argument("--output-model-name", default="lewm")
     parser.add_argument("--seed", type=int, default=3072)
-    parser.add_argument("--train-split", type=float, default=0.9)
+    parser.add_argument("--train-split", type=float, default=1.0)
 
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=9)
+    parser.add_argument("--embed-dim", type=int, default=18)
     parser.add_argument("--history-size", type=int, default=1)
-    parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=6, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
@@ -54,13 +54,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
-    parser.add_argument("--straighten-weight", type=float, default=1e-3)
+    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=6)
-    parser.add_argument("--prefetch-factor", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--num-workers", type=int, default=10)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        default=True,
+        help="Keep training dataloader workers alive across epochs. Validation workers stay non-persistent to avoid doubled RAM usage.",
+    )
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--gradient-clip-val", type=float, default=1.0)
@@ -125,10 +131,6 @@ class LeWMReacherDataset(Dataset):
                 self.samples.append((ep_idx, start))
         if not self.samples:
             raise ValueError("No valid training windows found. Check frameskip/history/num_preds.")
-        self.num_valid_episodes = len({ep_idx for ep_idx, _ in self.samples})
-
-        self.pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
-        self.pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -146,10 +148,11 @@ class LeWMReacherDataset(Dataset):
         frame_offsets = np.arange(self.num_steps, dtype=np.int64) * self.frameskip
         pixel_rows = base + frame_offsets
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
-        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).float().div_(255.0)
-        if pixels.shape[-2:] != (self.img_size, self.img_size):
-            pixels = F.interpolate(pixels, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
-        pixels = (pixels - self.pixel_mean) / self.pixel_std
+        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
+        has_prev = start >= self.frameskip
+        prev_row = base - self.frameskip if has_prev else base
+        prev_pixels_np = np.asarray(h5["pixels"][prev_row], dtype=np.uint8)
+        prev_pixels = torch.from_numpy(prev_pixels_np).permute(2, 0, 1).contiguous()
 
         action_blocks = []
         first_action_step = self.history_size - 1
@@ -162,6 +165,8 @@ class LeWMReacherDataset(Dataset):
 
         return {
             "pixels": pixels,
+            "prev_pixels": prev_pixels,
+            "has_prev": torch.tensor(has_prev, dtype=torch.bool),
             "action": torch.stack(action_blocks, dim=0).float(),
         }
 
@@ -206,17 +211,37 @@ def temporal_straightening_loss(emb: torch.Tensor, eps: float = 1e-8) -> torch.T
     return (1.0 - cosine).mean()
 
 
+def preprocess_pixels(pixels: torch.Tensor, img_size: int) -> torch.Tensor:
+    pixels = pixels.float().div_(255.0)
+    if pixels.shape[-2:] != (img_size, img_size):
+        batch_size, time_steps = pixels.shape[:2]
+        pixels = F.interpolate(
+            pixels.view(batch_size * time_steps, *pixels.shape[2:]),
+            size=(img_size, img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).view(batch_size, time_steps, *pixels.shape[2:3], img_size, img_size)
+    pixel_mean = pixels.new_tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+    pixel_std = pixels.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+    return (pixels - pixel_mean) / pixel_std
+
+
 def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
     ctx_len = args.history_size
     n_preds = args.num_preds
     lambd = args.sigreg_weight
     embed_dim = args.embed_dim
 
+    prev_pixels = batch["prev_pixels"].unsqueeze(1)
+    all_pixels = torch.cat((prev_pixels, batch["pixels"]), dim=1)
+    all_pixels = preprocess_pixels(all_pixels, args.img_size)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
-    output = self.model.encode(batch)
-
-    emb = output["emb"]
+    output = self.model.encode({"pixels": all_pixels, "action": batch["action"]})
+    prev_emb = output["emb"][:, 0]
+    emb = output["emb"][:, 1:]
+    output["emb"] = emb
     act_emb = output["act_emb"]
+    has_prev = batch["has_prev"].to(device=emb.device, dtype=torch.bool)
     rollout_emb = emb[:, :ctx_len]
     pred_losses = []
     pred_embs = []
@@ -225,7 +250,7 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
         if rollout_emb.shape[1] >= 2:
             delta_emb = current_emb - rollout_emb[:, -2]
         else:
-            delta_emb = torch.zeros_like(current_emb)
+            delta_emb = torch.where(has_prev[:, None], current_emb - prev_emb, torch.zeros_like(current_emb))
         ctx_state = torch.cat((current_emb, delta_emb), dim=-1).unsqueeze(1)
         ctx_act = act_emb[:, step : step + 1]
 
@@ -287,14 +312,21 @@ def build_model(args: argparse.Namespace) -> JEPA:
     )
 
 
-def make_loader(dataset: Dataset, args: argparse.Namespace, *, shuffle: bool, drop_last: bool) -> DataLoader:
+def make_loader(
+    dataset: Dataset,
+    args: argparse.Namespace,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    persistent_workers: bool,
+) -> DataLoader:
     loader_kwargs = {
         "batch_size": args.batch_size,
         "shuffle": shuffle,
         "drop_last": drop_last,
         "num_workers": args.num_workers,
         "pin_memory": args.accelerator == "gpu",
-        "persistent_workers": args.num_workers > 0,
+        "persistent_workers": args.num_workers > 0 and persistent_workers,
     }
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -353,8 +385,24 @@ def main() -> None:
     generator = torch.Generator().manual_seed(args.seed)
     train_set, val_set = random_split(dataset, [train_len, val_len], generator=generator)
 
-    train_loader = make_loader(train_set, args, shuffle=True, drop_last=True)
-    val_loader = make_loader(val_set, args, shuffle=False, drop_last=False) if val_len else None
+    train_loader = make_loader(
+        train_set,
+        args,
+        shuffle=True,
+        drop_last=True,
+        persistent_workers=args.persistent_workers,
+    )
+    val_loader = (
+        make_loader(
+            val_set,
+            args,
+            shuffle=False,
+            drop_last=False,
+            persistent_workers=False,
+        )
+        if val_len
+        else None
+    )
 
     world_model = build_model(args)
     optimizers = {
