@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finetune a PushT latent dynamics model from a pretrained image encoder."""
+"""Finetune a PushT split latent dynamics model from a pretrained image encoder."""
 
 from __future__ import annotations
 
@@ -17,16 +17,17 @@ import lightning as pl
 import numpy as np
 import stable_pretraining as spt
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset, random_split
 
-from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
+from pusht.shared.models import MLP, JEPA, MLPDynamicsPredictor, SIGReg
 
 
 DEFAULT_DATASET_PATH = "pusht/data/pusht_expert_train_preproc.h5"
 DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn"
+DEFAULT_RUN_DIR = "pusht/models/splitdyn_ft"
 FIXED_FRAMESKIP = 1
 
 
@@ -37,19 +38,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume-checkpoint",
         type=Path,
-        default="pusht/models/mlpdyn/last.ckpt",
+        default=None,
         help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
     )
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--output-model-name", default="mlpdyn")
+    parser.add_argument("--output-model-name", default="splitdyn")
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--train-split", type=float, default=1.0)
 
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--body-dim", type=int, default=24)
+    parser.add_argument("--pusher-dim", type=int, default=8)
     parser.add_argument("--history-size", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
@@ -66,10 +68,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
-    parser.add_argument("--freeze-projector-epochs", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=124)
     parser.add_argument("--num-workers", type=int, default=24)
-    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument(
         "--persistent-workers",
         action="store_true",
@@ -84,12 +85,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", default="bf16-mixed")
     parser.add_argument("--save-object-every", type=int, default=1)
     args = parser.parse_args()
+
     if args.freeze_encoder_epochs < 0:
         parser.error("--freeze-encoder-epochs must be non-negative.")
-    if args.freeze_projector_epochs < 0:
-        parser.error("--freeze-projector-epochs must be non-negative.")
+    if args.body_dim <= 0 or args.pusher_dim <= 0:
+        parser.error("--body-dim and --pusher-dim must be positive.")
+
     args.frameskip = FIXED_FRAMESKIP
+    args.embed_dim = args.body_dim + args.pusher_dim
     args.markov_state_dim = 2 * args.embed_dim
+    args.body_markov_state_dim = 2 * args.body_dim
+    args.pusher_markov_state_dim = 2 * args.pusher_dim
     return args
 
 
@@ -264,45 +270,166 @@ def preprocess_pixels(pixels: torch.Tensor, img_size: int) -> torch.Tensor:
     return (pixels - pixel_mean) / pixel_std
 
 
-def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
+def build_mlp(in_dim: int, out_dim: int, *, hidden_width: int, depth: int, dropout: float) -> nn.Sequential:
+    if depth < 1:
+        raise ValueError("depth must be at least 1.")
+
+    layers: list[nn.Module] = []
+    current_dim = in_dim
+    for _ in range(depth):
+        layers.append(nn.Linear(current_dim, hidden_width))
+        layers.append(nn.GELU())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+        current_dim = hidden_width
+    layers.append(nn.Linear(current_dim, out_dim))
+    return nn.Sequential(*layers)
+
+
+class SplitBodyDynamicsPredictor(nn.Module):
+    def __init__(
+        self,
+        *,
+        body_state_dim: int,
+        pusher_state_dim: int,
+        hidden_width: int,
+        depth: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.body_state_dim = int(body_state_dim)
+        self.pusher_state_dim = int(pusher_state_dim)
+        self.net = build_mlp(
+            self.body_state_dim + self.pusher_state_dim,
+            self.body_state_dim,
+            hidden_width=hidden_width,
+            depth=depth,
+            dropout=dropout,
+        )
+
+    def forward(self, body_state: torch.Tensor, pusher_state: torch.Tensor) -> torch.Tensor:
+        if body_state.ndim != 3 or pusher_state.ndim != 3:
+            raise ValueError(
+                f"Expected body_state and pusher_state with shape [batch, history, dim], got {body_state.shape} and {pusher_state.shape}."
+            )
+        if body_state.shape[1] != 1 or pusher_state.shape[1] != 1:
+            raise ValueError("SplitBodyDynamicsPredictor currently expects history size 1.")
+        x = torch.cat((body_state.flatten(1), pusher_state.flatten(1)), dim=-1)
+        pred = self.net(x)
+        return pred.reshape(body_state.shape[0], 1, self.body_state_dim)
+
+
+class SplitDynamicsModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        encoder: nn.Module,
+        projector: nn.Module,
+        pusher_predictor: nn.Module,
+        body_predictor: nn.Module,
+        body_dim: int,
+        pusher_dim: int,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.projector = projector
+        self.pusher_predictor = pusher_predictor
+        self.body_predictor = body_predictor
+        self.body_dim = int(body_dim)
+        self.pusher_dim = int(pusher_dim)
+
+    def encode(self, info: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        pixels = info["pixels"].float()
+        batch_size = pixels.size(0)
+        pixels = pixels.reshape(batch_size * pixels.size(1), *pixels.shape[2:])
+        output = self.encoder(pixels, interpolate_pos_encoding=True)
+        pixels_emb = output.last_hidden_state[:, 0]
+        emb = self.projector(pixels_emb).reshape(batch_size, -1, self.body_dim + self.pusher_dim)
+        info["emb"] = emb
+        info["z_body"] = emb[..., : self.body_dim]
+        info["z_pusher"] = emb[..., self.body_dim :]
+        return info
+
+    def predict_pusher(self, pusher_state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.pusher_predictor(pusher_state, action)
+
+    def predict_body(self, body_state: torch.Tensor, next_pusher_state: torch.Tensor) -> torch.Tensor:
+        return self.body_predictor(body_state, next_pusher_state)
+
+
+def splitdyn_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
     ctx_len = args.history_size
     n_preds = args.num_preds
     lambd = args.sigreg_weight
-    embed_dim = args.embed_dim
+    body_dim = args.body_dim
+    pusher_dim = args.pusher_dim
 
     prev_pixels = batch["prev_pixels"].unsqueeze(1)
     all_pixels = torch.cat((prev_pixels, batch["pixels"]), dim=1)
     all_pixels = preprocess_pixels(all_pixels, args.img_size)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
-    output = self.model.encode({"pixels": all_pixels, "action": batch["action"]})
-    prev_emb = output["emb"][:, 0]
+    output = self.model.encode({"pixels": all_pixels})
+
+    prev_body = output["z_body"][:, 0]
+    prev_pusher = output["z_pusher"][:, 0]
+    z_body = output["z_body"][:, 1:]
+    z_pusher = output["z_pusher"][:, 1:]
     emb = output["emb"][:, 1:]
     output["emb"] = emb
-    act_emb = output["act_emb"]
+    output["z_body"] = z_body
+    output["z_pusher"] = z_pusher
+
     has_prev = batch["has_prev"].to(device=emb.device, dtype=torch.bool)
-    rollout_emb = emb[:, :ctx_len]
-    pred_losses = []
-    pred_embs = []
+    rollout_body = z_body[:, :ctx_len]
+    rollout_pusher = z_pusher[:, :ctx_len]
+
+    body_losses = []
+    pusher_losses = []
+    pred_body_embs = []
+    pred_pusher_embs = []
+
     for step in range(n_preds):
-        current_emb = rollout_emb[:, -1]
-        if rollout_emb.shape[1] >= 2:
-            delta_emb = current_emb - rollout_emb[:, -2]
+        current_body = rollout_body[:, -1]
+        current_pusher = rollout_pusher[:, -1]
+
+        if rollout_body.shape[1] >= 2:
+            delta_body = current_body - rollout_body[:, -2]
+            delta_pusher = current_pusher - rollout_pusher[:, -2]
         else:
-            delta_emb = torch.where(has_prev[:, None], current_emb - prev_emb, torch.zeros_like(current_emb))
-        ctx_state = torch.cat((current_emb, delta_emb), dim=-1).unsqueeze(1)
-        ctx_act = act_emb[:, step : step + 1]
+            delta_body = torch.where(has_prev[:, None], current_body - prev_body, torch.zeros_like(current_body))
+            delta_pusher = torch.where(
+                has_prev[:, None], current_pusher - prev_pusher, torch.zeros_like(current_pusher)
+            )
 
-        pred_state = self.model.predict(ctx_state, ctx_act)[:, 0]
-        pred_next = pred_state[..., :embed_dim]
-        tgt_next = emb[:, ctx_len + step]
-        tgt_delta = tgt_next - current_emb.detach()
-        tgt_state = torch.cat((tgt_next, tgt_delta), dim=-1)
-        pred_losses.append((pred_state - tgt_state).pow(2).mean())
-        pred_embs.append(pred_next)
-        rollout_emb = torch.cat((rollout_emb, pred_next.unsqueeze(1)), dim=1)
+        body_state = torch.cat((current_body, delta_body), dim=-1).unsqueeze(1)
+        pusher_state = torch.cat((current_pusher, delta_pusher), dim=-1).unsqueeze(1)
+        action = batch["action"][:, step : step + 1]
 
-    output["pred_emb"] = torch.stack(pred_embs, dim=1)
-    output["pred_loss"] = torch.stack(pred_losses).mean()
+        pred_pusher_state = self.model.predict_pusher(pusher_state, action)[:, 0]
+        pred_pusher_next = pred_pusher_state[..., :pusher_dim]
+        tgt_pusher_next = z_pusher[:, ctx_len + step]
+        tgt_pusher_delta = tgt_pusher_next - current_pusher.detach()
+        tgt_pusher_state = torch.cat((tgt_pusher_next, tgt_pusher_delta), dim=-1)
+        pusher_losses.append((pred_pusher_state - tgt_pusher_state).pow(2).mean())
+
+        pred_body_state = self.model.predict_body(body_state, pred_pusher_state.detach().unsqueeze(1))[:, 0]
+        pred_body_next = pred_body_state[..., :body_dim]
+        tgt_body_next = z_body[:, ctx_len + step]
+        tgt_body_delta = tgt_body_next - current_body.detach()
+        tgt_body_state = torch.cat((tgt_body_next, tgt_body_delta), dim=-1)
+        body_losses.append((pred_body_state - tgt_body_state).pow(2).mean())
+
+        pred_body_embs.append(pred_body_next)
+        pred_pusher_embs.append(pred_pusher_next)
+        rollout_body = torch.cat((rollout_body, pred_body_next.unsqueeze(1)), dim=1)
+        rollout_pusher = torch.cat((rollout_pusher, pred_pusher_next.unsqueeze(1)), dim=1)
+
+    output["pred_body_emb"] = torch.stack(pred_body_embs, dim=1)
+    output["pred_pusher_emb"] = torch.stack(pred_pusher_embs, dim=1)
+    output["pred_emb"] = torch.cat((output["pred_body_emb"], output["pred_pusher_emb"]), dim=-1)
+    output["body_loss"] = torch.stack(body_losses).mean()
+    output["pusher_loss"] = torch.stack(pusher_losses).mean()
+    output["pred_loss"] = output["body_loss"] + output["pusher_loss"]
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
     output["straighten_loss"] = temporal_straightening_loss(emb) if args.straighten else emb.new_zeros(())
     output["loss"] = (
@@ -317,7 +444,7 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     return output
 
 
-def build_model(args: argparse.Namespace) -> JEPA:
+def build_model(args: argparse.Namespace) -> SplitDynamicsModel:
     encoder = spt.backbone.utils.vit_hf(
         args.encoder_scale,
         patch_size=args.patch_size,
@@ -326,12 +453,11 @@ def build_model(args: argparse.Namespace) -> JEPA:
         use_mask_token=False,
     )
     hidden_dim = encoder.config.hidden_size
-    embed_dim = args.embed_dim
-    markov_state_dim = 2 * embed_dim
     effective_act_dim = args.frameskip * args.action_dim
 
-    predictor = MLPDynamicsPredictor(
-        embed_dim=markov_state_dim,
+    projector = MLP(input_dim=hidden_dim, output_dim=args.embed_dim, hidden_dim=2048, norm_fn=torch.nn.BatchNorm1d)
+    pusher_predictor = MLPDynamicsPredictor(
+        embed_dim=args.pusher_markov_state_dim,
         action_dim=effective_act_dim,
         history_size=1,
         action_history_size=1,
@@ -340,13 +466,20 @@ def build_model(args: argparse.Namespace) -> JEPA:
         depth=args.predictor_depth,
         dropout=args.predictor_dropout,
     )
-    projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=torch.nn.BatchNorm1d)
-    return JEPA(
+    body_predictor = SplitBodyDynamicsPredictor(
+        body_state_dim=args.body_markov_state_dim,
+        pusher_state_dim=args.pusher_markov_state_dim,
+        hidden_width=args.predictor_hidden_width,
+        depth=args.predictor_depth,
+        dropout=args.predictor_dropout,
+    )
+    return SplitDynamicsModel(
         encoder=encoder,
-        predictor=predictor,
-        action_encoder=torch.nn.Identity(),
         projector=projector,
-        pred_proj=torch.nn.Identity(),
+        pusher_predictor=pusher_predictor,
+        body_predictor=body_predictor,
+        body_dim=args.body_dim,
+        pusher_dim=args.pusher_dim,
     )
 
 
@@ -500,7 +633,7 @@ def main() -> None:
     module = spt.Module(
         model=world_model,
         sigreg=SIGReg(knots=args.sigreg_knots, num_proj=args.sigreg_num_proj),
-        forward=partial(lewm_forward, args=args),
+        forward=partial(splitdyn_forward, args=args),
         optim=optimizers,
         hparams=sanitize_hparams(args),
     )
@@ -516,9 +649,8 @@ def main() -> None:
         init_report = {
             "init_checkpoint": str(init_checkpoint_path),
             "loaded_modules": ["encoder"],
-            "reinitialized_modules": ["projector", "predictor", "action_encoder", "pred_proj"],
+            "reinitialized_modules": ["projector", "pusher_predictor", "body_predictor"],
             "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
-            "freeze_projector_epochs": int(args.freeze_projector_epochs),
         }
         with (run_dir / "init_report.json").open("w") as f:
             json.dump(init_report, f, indent=2)
@@ -528,14 +660,12 @@ def main() -> None:
             "run_dir": str(run_dir),
             "sigreg_weight": float(args.sigreg_weight),
             "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
-            "freeze_projector_epochs": int(args.freeze_projector_epochs),
         }
         with (run_dir / "resume_report.json").open("w") as f:
             json.dump(resume_report, f, indent=2)
 
     callbacks: list[Callback] = [
         FreezeModuleCallback("encoder", args.freeze_encoder_epochs),
-        FreezeModuleCallback("projector", args.freeze_projector_epochs),
         ModelCheckpoint(
             dirpath=run_dir,
             filename=f"{args.output_model_name}" + "_{epoch:03d}",
