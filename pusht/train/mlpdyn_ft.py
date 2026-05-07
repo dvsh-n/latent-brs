@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume-checkpoint",
         type=Path,
-        default="pusht/models/mlpdyn/last.ckpt",
+        default=None,
         help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
     )
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
