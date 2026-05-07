@@ -44,6 +44,8 @@ DEFAULT_OUTPUT_NAME = "ogbench_cube_expert.h5"
 DEFAULT_ENV_NAME = "cube-single-v0"
 DEFAULT_SIM_FREQ_HZ = 500.0
 DEFAULT_CONTROL_DECIMATION = 20
+XY_SAMPLING_BOUNDS = np.asarray([[0.30, -0.25], [0.5, 0.25]], dtype=np.float32) # x (front back), y (left right), [x_min, y_min] and [x_max, y_max]
+MIN_START_GOAL_SAMPLING_DIST = 0.10
 ACTION_DIM = 5
 
 
@@ -52,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-name", default=DEFAULT_ENV_NAME)
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     parser.add_argument("--output-name", default=DEFAULT_OUTPUT_NAME)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--overwrite", action="store_true", default=True)
     parser.add_argument(
         "--target-transitions",
         type=int,
@@ -62,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=10,
+        default=20,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -78,6 +80,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise-smoothing", type=float, default=0.5)
     parser.add_argument("--segment-dt", type=float, default=0.4)
     parser.add_argument("--goal-threshold", type=float, default=0.04)
+    parser.add_argument(
+        "--post-goal-steps",
+        type=int,
+        default=15,
+        help="Number of extra control steps to record after the cube first reaches the goal threshold.",
+    )
     parser.add_argument("--camera", default="front_pixels")
     return parser.parse_args()
 
@@ -134,6 +142,28 @@ def compute_env_timing(sim_freq_hz: float, control_decimation: int) -> tuple[flo
     return physics_timestep, control_timestep, control_freq_hz
 
 
+def apply_xy_sampling_bounds(env: object) -> None:
+    xy_bounds = np.asarray(XY_SAMPLING_BOUNDS, dtype=np.float64)
+    if xy_bounds.shape != (2, 2):
+        raise ValueError(f"XY_SAMPLING_BOUNDS must have shape (2, 2), got {xy_bounds.shape}.")
+    env.unwrapped._object_sampling_bounds = xy_bounds
+    env.unwrapped._target_sampling_bounds = xy_bounds
+
+
+def sample_valid_reset(env: object, trajectory_seed: int, min_sampling_dist: float) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    if min_sampling_dist < 0.0:
+        raise ValueError(f"MIN_SAMPLING_DIST cannot be negative, got {min_sampling_dist}.")
+
+    seed_offset = 0
+    while True:
+        ob, info = env.reset(seed=trajectory_seed + seed_offset)
+        start_xy = np.asarray(info["privileged/block_0_pos"][:2], dtype=np.float64)
+        goal_xy = np.asarray(info["privileged/target_block_pos"][:2], dtype=np.float64)
+        if np.linalg.norm(start_xy - goal_xy) >= min_sampling_dist:
+            return ob, info
+        seed_offset += 1
+
+
 def extract_step_info(info: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     return {
         "qpos": np.asarray(info["qpos"], dtype=np.float32),
@@ -163,8 +193,9 @@ def collect_trajectory(
     trajectory_seed: int,
     camera: str,
     goal_threshold: float,
+    post_goal_steps: int,
 ) -> tuple[dict[str, np.ndarray], float, bool, bool]:
-    ob, info = env.reset(seed=trajectory_seed)
+    ob, info = sample_valid_reset(env, trajectory_seed, MIN_START_GOAL_SAMPLING_DIST)
     oracle.reset(ob, info)
 
     observations = [np.asarray(ob, dtype=np.float32)]
@@ -188,8 +219,10 @@ def collect_trajectory(
     terminated = False
     truncated = False
     success = reached_goal(info, goal_threshold)
+    goal_seen = success
+    post_goal_step_count = 0
 
-    while not (terminated or truncated or success):
+    while not (terminated or truncated or (goal_seen and post_goal_step_count >= post_goal_steps)):
         action = np.asarray(oracle.select_action(ob, info), dtype=np.float32)
         next_ob, reward, terminated, truncated, next_info = env.step(action)
         total_reward += float(reward)
@@ -216,6 +249,10 @@ def collect_trajectory(
         ob = next_ob
         info = next_info
         success = reached_goal(info, goal_threshold)
+        if goal_seen:
+            post_goal_step_count += 1
+        elif success:
+            goal_seen = True
 
     data = {
         "observation": np.stack(observations, axis=0),
@@ -248,6 +285,8 @@ def main() -> None:
         raise ValueError("--max-episode-steps must be positive.")
     if args.min_steps < 1:
         raise ValueError("--min-steps must be positive.")
+    if args.post_goal_steps < 0:
+        raise ValueError("--post-goal-steps cannot be negative.")
     physics_timestep, control_timestep, control_freq_hz = compute_env_timing(
         args.sim_freq_hz,
         args.control_decimation,
@@ -267,7 +306,7 @@ def main() -> None:
 
     env = gymnasium.make(
         args.env_name,
-        terminate_at_goal=True,
+        terminate_at_goal=False,
         mode="data_collection",
         visualize_info=False,
         max_episode_steps=args.max_episode_steps,
@@ -276,6 +315,7 @@ def main() -> None:
         width=args.width,
         height=args.height,
     )
+    apply_xy_sampling_bounds(env)
     oracle = CubePlanOracle(
         env=env,
         segment_dt=args.segment_dt,
@@ -301,7 +341,7 @@ def main() -> None:
 
     env = gymnasium.make(
         args.env_name,
-        terminate_at_goal=True,
+        terminate_at_goal=False,
         mode="data_collection",
         visualize_info=False,
         max_episode_steps=args.max_episode_steps,
@@ -310,6 +350,7 @@ def main() -> None:
         width=args.width,
         height=args.height,
     )
+    apply_xy_sampling_bounds(env)
     oracle = CubePlanOracle(
         env=env,
         segment_dt=args.segment_dt,
@@ -323,6 +364,7 @@ def main() -> None:
         h5.attrs["env_name"] = args.env_name
         h5.attrs["seed"] = args.seed
         h5.attrs["goal_threshold"] = args.goal_threshold
+        h5.attrs["post_goal_steps"] = args.post_goal_steps
         h5.attrs["video_dir"] = str(video_dir)
         h5.attrs["video_resolution"] = json.dumps([args.height, args.width])
         h5.attrs["camera"] = args.camera
@@ -334,6 +376,8 @@ def main() -> None:
         h5.attrs["physics_timestep"] = physics_timestep
         h5.attrs["control_timestep"] = control_timestep
         h5.attrs["max_episode_steps"] = args.max_episode_steps
+        h5.attrs["xy_sampling_bounds"] = json.dumps(XY_SAMPLING_BOUNDS.tolist())
+        h5.attrs["min_sampling_dist"] = MIN_START_GOAL_SAMPLING_DIST
         h5.attrs["noise"] = args.noise
         h5.attrs["noise_smoothing"] = args.noise_smoothing
         h5.attrs["segment_dt"] = args.segment_dt
@@ -390,6 +434,7 @@ def main() -> None:
                     trajectory_seed=trajectory_seed,
                     camera=args.camera,
                     goal_threshold=args.goal_threshold,
+                    post_goal_steps=args.post_goal_steps,
                 )
                 num_actions = int(trajectory["action"].shape[0])
                 if num_actions < args.min_steps:
