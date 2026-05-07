@@ -15,29 +15,13 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import h5py
 import imageio.v2 as imageio
+import gymnasium
+import mujoco
 import numpy as np
+import ogbench.manipspace  # noqa: F401
 from tqdm.auto import tqdm
-
-
-def import_ogbench_modules():
-    try:
-        import gymnasium
-        import ogbench.manipspace  # noqa: F401
-        from ogbench.manipspace.oracles.plan.cube_plan import CubePlanOracle
-
-        return gymnasium, CubePlanOracle
-    except ModuleNotFoundError:
-        repo_root = Path(__file__).resolve().parents[2]
-        local_ogbench_root = repo_root / "third_party" / "ogbench"
-        if local_ogbench_root.is_dir():
-            sys.path.insert(0, str(local_ogbench_root))
-            import gymnasium
-            import ogbench.manipspace  # noqa: F401
-            from ogbench.manipspace.oracles.plan.cube_plan import CubePlanOracle
-
-            return gymnasium, CubePlanOracle
-        raise
-
+from ogbench.manipspace import lie
+from ogbench.manipspace.oracles.plan.cube_plan import CubePlanOracle
 
 DEFAULT_OUTDIR = "ogbench_cube/data/expert_data"
 DEFAULT_OUTPUT_NAME = "ogbench_cube_expert.h5"
@@ -45,6 +29,7 @@ DEFAULT_ENV_NAME = "cube-single-v0"
 DEFAULT_SIM_FREQ_HZ = 500.0
 DEFAULT_CONTROL_DECIMATION = 20
 XY_SAMPLING_BOUNDS = np.asarray([[0.30, -0.25], [0.5, 0.25]], dtype=np.float32) # x (front back), y (left right), [x_min, y_min] and [x_max, y_max]
+THETA_SAMPLING_BOUNDS = np.asarray([0.0, 2.0 * np.pi], dtype=np.float32)
 MIN_START_GOAL_SAMPLING_DIST = 0.10
 ACTION_DIM = 5
 
@@ -54,11 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-name", default=DEFAULT_ENV_NAME)
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     parser.add_argument("--output-name", default=DEFAULT_OUTPUT_NAME)
-    parser.add_argument("--overwrite", action="store_true", default=True)
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=None,
+        default=750_000,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
@@ -150,13 +135,69 @@ def apply_xy_sampling_bounds(env: object) -> None:
     env.unwrapped._target_sampling_bounds = xy_bounds
 
 
-def sample_valid_reset(env: object, trajectory_seed: int, min_sampling_dist: float) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+def sample_theta(theta_rng: np.random.Generator) -> float:
+    theta_bounds = np.asarray(THETA_SAMPLING_BOUNDS, dtype=np.float64)
+    if theta_bounds.shape != (2,):
+        raise ValueError(f"THETA_SAMPLING_BOUNDS must have shape (2,), got {theta_bounds.shape}.")
+    theta_min = float(theta_bounds[0])
+    theta_max = float(theta_bounds[1])
+    if theta_max < theta_min:
+        raise ValueError(
+            "THETA_SAMPLING_BOUNDS must satisfy theta_max >= theta_min, "
+            f"got {theta_min} and {theta_max}."
+        )
+    return float(theta_rng.uniform(theta_min, theta_max))
+
+
+def apply_theta_sampling_bounds(
+    env: object,
+    info: dict[str, np.ndarray],
+    theta_rng: np.random.Generator,
+    *,
+    mujoco_module: object,
+    lie_module: object,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    target_block = int(info["privileged/target_block"])
+    target_mocap_id = env.unwrapped._cube_target_mocap_ids[target_block]
+
+    block_theta = sample_theta(theta_rng)
+    target_theta = sample_theta(theta_rng)
+    block_quat = np.asarray(lie_module.SO3.from_z_radians(block_theta).wxyz, dtype=np.float64)
+    target_quat = np.asarray(lie_module.SO3.from_z_radians(target_theta).wxyz, dtype=np.float64)
+
+    env.unwrapped._data.joint(f"object_joint_{target_block}").qpos[3:] = block_quat
+    env.unwrapped._data.mocap_quat[target_mocap_id] = target_quat
+    env.unwrapped.pre_step()
+    mujoco_module.mj_forward(env.unwrapped._model, env.unwrapped._data)
+    env.unwrapped.post_step()
+
+    ob = np.asarray(env.unwrapped.compute_observation(), dtype=np.float32)
+    bounded_info = env.unwrapped.get_reset_info()
+    return ob, bounded_info
+
+
+def sample_valid_reset(
+    env: object,
+    trajectory_seed: int,
+    min_sampling_dist: float,
+    *,
+    mujoco_module: object,
+    lie_module: object,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     if min_sampling_dist < 0.0:
         raise ValueError(f"MIN_SAMPLING_DIST cannot be negative, got {min_sampling_dist}.")
 
     seed_offset = 0
     while True:
         ob, info = env.reset(seed=trajectory_seed + seed_offset)
+        theta_rng = np.random.default_rng(trajectory_seed + seed_offset)
+        ob, info = apply_theta_sampling_bounds(
+            env,
+            info,
+            theta_rng,
+            mujoco_module=mujoco_module,
+            lie_module=lie_module,
+        )
         start_xy = np.asarray(info["privileged/block_0_pos"][:2], dtype=np.float64)
         goal_xy = np.asarray(info["privileged/target_block_pos"][:2], dtype=np.float64)
         if np.linalg.norm(start_xy - goal_xy) >= min_sampling_dist:
@@ -194,8 +235,16 @@ def collect_trajectory(
     camera: str,
     goal_threshold: float,
     post_goal_steps: int,
+    mujoco_module: object,
+    lie_module: object,
 ) -> tuple[dict[str, np.ndarray], float, bool, bool]:
-    ob, info = sample_valid_reset(env, trajectory_seed, MIN_START_GOAL_SAMPLING_DIST)
+    ob, info = sample_valid_reset(
+        env,
+        trajectory_seed,
+        MIN_START_GOAL_SAMPLING_DIST,
+        mujoco_module=mujoco_module,
+        lie_module=lie_module,
+    )
     oracle.reset(ob, info)
 
     observations = [np.asarray(ob, dtype=np.float32)]
@@ -292,8 +341,6 @@ def main() -> None:
         args.control_decimation,
     )
 
-    gymnasium, CubePlanOracle = import_ogbench_modules()
-
     outdir = args.outdir.expanduser().resolve()
     video_dir = outdir / "videos"
     output_path = outdir / args.output_name
@@ -377,6 +424,7 @@ def main() -> None:
         h5.attrs["control_timestep"] = control_timestep
         h5.attrs["max_episode_steps"] = args.max_episode_steps
         h5.attrs["xy_sampling_bounds"] = json.dumps(XY_SAMPLING_BOUNDS.tolist())
+        h5.attrs["theta_sampling_bounds"] = json.dumps(THETA_SAMPLING_BOUNDS.tolist())
         h5.attrs["min_sampling_dist"] = MIN_START_GOAL_SAMPLING_DIST
         h5.attrs["noise"] = args.noise
         h5.attrs["noise_smoothing"] = args.noise_smoothing
@@ -435,6 +483,8 @@ def main() -> None:
                     camera=args.camera,
                     goal_threshold=args.goal_threshold,
                     post_goal_steps=args.post_goal_steps,
+                    mujoco_module=mujoco,
+                    lie_module=lie,
                 )
                 num_actions = int(trajectory["action"].shape[0])
                 if num_actions < args.min_steps:
