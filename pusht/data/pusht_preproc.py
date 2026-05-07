@@ -120,16 +120,10 @@ def copy_non_pixel_items(src_h5: h5py.File, dst_h5: h5py.File, *, pixel_key: str
 
 
 def import_pusht_renderer():
-    try:
-        import pygame
-        import pymunk
-        from gym_pusht.envs.pusht import PushTEnv
-        from gym_pusht.envs.pymunk_override import DrawOptions
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "This script needs gym_pusht, pygame, and pymunk. In this repo, run it with "
-            "`lerobot_venv/bin/python pusht/data/rerender_pusht_h5_without_target.py`."
-        ) from exc
+    import pygame
+    import pymunk
+    from gym_pusht.envs.pusht import PushTEnv
+    from gym_pusht.envs.pymunk_override import DrawOptions
 
     class PushTNoTargetEnv(PushTEnv):
         def _setup(self):
