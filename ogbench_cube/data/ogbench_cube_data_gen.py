@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=None,
+        default=750_000,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
