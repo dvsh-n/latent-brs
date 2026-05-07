@@ -19,19 +19,24 @@ import gymnasium
 import mujoco
 import numpy as np
 import ogbench.manipspace  # noqa: F401
+from scipy.interpolate import interp1d
+from scipy.ndimage import gaussian_filter1d
 from tqdm.auto import tqdm
 from ogbench.manipspace import lie
-from ogbench.manipspace.oracles.plan.cube_plan import CubePlanOracle
 
 DEFAULT_OUTDIR = "ogbench_cube/data/expert_data"
 DEFAULT_OUTPUT_NAME = "ogbench_cube_expert.h5"
 DEFAULT_ENV_NAME = "cube-single-v0"
 DEFAULT_SIM_FREQ_HZ = 500.0
-DEFAULT_CONTROL_DECIMATION = 20
+DEFAULT_CONTROL_DECIMATION = 25
+VISUALIZE_TARGET = False
+DETERMINISTIC_ARM_START = True
 XY_SAMPLING_BOUNDS = np.asarray([[0.30, -0.25], [0.5, 0.25]], dtype=np.float32) # x (front back), y (left right), [x_min, y_min] and [x_max, y_max]
+Z_SAMPLING_BOUNDS = np.asarray([0.02, 0.30], dtype=np.float32)
 THETA_SAMPLING_BOUNDS = np.asarray([0.0, 2.0 * np.pi], dtype=np.float32)
 MIN_START_GOAL_SAMPLING_DIST = 0.10
 ACTION_DIM = 5
+DEFAULT_GOAL_YAW_THRESHOLD = 0.20
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=750_000,
+        default=None,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
@@ -53,7 +58,7 @@ def parse_args() -> argparse.Namespace:
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-episode-steps", type=int, default=120)
+    parser.add_argument("--max-episode-steps", type=int, default=100)
     parser.add_argument("--min-steps", type=int, default=3)
     parser.add_argument("--sim-freq-hz", type=float, default=DEFAULT_SIM_FREQ_HZ)
     parser.add_argument("--control-decimation", type=int, default=DEFAULT_CONTROL_DECIMATION)
@@ -66,9 +71,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment-dt", type=float, default=0.4)
     parser.add_argument("--goal-threshold", type=float, default=0.04)
     parser.add_argument(
+        "--goal-yaw-threshold",
+        type=float,
+        default=DEFAULT_GOAL_YAW_THRESHOLD,
+        help="Maximum wrapped yaw error in radians for considering the cube at the goal orientation.",
+    )
+    parser.add_argument(
         "--post-goal-steps",
         type=int,
-        default=15,
+        default=10,
         help="Number of extra control steps to record after the cube first reaches the goal threshold.",
     )
     parser.add_argument("--camera", default="front_pixels")
@@ -135,6 +146,52 @@ def apply_xy_sampling_bounds(env: object) -> None:
     env.unwrapped._target_sampling_bounds = xy_bounds
 
 
+def apply_deterministic_arm_start(
+    env: object,
+    *,
+    mujoco_module: object,
+    lie_module: object,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    arm_bounds = np.asarray(env.unwrapped._arm_sampling_bounds, dtype=np.float64)
+    center_pos = arm_bounds.mean(axis=0)
+    center_yaw = 0.0
+
+    target_effector_orientation = lie_module.SO3.from_z_radians(center_yaw) @ env.unwrapped._effector_down_rotation
+    pinch_pose = lie_module.SE3.from_rotation_and_translation(
+        rotation=target_effector_orientation,
+        translation=center_pos,
+    )
+    attach_pose = pinch_pose @ env.unwrapped._T_pa
+    qpos_init = env.unwrapped._ik.solve(
+        pos=attach_pose.translation(),
+        quat=attach_pose.rotation().wxyz,
+        curr_qpos=env.unwrapped._home_qpos,
+    )
+
+    env.unwrapped._data.qpos[env.unwrapped._arm_joint_ids] = qpos_init
+    env.unwrapped.pre_step()
+    mujoco_module.mj_forward(env.unwrapped._model, env.unwrapped._data)
+    env.unwrapped.post_step()
+
+    ob = np.asarray(env.unwrapped.compute_observation(), dtype=np.float32)
+    reset_info = env.unwrapped.get_reset_info()
+    return ob, reset_info
+
+
+def sample_z(z_rng: np.random.Generator) -> float:
+    z_bounds = np.asarray(Z_SAMPLING_BOUNDS, dtype=np.float64)
+    if z_bounds.shape != (2,):
+        raise ValueError(f"Z_SAMPLING_BOUNDS must have shape (2,), got {z_bounds.shape}.")
+    z_min = float(z_bounds[0])
+    z_max = float(z_bounds[1])
+    if z_max < z_min:
+        raise ValueError(
+            "Z_SAMPLING_BOUNDS must satisfy z_max >= z_min, "
+            f"got {z_min} and {z_max}."
+        )
+    return float(z_rng.uniform(z_min, z_max))
+
+
 def sample_theta(theta_rng: np.random.Generator) -> float:
     theta_bounds = np.asarray(THETA_SAMPLING_BOUNDS, dtype=np.float64)
     if theta_bounds.shape != (2,):
@@ -152,7 +209,7 @@ def sample_theta(theta_rng: np.random.Generator) -> float:
 def apply_theta_sampling_bounds(
     env: object,
     info: dict[str, np.ndarray],
-    theta_rng: np.random.Generator,
+    rng: np.random.Generator,
     *,
     mujoco_module: object,
     lie_module: object,
@@ -160,12 +217,14 @@ def apply_theta_sampling_bounds(
     target_block = int(info["privileged/target_block"])
     target_mocap_id = env.unwrapped._cube_target_mocap_ids[target_block]
 
-    block_theta = sample_theta(theta_rng)
-    target_theta = sample_theta(theta_rng)
+    block_theta = sample_theta(rng)
+    target_theta = sample_theta(rng)
+    target_z = sample_z(rng)
     block_quat = np.asarray(lie_module.SO3.from_z_radians(block_theta).wxyz, dtype=np.float64)
     target_quat = np.asarray(lie_module.SO3.from_z_radians(target_theta).wxyz, dtype=np.float64)
 
     env.unwrapped._data.joint(f"object_joint_{target_block}").qpos[3:] = block_quat
+    env.unwrapped._data.mocap_pos[target_mocap_id, 2] = target_z
     env.unwrapped._data.mocap_quat[target_mocap_id] = target_quat
     env.unwrapped.pre_step()
     mujoco_module.mj_forward(env.unwrapped._model, env.unwrapped._data)
@@ -190,11 +249,17 @@ def sample_valid_reset(
     seed_offset = 0
     while True:
         ob, info = env.reset(seed=trajectory_seed + seed_offset)
-        theta_rng = np.random.default_rng(trajectory_seed + seed_offset)
+        if DETERMINISTIC_ARM_START:
+            ob, info = apply_deterministic_arm_start(
+                env,
+                mujoco_module=mujoco_module,
+                lie_module=lie_module,
+            )
+        rng = np.random.default_rng(trajectory_seed + seed_offset)
         ob, info = apply_theta_sampling_bounds(
             env,
             info,
-            theta_rng,
+            rng,
             mujoco_module=mujoco_module,
             lie_module=lie_module,
         )
@@ -203,6 +268,198 @@ def sample_valid_reset(
         if np.linalg.norm(start_xy - goal_xy) >= min_sampling_dist:
             return ob, info
         seed_offset += 1
+
+
+def angular_distance(a: float, b: float) -> float:
+    return float(np.abs(np.arctan2(np.sin(a - b), np.cos(a - b))))
+
+
+def symmetry_aware_yaw_distance(a: float, b: float, n: int = 4) -> float:
+    symmetries = [b + i * 2 * np.pi / n for i in range(n)]
+    return min(angular_distance(a, sym_yaw) for sym_yaw in symmetries)
+
+
+class LocalCubePlanOracle:
+    def __init__(self, env: object, segment_dt: float = 0.4, noise: float = 0.1, noise_smoothing: float = 0.5):
+        self._env = env
+        self._env_dt = self._env.unwrapped._control_timestep
+        self._dt = segment_dt
+        self._noise = noise
+        self._noise_smoothing = noise_smoothing
+
+        self._done = False
+        self._t_init: float | None = None
+        self._t_max: float | None = None
+        self._plan: np.ndarray | None = None
+
+    def above(self, pose: lie.SE3, z: float) -> lie.SE3:
+        return (
+            lie.SE3.from_rotation_and_translation(
+                rotation=lie.SO3.identity(),
+                translation=np.array([0.0, 0.0, z], dtype=np.float64),
+            )
+            @ pose
+        )
+
+    def to_pose(self, pos: np.ndarray, yaw: float) -> lie.SE3:
+        return lie.SE3.from_rotation_and_translation(
+            rotation=lie.SO3.from_z_radians(yaw),
+            translation=np.asarray(pos, dtype=np.float64),
+        )
+
+    def get_yaw(self, pose: lie.SE3) -> float:
+        yaw = float(pose.rotation().compute_yaw_radians())
+        if yaw < 0.0:
+            return yaw + 2 * np.pi
+        return yaw
+
+    def shortest_yaw(self, eff_yaw: float, obj_yaw: float, translation: np.ndarray, n: int = 4) -> lie.SE3:
+        symmetries = np.array([i * 2 * np.pi / n + obj_yaw for i in range(-n, n + 1)], dtype=np.float64)
+        closest_idx = int(np.argmin(np.abs(eff_yaw - symmetries)))
+        return lie.SE3.from_rotation_and_translation(
+            rotation=lie.SO3.from_z_radians(symmetries[closest_idx]),
+            translation=np.asarray(translation, dtype=np.float64),
+        )
+
+    def compute_plan(self, times: list[float], poses: list[lie.SE3], grasps: list[float]) -> np.ndarray:
+        grasp_interp = interp1d(times, grasps, kind="linear", axis=0, assume_sorted=True)
+
+        xyzs = [p.translation() for p in poses]
+        xyz_interp = interp1d(times, xyzs, kind="linear", axis=0, assume_sorted=True)
+
+        quats = [p.rotation() for p in poses]
+
+        def quat_interp(t: float) -> lie.SO3:
+            seg_idx = int(np.searchsorted(times, t, side="right") - 1)
+            seg_idx = int(np.clip(seg_idx, 0, len(times) - 2))
+            interp_time = (t - times[seg_idx]) / (times[seg_idx + 1] - times[seg_idx])
+            interp_time = float(np.clip(interp_time, 0.0, 1.0))
+            return lie.interpolate(quats[seg_idx], quats[seg_idx + 1], interp_time)
+
+        plan = []
+        t = 0.0
+        assert self._t_max is not None
+        while t < self._t_max:
+            action = np.zeros(ACTION_DIM, dtype=np.float64)
+            action[:3] = xyz_interp(t)
+            action[3] = quat_interp(t).compute_yaw_radians()
+            action[4] = grasp_interp(t)
+            plan.append(action)
+            t += self._env_dt
+
+        plan_array = np.asarray(plan, dtype=np.float64)
+
+        if self._noise > 0:
+            noise = (
+                np.random.normal(0.0, 1.0, size=plan_array.shape)
+                * np.array([0.05, 0.05, 0.05, 0.3, 1.0], dtype=np.float64)
+                * self._noise
+            )
+            noise = gaussian_filter1d(noise, axis=0, sigma=self._noise_smoothing)
+            plan_array += noise
+            plan_array[:, 4] = np.clip(plan_array[:, 4], 0.0, 1.0)
+
+        return plan_array
+
+    def compute_keyframes(
+        self,
+        *,
+        effector_initial: lie.SE3,
+        block_initial: lie.SE3,
+        block_goal: lie.SE3,
+    ) -> tuple[dict[str, float], dict[str, lie.SE3], dict[str, float]]:
+        poses: dict[str, lie.SE3] = {}
+
+        block_pick = self.shortest_yaw(
+            eff_yaw=self.get_yaw(effector_initial),
+            obj_yaw=self.get_yaw(block_initial),
+            translation=block_initial.translation(),
+        )
+        poses["initial"] = effector_initial
+        poses["pick"] = self.above(block_pick, 0.1 + np.random.uniform(0.0, 0.1))
+        poses["pick_start"] = block_pick
+        poses["pick_end"] = block_pick
+        poses["postpick"] = poses["pick"]
+
+        block_goal_aligned = self.shortest_yaw(
+            eff_yaw=self.get_yaw(poses["postpick"]),
+            obj_yaw=self.get_yaw(block_goal),
+            translation=block_goal.translation(),
+        )
+        poses["clearance"] = lie.interpolate(poses["postpick"], self.above(block_goal_aligned, 0.1), 0.5)
+        poses["goal_approach"] = self.above(block_goal_aligned, 0.05)
+        poses["goal_hold"] = block_goal_aligned
+        poses["final"] = block_goal_aligned
+
+        times = {
+            "initial": 0.0,
+            "pick": self._dt,
+            "pick_start": self._dt * 2.5,
+            "pick_end": self._dt * 3.5,
+            "postpick": self._dt * 4.5,
+            "clearance": self._dt * 5.5,
+            "goal_approach": self._dt * 6.5,
+            "goal_hold": self._dt * 8.0,
+            "final": self._dt * 9.0,
+        }
+        for name in list(times.keys()):
+            if name != "initial":
+                times[name] += float(np.random.uniform(-1.0, 1.0) * self._dt * 0.2)
+
+        grasps = {}
+        grasp = 0.0
+        for name in times.keys():
+            if name == "pick_end":
+                grasp = 1.0
+            grasps[name] = grasp
+
+        return times, poses, grasps
+
+    def reset(self, ob: np.ndarray, info: dict[str, np.ndarray]) -> None:
+        target_block = int(info["privileged/target_block"])
+        effector_initial = self.to_pose(
+            pos=info["proprio/effector_pos"],
+            yaw=float(info["proprio/effector_yaw"][0]),
+        )
+        block_initial = self.to_pose(
+            pos=info[f"privileged/block_{target_block}_pos"],
+            yaw=float(info[f"privileged/block_{target_block}_yaw"][0]),
+        )
+        block_goal = self.to_pose(
+            pos=info["privileged/target_block_pos"],
+            yaw=float(info["privileged/target_block_yaw"][0]),
+        )
+
+        times, poses, grasps = self.compute_keyframes(
+            effector_initial=effector_initial,
+            block_initial=block_initial,
+            block_goal=block_goal,
+        )
+        ordered_names = list(times.keys())
+        ordered_poses = [poses[name] for name in ordered_names]
+        ordered_grasps = [grasps[name] for name in ordered_names]
+        ordered_times = [times[name] for name in ordered_names]
+
+        self._t_init = float(info["time"][0])
+        self._t_max = float(ordered_times[-1])
+        self._done = False
+        self._plan = self.compute_plan(ordered_times, ordered_poses, ordered_grasps)
+
+    def select_action(self, ob: np.ndarray, info: dict[str, np.ndarray]) -> np.ndarray:
+        if self._plan is None or self._t_init is None:
+            raise RuntimeError("Oracle must be reset before select_action is called.")
+
+        cur_plan_idx = int((float(info["time"][0]) - self._t_init + 1e-7) // self._env_dt)
+        if cur_plan_idx >= len(self._plan) - 1:
+            cur_plan_idx = len(self._plan) - 1
+            self._done = True
+
+        absolute_target = self._plan[cur_plan_idx]
+        action = np.zeros(ACTION_DIM, dtype=np.float64)
+        action[:3] = absolute_target[:3] - info["proprio/effector_pos"]
+        action[3] = absolute_target[3] - float(info["proprio/effector_yaw"][0])
+        action[4] = absolute_target[4] - float(info["proprio/gripper_opening"][0])
+        return np.asarray(self._env.unwrapped.normalize_action(action), dtype=np.float32)
 
 
 def extract_step_info(info: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -223,8 +480,13 @@ def extract_step_info(info: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     }
 
 
-def reached_goal(info: dict[str, np.ndarray], threshold: float) -> bool:
-    return bool(np.linalg.norm(info["privileged/block_0_pos"] - info["privileged/target_block_pos"]) <= threshold)
+def reached_goal(info: dict[str, np.ndarray], threshold: float, yaw_threshold: float) -> bool:
+    pos_ok = np.linalg.norm(info["privileged/block_0_pos"] - info["privileged/target_block_pos"]) <= threshold
+    yaw_ok = symmetry_aware_yaw_distance(
+        float(info["privileged/block_0_yaw"][0]),
+        float(info["privileged/target_block_yaw"][0]),
+    ) <= yaw_threshold
+    return bool(pos_ok and yaw_ok)
 
 
 def collect_trajectory(
@@ -234,6 +496,7 @@ def collect_trajectory(
     trajectory_seed: int,
     camera: str,
     goal_threshold: float,
+    goal_yaw_threshold: float,
     post_goal_steps: int,
     mujoco_module: object,
     lie_module: object,
@@ -267,7 +530,7 @@ def collect_trajectory(
     total_reward = 0.0
     terminated = False
     truncated = False
-    success = reached_goal(info, goal_threshold)
+    success = reached_goal(info, goal_threshold, goal_yaw_threshold)
     goal_seen = success
     post_goal_step_count = 0
 
@@ -297,7 +560,7 @@ def collect_trajectory(
 
         ob = next_ob
         info = next_info
-        success = reached_goal(info, goal_threshold)
+        success = reached_goal(info, goal_threshold, goal_yaw_threshold)
         if goal_seen:
             post_goal_step_count += 1
         elif success:
@@ -321,7 +584,7 @@ def collect_trajectory(
         "target_block_yaw": np.stack(target_block_yaw, axis=0),
         "time": np.stack(time, axis=0),
     }
-    return data, total_reward, bool(terminated), bool(truncated)
+    return data, total_reward, bool(terminated), bool(truncated), bool(goal_seen)
 
 
 def main() -> None:
@@ -334,6 +597,8 @@ def main() -> None:
         raise ValueError("--max-episode-steps must be positive.")
     if args.min_steps < 1:
         raise ValueError("--min-steps must be positive.")
+    if args.goal_yaw_threshold < 0.0:
+        raise ValueError("--goal-yaw-threshold cannot be negative.")
     if args.post_goal_steps < 0:
         raise ValueError("--post-goal-steps cannot be negative.")
     physics_timestep, control_timestep, control_freq_hz = compute_env_timing(
@@ -355,7 +620,7 @@ def main() -> None:
         args.env_name,
         terminate_at_goal=False,
         mode="data_collection",
-        visualize_info=False,
+        visualize_info=VISUALIZE_TARGET,
         max_episode_steps=args.max_episode_steps,
         physics_timestep=physics_timestep,
         control_timestep=control_timestep,
@@ -363,7 +628,7 @@ def main() -> None:
         height=args.height,
     )
     apply_xy_sampling_bounds(env)
-    oracle = CubePlanOracle(
+    oracle = LocalCubePlanOracle(
         env=env,
         segment_dt=args.segment_dt,
         noise=args.noise,
@@ -375,10 +640,17 @@ def main() -> None:
     step_counts: list[int] = []
     terminated_flags: list[bool] = []
     truncated_flags: list[bool] = []
+    failed_flags: list[bool] = []
     skipped_short = 0
     seed_offset = 0
 
     sample_ob, sample_info = env.reset(seed=args.seed)
+    if DETERMINISTIC_ARM_START:
+        sample_ob, sample_info = apply_deterministic_arm_start(
+            env,
+            mujoco_module=mujoco,
+            lie_module=lie,
+        )
     sample_frame = np.asarray(env.unwrapped.render(camera=args.camera), dtype=np.uint8)
     obs_dim = int(np.asarray(sample_ob).shape[0])
     qpos_dim = int(np.asarray(sample_info["qpos"]).shape[0])
@@ -390,7 +662,7 @@ def main() -> None:
         args.env_name,
         terminate_at_goal=False,
         mode="data_collection",
-        visualize_info=False,
+        visualize_info=VISUALIZE_TARGET,
         max_episode_steps=args.max_episode_steps,
         physics_timestep=physics_timestep,
         control_timestep=control_timestep,
@@ -398,7 +670,7 @@ def main() -> None:
         height=args.height,
     )
     apply_xy_sampling_bounds(env)
-    oracle = CubePlanOracle(
+    oracle = LocalCubePlanOracle(
         env=env,
         segment_dt=args.segment_dt,
         noise=args.noise,
@@ -411,11 +683,13 @@ def main() -> None:
         h5.attrs["env_name"] = args.env_name
         h5.attrs["seed"] = args.seed
         h5.attrs["goal_threshold"] = args.goal_threshold
+        h5.attrs["goal_yaw_threshold"] = args.goal_yaw_threshold
         h5.attrs["post_goal_steps"] = args.post_goal_steps
         h5.attrs["video_dir"] = str(video_dir)
         h5.attrs["video_resolution"] = json.dumps([args.height, args.width])
         h5.attrs["camera"] = args.camera
-        h5.attrs["target_visualization"] = False
+        h5.attrs["target_visualization"] = VISUALIZE_TARGET
+        h5.attrs["deterministic_arm_start"] = DETERMINISTIC_ARM_START
         h5.attrs["video_fps"] = control_freq_hz
         h5.attrs["sim_freq_hz"] = args.sim_freq_hz
         h5.attrs["control_freq_hz"] = control_freq_hz
@@ -424,6 +698,7 @@ def main() -> None:
         h5.attrs["control_timestep"] = control_timestep
         h5.attrs["max_episode_steps"] = args.max_episode_steps
         h5.attrs["xy_sampling_bounds"] = json.dumps(XY_SAMPLING_BOUNDS.tolist())
+        h5.attrs["z_sampling_bounds"] = json.dumps(Z_SAMPLING_BOUNDS.tolist())
         h5.attrs["theta_sampling_bounds"] = json.dumps(THETA_SAMPLING_BOUNDS.tolist())
         h5.attrs["min_sampling_dist"] = MIN_START_GOAL_SAMPLING_DIST
         h5.attrs["noise"] = args.noise
@@ -476,12 +751,13 @@ def main() -> None:
                 trajectory_seed = args.seed + seed_offset
                 seed_offset += 1
 
-                trajectory, total_reward, terminated, truncated = collect_trajectory(
+                trajectory, total_reward, terminated, truncated, reached_goal_once = collect_trajectory(
                     env=env,
                     oracle=oracle,
                     trajectory_seed=trajectory_seed,
                     camera=args.camera,
                     goal_threshold=args.goal_threshold,
+                    goal_yaw_threshold=args.goal_yaw_threshold,
                     post_goal_steps=args.post_goal_steps,
                     mujoco_module=mujoco,
                     lie_module=lie,
@@ -534,11 +810,31 @@ def main() -> None:
                 step_counts.append(num_actions)
                 terminated_flags.append(terminated)
                 truncated_flags.append(truncated)
+                failed_flags.append(not reached_goal_once)
+                if truncated:
+                    final_pos_error = float(
+                        np.linalg.norm(trajectory["block_pos"][-1] - trajectory["target_block_pos"][-1])
+                    )
+                    final_raw_yaw_error = angular_distance(
+                        float(trajectory["block_yaw"][-1][0]),
+                        float(trajectory["target_block_yaw"][-1][0]),
+                    )
+                    final_symmetry_yaw_error = symmetry_aware_yaw_distance(
+                        float(trajectory["block_yaw"][-1][0]),
+                        float(trajectory["target_block_yaw"][-1][0]),
+                    )
+                    print(
+                        f"Temporarily logging truncated episode: episode_idx={episode_idx}, "
+                        f"trajectory_seed={trajectory_seed}, num_actions={num_actions}, "
+                        f"final_pos_error={final_pos_error:.4f}, "
+                        f"final_raw_yaw_error={final_raw_yaw_error:.4f}, "
+                        f"final_symmetry_yaw_error={final_symmetry_yaw_error:.4f}"
+                    )
                 progress.update(num_actions if args.target_transitions is not None else 1)
                 progress.set_postfix(
                     episodes=len(step_counts),
                     transitions=int(np.sum(step_counts, dtype=np.int64)),
-                    skipped=skipped_short,
+                    fail=int(np.sum(failed_flags, dtype=np.int64)),
                 )
 
         ep_len = np.asarray(ep_len_ds[:], dtype=np.int64)
