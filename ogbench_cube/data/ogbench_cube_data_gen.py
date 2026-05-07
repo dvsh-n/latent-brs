@@ -49,11 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=20,
+        default=25,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-episode-steps", type=int, default=500)
+    parser.add_argument("--max-episode-steps", type=int, default=120)
     parser.add_argument("--min-steps", type=int, default=3)
     parser.add_argument("--sim-freq-hz", type=float, default=DEFAULT_SIM_FREQ_HZ)
     parser.add_argument("--control-decimation", type=int, default=DEFAULT_CONTROL_DECIMATION)
