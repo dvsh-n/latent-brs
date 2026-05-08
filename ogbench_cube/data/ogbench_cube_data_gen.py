@@ -24,8 +24,8 @@ from scipy.ndimage import gaussian_filter1d
 from tqdm.auto import tqdm
 from ogbench.manipspace import lie
 
-DEFAULT_OUTDIR = "ogbench_cube/data/expert_data"
-DEFAULT_OUTPUT_NAME = "ogbench_cube_expert.h5"
+DEFAULT_OUTDIR = "ogbench_cube/data/test_data"
+DEFAULT_OUTPUT_NAME = "ogbench_cube_test.h5"
 DEFAULT_ENV_NAME = "cube-single-v0"
 DEFAULT_SIM_FREQ_HZ = 500.0
 DEFAULT_CONTROL_DECIMATION = 25
@@ -48,13 +48,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=750_000,
+        default=None,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=25,
+        default=1500,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
