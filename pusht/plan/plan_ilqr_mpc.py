@@ -19,7 +19,12 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from pusht.data.pusht_preproc import make_no_target_env, set_render_state
+from pusht.shared.pusht_env import (
+    get_pusht_agent_pos,
+    get_pusht_block_pose,
+    make_no_target_env,
+    reset_pusht_env_to_state,
+)
 from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, required_markov_history
 
 DEFAULT_DATASET_PATH = "pusht/data/pusht_expert_train_preproc.h5"
@@ -27,13 +32,13 @@ DEFAULT_MODEL_DIR = "pusht/models/mlpdyn"
 DEFAULT_OUT_DIR = "pusht/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-HORIZON = 40
-MAX_MPC_STEPS = 300
+HORIZON = 25
+MAX_MPC_STEPS = 150
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 10
-EPISODE_IDX = 0
+EPISODE_IDX = None
 ENV_ACTION_SCALE = 100.0
 
 
@@ -52,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-terminal", type=float, default=Q_TERMINAL)
     parser.add_argument("--q-stage", type=float, default=Q_STAGE)
     parser.add_argument("--r-control", type=float, default=R_CONTROL)
-    parser.add_argument("--ilqr-max-iters", type=int, default=15)
+    parser.add_argument("--ilqr-max-iters", type=int, default=35)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=None)
@@ -77,6 +82,12 @@ def load_config(model_dir: Path) -> dict[str, object]:
         raise FileNotFoundError(f"Model config not found: {config_path}")
     with config_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def resolve_model_dir(args: argparse.Namespace) -> Path:
+    if args.checkpoint is not None:
+        return args.checkpoint.expanduser().resolve().parent
+    return args.model_dir.expanduser().resolve()
 
 
 def require_device(device_arg: str) -> torch.device:
@@ -231,16 +242,15 @@ def make_render_env(*, width: int, height: int) -> Any:
 
 
 def reset_env_to_state(env: Any, state: np.ndarray) -> np.ndarray:
-    set_render_state(env, np.asarray(state, dtype=np.float64))
-    return np.asarray(env._render(visualize=False), dtype=np.uint8)
+    return reset_pusht_env_to_state(env, state)
 
 
 def current_block_pose(env: Any) -> np.ndarray:
-    return np.asarray([env.block.position.x, env.block.position.y, env.block.angle], dtype=np.float32)
+    return get_pusht_block_pose(env)
 
 
 def current_agent_pos(env: Any) -> np.ndarray:
-    return np.asarray([env.agent.position.x, env.agent.position.y], dtype=np.float32)
+    return get_pusht_agent_pos(env)
 
 
 class MarkovDynamicsTorch:
@@ -449,7 +459,7 @@ class ILQRMPCSolver:
 def main() -> None:
     args = parse_args()
     device = require_device(args.device)
-    model_dir = args.model_dir.expanduser().resolve()
+    model_dir = resolve_model_dir(args)
     dataset_path = args.dataset_path.expanduser().resolve()
     out_root = args.out_dir.expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -467,16 +477,21 @@ def main() -> None:
         raise ValueError(f"Expected non-negative markov_deriv for the MLP model, got {markov_deriv}.")
 
     img_size = int(config.get("img_size", 224))
+    frameskip = int(config.get("frameskip", 1))
     action_dim = int(config.get("action_dim", 2))
-    embed_dim = int(config.get("embed_dim", 32))
+    embed_dim = int(config.get("embed_dim", 48))
     markov_state_dim = int(config.get("markov_state_dim", (markov_deriv + 1) * embed_dim))
+    if frameskip != 1:
+        raise ValueError(
+            f"This PushT MPC planner currently supports frameskip=1 only, but the model config has frameskip={frameskip}."
+        )
 
     train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
     train_stats_dataset = LeWMPushTDataset(
         train_dataset_path,
         markov_deriv=markov_deriv,
         num_preds=1,
-        frameskip=int(config.get("frameskip", 1)),
+        frameskip=frameskip,
         img_size=img_size,
         action_dim=action_dim,
     )
@@ -526,9 +541,8 @@ def main() -> None:
     )
     history_len = required_markov_history(markov_deriv)
     start_emb = true_latents[0]
-    goal_emb = true_latents[-1]
     start_history = [start_emb] * history_len
-    goal_history = [goal_emb] * history_len
+    goal_history = [emb for emb in true_latents[-history_len:]]
     start_state = make_markov_state(start_history, markov_deriv)
     goal_state = make_markov_state(goal_history, markov_deriv)
     if int(start_state.numel()) != markov_state_dim:
@@ -645,6 +659,7 @@ def main() -> None:
         "action_history_size": 1,
         "state_space": "latent_plus_finite_differences",
         "markov_state_dim": markov_state_dim,
+        "frameskip": frameskip,
         "horizon": args.horizon,
         "max_mpc_steps": args.max_mpc_steps,
         "stop_reason": stop_reason,

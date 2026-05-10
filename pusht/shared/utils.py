@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +8,10 @@ import numpy as np
 import torch
 from PIL import Image
 
+from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env
 
-DEFAULT_PUSHT_ENV_ID = "gym_pusht/PushT-v0"
+
 DEFAULT_EXPERT_MODEL_DIR = Path("pusht/models/diffusion_pusht")
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_VENDORED_LEROBOT_SRC = _REPO_ROOT / "third_party" / "lerobot" / "src"
 
 
 @dataclass
@@ -22,44 +20,6 @@ class ExpertPolicyBundle:
     preprocessor: Any
     postprocessor: Any
     device: torch.device
-
-
-def ensure_lerobot_available() -> None:
-    """Use the repo's LeRobot checkout when the active environment needs it."""
-    try:
-        from lerobot.configs import PreTrainedConfig as _PreTrainedConfig  # noqa: F401
-
-        return
-    except (ImportError, SyntaxError) as exc:
-        import_error = exc
-
-    if _VENDORED_LEROBOT_SRC.exists():
-        if sys.version_info < (3, 12):
-            raise ImportError(
-                "The LeRobot checkout in third_party/lerobot requires Python 3.12+. "
-                f"You are running Python {sys.version_info.major}.{sys.version_info.minor} "
-                f"from {sys.executable}. Run this script with the Python 3.12 environment, e.g. "
-                "`/home/devesh/latent-brs/temp_venv/bin/python pusht/eval/expert_viz.py`, "
-                "or recreate the active venv with Python 3.12 and install LeRobot's pusht extra."
-            ) from import_error
-
-        vendor_path = str(_VENDORED_LEROBOT_SRC)
-        if vendor_path not in sys.path:
-            sys.path.insert(0, vendor_path)
-        for module_name in list(sys.modules):
-            if module_name == "lerobot" or module_name.startswith("lerobot."):
-                del sys.modules[module_name]
-        try:
-            from lerobot.configs import PreTrainedConfig as _PreTrainedConfig  # noqa: F401
-
-            return
-        except (ImportError, SyntaxError) as exc:
-            import_error = exc
-
-    raise ModuleNotFoundError(
-        "A compatible LeRobot install is required. Install LeRobot in the active environment, "
-        "or use this repo's Python 3.12 environment at /home/devesh/latent-brs/temp_venv."
-    ) from import_error
 
 
 def resolve_device(device: str) -> torch.device:
@@ -72,53 +32,8 @@ def resolve_device(device: str) -> torch.device:
     return torch.device("cpu")
 
 
-def make_pusht_env(
-    env_id: str = DEFAULT_PUSHT_ENV_ID,
-    *,
-    obs_type: str = "pixels_agent_pos",
-    render_mode: str = "rgb_array",
-    max_episode_steps: int = 300,
-    visualization_width: int = 384,
-    visualization_height: int = 384,
-):
-    """Create a PushT Gymnasium environment.
-
-    This prefers Hugging Face's `gym-pusht` package because LeRobot's PushT
-    policies are trained against that action/observation convention.
-    """
-    try:
-        import gymnasium as gym
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError("Install gymnasium in the active environment.") from exc
-
-    package_name = env_id.split("/", maxsplit=1)[0] if "/" in env_id else None
-    if package_name:
-        try:
-            __import__(package_name)
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                f"Environment package '{package_name}' is not installed. "
-                "For the default PushT env, install LeRobot's pusht extra or gym-pusht."
-            ) from exc
-
-    kwargs = {
-        "obs_type": obs_type,
-        "render_mode": render_mode,
-        "max_episode_steps": max_episode_steps,
-        "visualization_width": visualization_width,
-        "visualization_height": visualization_height,
-    }
-    try:
-        return gym.make(env_id, disable_env_checker=True, **kwargs)
-    except TypeError:
-        # Some local PushT variants do not accept the visualization kwargs.
-        kwargs.pop("visualization_width", None)
-        kwargs.pop("visualization_height", None)
-        return gym.make(env_id, disable_env_checker=True, **kwargs)
-
-
 def load_expert_policy_bundle(model_dir: str | Path = DEFAULT_EXPERT_MODEL_DIR, device: str = "auto") -> ExpertPolicyBundle:
-    """Load the saved PushT diffusion expert without importing LeRobot."""
+    """Load the saved PushT diffusion expert."""
     from pusht.shared.native_diffusion_policy import load_native_diffusion_policy_bundle
 
     model_dir = Path(model_dir)
@@ -165,7 +80,7 @@ def _resize_hwc_uint8(image: np.ndarray, height: int, width: int) -> np.ndarray:
     return np.asarray(pil_image, dtype=np.uint8)
 
 
-def pusht_observation_to_lerobot_batch(
+def pusht_observation_to_policy_batch(
     observation: dict[str, Any],
     *,
     env: Any | None,
@@ -194,7 +109,7 @@ def env_action_from_policy_action(
     observation: dict[str, Any],
     action_mode: str = "auto",
 ) -> np.ndarray:
-    """Convert absolute LeRobot PushT actions to the active env's action convention."""
+    """Convert absolute PushT policy actions to the active env's action convention."""
     action = np.asarray(policy_action, dtype=np.float32).reshape(-1)[:2]
     if action_mode == "absolute":
         return action
@@ -223,7 +138,7 @@ def select_expert_action(
     action_mode: str = "auto",
 ) -> np.ndarray:
     image_shape = tuple(bundle.policy.config.input_features["observation.image"].shape)
-    batch = pusht_observation_to_lerobot_batch(observation, env=env, image_shape=image_shape)
+    batch = pusht_observation_to_policy_batch(observation, env=env, image_shape=image_shape)
     batch = bundle.preprocessor(batch)
     action = bundle.policy.select_action(batch)
     action = bundle.postprocessor(action)

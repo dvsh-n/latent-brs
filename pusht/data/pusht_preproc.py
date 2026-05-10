@@ -27,6 +27,8 @@ except ModuleNotFoundError:
 import h5py
 import numpy as np
 
+from pusht.shared.pusht_env import make_no_target_env, set_pusht_state
+
 
 DEFAULT_DATASET_PATH = Path(__file__).with_name("pusht_expert_train.h5")
 DEFAULT_OUTPUT_SUFFIX = "_rerendered_no_target"
@@ -119,70 +121,8 @@ def copy_non_pixel_items(src_h5: h5py.File, dst_h5: h5py.File, *, pixel_key: str
             src_h5.copy(key, dst_h5)
 
 
-def import_pusht_renderer():
-    import pygame
-    import pymunk
-    from gym_pusht.envs.pusht import PushTEnv
-    from gym_pusht.envs.pymunk_override import DrawOptions
-
-    class PushTNoTargetEnv(PushTEnv):
-        def _setup(self):
-            self.space = pymunk.Space()
-            self.space.gravity = 0, 0
-            self.space.damping = self.damping if self.damping is not None else 0.0
-            self.teleop = False
-
-            walls = [
-                self.add_segment(self.space, (5, 506), (5, 5), 2),
-                self.add_segment(self.space, (5, 5), (506, 5), 2),
-                self.add_segment(self.space, (506, 5), (506, 506), 2),
-                self.add_segment(self.space, (5, 506), (506, 506), 2),
-            ]
-            self.space.add(*walls)
-
-            self.agent = self.add_circle(self.space, (256, 400), 15)
-            self.block, self._block_shapes = self.add_tee(self.space, (256, 300), 0)
-            self.goal_pose = np.array([256, 256, np.pi / 4])
-            if self.block_cog is not None:
-                self.block.center_of_gravity = self.block_cog
-            self.n_contact_points = 0
-
-        def _draw(self):
-            screen = pygame.Surface((512, 512))
-            screen.fill((255, 255, 255))
-            draw_options = DrawOptions(screen)
-            self.space.debug_draw(draw_options)
-            return screen
-
-    return PushTNoTargetEnv
-
-
-def make_no_target_env(*, height: int, width: int):
-    env_cls = import_pusht_renderer()
-    env = env_cls(
-        obs_type="pixels",
-        render_mode="rgb_array",
-        observation_width=width,
-        observation_height=height,
-        visualization_width=width,
-        visualization_height=height,
-    )
-    env.reset(seed=0)
-    return env
-
-
 def set_render_state(env: Any, state: np.ndarray) -> None:
-    # Use the environment's legacy setter because the block has a non-default
-    # center of gravity. Direct assignment to block.position does not reproduce
-    # the rendered pose from the original PushT dataset.
-    env.agent.velocity = [0.0, 0.0]
-    env.block.velocity = [0.0, 0.0]
-    env.block.angular_velocity = 0.0
-    env._set_state(np.asarray(state[:5], dtype=np.float64))
-    env.agent.velocity = [float(state[5]), float(state[6])] if state.shape[0] >= 7 else [0.0, 0.0]
-    env.block.velocity = [0.0, 0.0]
-    env.block.angular_velocity = 0.0
-    env._last_action = None
+    set_pusht_state(env, state)
 
 
 def render_states_without_target(env: Any, states: np.ndarray) -> np.ndarray:

@@ -10,8 +10,6 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from pusht.shared.utils import ensure_lerobot_available
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -112,7 +110,6 @@ def save_run_config(run_dir: Path, args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
 
-    ensure_lerobot_available()
     from lerobot.datasets import EpisodeAwareSampler, LeRobotDataset, LeRobotDatasetMetadata
     from lerobot.policies import make_pre_post_processors
     from lerobot.policies.diffusion import DiffusionPolicy
