@@ -52,25 +52,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--body-dim", type=int, default=24)
     parser.add_argument("--pusher-dim", type=int, default=8)
-    parser.add_argument("--history-size", type=int, default=1)
+    parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
-    parser.add_argument("--predictor-depth", type=int, default=2)
+    parser.add_argument("--predictor-depth", type=int, default=3)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.005)
+    parser.add_argument("--sigreg-weight", type=float, default=0.009)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
     parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=124)
+    parser.add_argument("--freeze-projector-epochs", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=120)
     parser.add_argument("--num-workers", type=int, default=24)
-    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
         "--persistent-workers",
         action="store_true",
@@ -88,14 +89,16 @@ def parse_args() -> argparse.Namespace:
 
     if args.freeze_encoder_epochs < 0:
         parser.error("--freeze-encoder-epochs must be non-negative.")
+    if args.freeze_projector_epochs < 0:
+        parser.error("--freeze-projector-epochs must be non-negative.")
     if args.body_dim <= 0 or args.pusher_dim <= 0:
         parser.error("--body-dim and --pusher-dim must be positive.")
 
     args.frameskip = FIXED_FRAMESKIP
     args.embed_dim = args.body_dim + args.pusher_dim
-    args.markov_state_dim = 2 * args.embed_dim
-    args.body_markov_state_dim = 2 * args.body_dim
-    args.pusher_markov_state_dim = 2 * args.pusher_dim
+    args.markov_state_dim = (args.markov_deriv + 1) * args.embed_dim
+    args.body_markov_state_dim = (args.markov_deriv + 1) * args.body_dim
+    args.pusher_markov_state_dim = (args.markov_deriv + 1) * args.pusher_dim
     return args
 
 
@@ -104,25 +107,25 @@ class LeWMPushTDataset(Dataset):
         self,
         dataset_path: Path,
         *,
-        history_size: int,
+        markov_deriv: int,
         num_preds: int,
         frameskip: int,
         img_size: int,
         action_dim: int,
     ) -> None:
         self.dataset_path = dataset_path
-        self.history_size = int(history_size)
+        self.markov_deriv = int(markov_deriv)
         self.num_preds = int(num_preds)
         self.frameskip = int(frameskip)
-        self.num_steps = self.history_size + self.num_preds
+        self.num_steps = 1 + self.num_preds
         self.action_steps = self.num_preds
         self.img_size = int(img_size)
         self.action_dim = int(action_dim)
         self.effective_action_dim = self.frameskip * self.action_dim
         self._h5: h5py.File | None = None
 
-        if self.history_size < 1:
-            raise ValueError("history_size must be positive.")
+        if self.markov_deriv < 0:
+            raise ValueError("markov_deriv must be non-negative.")
         if self.num_preds < 1:
             raise ValueError("num_preds must be positive.")
         if self.frameskip < 1:
@@ -141,15 +144,14 @@ class LeWMPushTDataset(Dataset):
 
         self.samples: list[tuple[int, int]] = []
         required_last_frame_offset = (self.num_steps - 1) * self.frameskip
-        action_start_step = self.history_size - 1
-        required_action_end_offset = (action_start_step + self.action_steps) * self.frameskip
+        required_action_end_offset = self.action_steps * self.frameskip
         required_offset = max(required_last_frame_offset, required_action_end_offset)
         for ep_idx, ep_len in enumerate(self.ep_len.tolist()):
             max_start = ep_len - 1 - required_offset
             for start in range(max_start + 1):
                 self.samples.append((ep_idx, start))
         if not self.samples:
-            raise ValueError("No valid training windows found. Check frameskip/history/num_preds.")
+            raise ValueError("No valid training windows found. Check frameskip/markov_deriv/num_preds.")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -168,14 +170,16 @@ class LeWMPushTDataset(Dataset):
         pixel_rows = base + frame_offsets
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
         pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
-        has_prev = start >= self.frameskip
-        prev_row = base - self.frameskip if has_prev else base
-        prev_pixels_np = np.asarray(h5["pixels"][prev_row], dtype=np.uint8)
-        prev_pixels = torch.from_numpy(prev_pixels_np).permute(2, 0, 1).contiguous()
+        if self.markov_deriv > 0:
+            prev_offsets = np.arange(self.markov_deriv, 0, -1, dtype=np.int64) * self.frameskip
+            prev_rows = int(self.ep_offset[ep_idx]) + np.maximum(start - prev_offsets, 0)
+            prev_pixels_np = np.stack([np.asarray(h5["pixels"][int(row)], dtype=np.uint8) for row in prev_rows], axis=0)
+            prev_pixels = torch.from_numpy(prev_pixels_np).permute(0, 3, 1, 2).contiguous()
+        else:
+            prev_pixels = pixels[:0].clone()
 
         action_blocks = []
-        first_action_step = self.history_size - 1
-        for step in range(first_action_step, first_action_step + self.action_steps):
+        for step in range(self.action_steps):
             action_start = base + step * self.frameskip
             action_stop = action_start + self.frameskip
             block = np.asarray(h5["action"][action_start:action_stop], dtype=np.float32)
@@ -185,7 +189,6 @@ class LeWMPushTDataset(Dataset):
         return {
             "pixels": pixels,
             "prev_pixels": prev_pixels,
-            "has_prev": torch.tensor(has_prev, dtype=torch.bool),
             "action": torch.stack(action_blocks, dim=0).float(),
         }
 
@@ -253,6 +256,31 @@ def temporal_straightening_loss(emb: torch.Tensor, eps: float = 1e-8) -> torch.T
     vel_next = emb[:, 2:] - emb[:, 1:-1]
     cosine = F.cosine_similarity(vel_prev, vel_next, dim=-1, eps=eps)
     return (1.0 - cosine).mean()
+
+
+def required_markov_history(markov_deriv: int) -> int:
+    if markov_deriv < 0:
+        raise ValueError("markov_deriv must be non-negative.")
+    return markov_deriv + 1
+
+
+def build_markov_state(history_emb: torch.Tensor, markov_deriv: int) -> torch.Tensor:
+    squeeze = False
+    if history_emb.ndim == 2:
+        history_emb = history_emb.unsqueeze(0)
+        squeeze = True
+    context_len = required_markov_history(markov_deriv)
+    if history_emb.ndim != 3 or history_emb.shape[1] < context_len:
+        raise ValueError(
+            f"Expected history_emb with shape [batch, >= {context_len}, dim], got {tuple(history_emb.shape)}."
+        )
+    deriv_seq = history_emb[:, -context_len:]
+    components = [deriv_seq[:, -1]]
+    for _ in range(markov_deriv):
+        deriv_seq = deriv_seq[:, 1:] - deriv_seq[:, :-1]
+        components.append(deriv_seq[:, -1])
+    state = torch.cat(components, dim=-1)
+    return state[0] if squeeze else state
 
 
 def preprocess_pixels(pixels: torch.Tensor, img_size: int) -> torch.Tensor:
@@ -358,30 +386,28 @@ class SplitDynamicsModel(nn.Module):
 
 
 def splitdyn_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
-    ctx_len = args.history_size
     n_preds = args.num_preds
     lambd = args.sigreg_weight
     body_dim = args.body_dim
     pusher_dim = args.pusher_dim
+    markov_context_len = required_markov_history(args.markov_deriv)
 
-    prev_pixels = batch["prev_pixels"].unsqueeze(1)
-    all_pixels = torch.cat((prev_pixels, batch["pixels"]), dim=1)
+    all_pixels = torch.cat((batch["prev_pixels"], batch["pixels"]), dim=1)
     all_pixels = preprocess_pixels(all_pixels, args.img_size)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode({"pixels": all_pixels})
 
-    prev_body = output["z_body"][:, 0]
-    prev_pusher = output["z_pusher"][:, 0]
-    z_body = output["z_body"][:, 1:]
-    z_pusher = output["z_pusher"][:, 1:]
-    emb = output["emb"][:, 1:]
+    history_body = output["z_body"][:, :markov_context_len]
+    history_pusher = output["z_pusher"][:, :markov_context_len]
+    z_body = output["z_body"][:, args.markov_deriv :]
+    z_pusher = output["z_pusher"][:, args.markov_deriv :]
+    emb = output["emb"][:, args.markov_deriv :]
     output["emb"] = emb
     output["z_body"] = z_body
     output["z_pusher"] = z_pusher
 
-    has_prev = batch["has_prev"].to(device=emb.device, dtype=torch.bool)
-    rollout_body = z_body[:, :ctx_len]
-    rollout_pusher = z_pusher[:, :ctx_len]
+    rollout_body_state = build_markov_state(history_body, args.markov_deriv)
+    rollout_pusher_state = build_markov_state(history_pusher, args.markov_deriv)
 
     body_losses = []
     pusher_losses = []
@@ -389,40 +415,38 @@ def splitdyn_forward(self, batch: dict[str, torch.Tensor], stage: str, args: arg
     pred_pusher_embs = []
 
     for step in range(n_preds):
-        current_body = rollout_body[:, -1]
-        current_pusher = rollout_pusher[:, -1]
-
-        if rollout_body.shape[1] >= 2:
-            delta_body = current_body - rollout_body[:, -2]
-            delta_pusher = current_pusher - rollout_pusher[:, -2]
-        else:
-            delta_body = torch.where(has_prev[:, None], current_body - prev_body, torch.zeros_like(current_body))
-            delta_pusher = torch.where(
-                has_prev[:, None], current_pusher - prev_pusher, torch.zeros_like(current_pusher)
-            )
-
-        body_state = torch.cat((current_body, delta_body), dim=-1).unsqueeze(1)
-        pusher_state = torch.cat((current_pusher, delta_pusher), dim=-1).unsqueeze(1)
+        body_state = rollout_body_state.unsqueeze(1)
+        pusher_state = rollout_pusher_state.unsqueeze(1)
         action = batch["action"][:, step : step + 1]
 
         pred_pusher_state = self.model.predict_pusher(pusher_state, action)[:, 0]
         pred_pusher_next = pred_pusher_state[..., :pusher_dim]
-        tgt_pusher_next = z_pusher[:, ctx_len + step]
-        tgt_pusher_delta = tgt_pusher_next - current_pusher.detach()
-        tgt_pusher_state = torch.cat((tgt_pusher_next, tgt_pusher_delta), dim=-1)
+        tgt_pusher_next = z_pusher[:, step + 1]
+        if args.markov_deriv > 0:
+            tgt_pusher_history = torch.cat(
+                (z_pusher[:, step + 1 - args.markov_deriv : step + 1], tgt_pusher_next.unsqueeze(1)), dim=1
+            )
+        else:
+            tgt_pusher_history = tgt_pusher_next.unsqueeze(1)
+        tgt_pusher_state = build_markov_state(tgt_pusher_history, args.markov_deriv)
         pusher_losses.append((pred_pusher_state - tgt_pusher_state).pow(2).mean())
 
         pred_body_state = self.model.predict_body(body_state, pred_pusher_state.detach().unsqueeze(1))[:, 0]
         pred_body_next = pred_body_state[..., :body_dim]
-        tgt_body_next = z_body[:, ctx_len + step]
-        tgt_body_delta = tgt_body_next - current_body.detach()
-        tgt_body_state = torch.cat((tgt_body_next, tgt_body_delta), dim=-1)
+        tgt_body_next = z_body[:, step + 1]
+        if args.markov_deriv > 0:
+            tgt_body_history = torch.cat(
+                (z_body[:, step + 1 - args.markov_deriv : step + 1], tgt_body_next.unsqueeze(1)), dim=1
+            )
+        else:
+            tgt_body_history = tgt_body_next.unsqueeze(1)
+        tgt_body_state = build_markov_state(tgt_body_history, args.markov_deriv)
         body_losses.append((pred_body_state - tgt_body_state).pow(2).mean())
 
         pred_body_embs.append(pred_body_next)
         pred_pusher_embs.append(pred_pusher_next)
-        rollout_body = torch.cat((rollout_body, pred_body_next.unsqueeze(1)), dim=1)
-        rollout_pusher = torch.cat((rollout_pusher, pred_pusher_next.unsqueeze(1)), dim=1)
+        rollout_body_state = pred_body_state
+        rollout_pusher_state = pred_pusher_state
 
     output["pred_body_emb"] = torch.stack(pred_body_embs, dim=1)
     output["pred_pusher_emb"] = torch.stack(pred_pusher_embs, dim=1)
@@ -576,7 +600,7 @@ def main() -> None:
 
     dataset = LeWMPushTDataset(
         dataset_path,
-        history_size=args.history_size,
+        markov_deriv=args.markov_deriv,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,
@@ -651,6 +675,7 @@ def main() -> None:
             "loaded_modules": ["encoder"],
             "reinitialized_modules": ["projector", "pusher_predictor", "body_predictor"],
             "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
+            "freeze_projector_epochs": int(args.freeze_projector_epochs),
         }
         with (run_dir / "init_report.json").open("w") as f:
             json.dump(init_report, f, indent=2)
@@ -660,12 +685,14 @@ def main() -> None:
             "run_dir": str(run_dir),
             "sigreg_weight": float(args.sigreg_weight),
             "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
+            "freeze_projector_epochs": int(args.freeze_projector_epochs),
         }
         with (run_dir / "resume_report.json").open("w") as f:
             json.dump(resume_report, f, indent=2)
 
     callbacks: list[Callback] = [
         FreezeModuleCallback("encoder", args.freeze_encoder_epochs),
+        FreezeModuleCallback("projector", args.freeze_projector_epochs),
         ModelCheckpoint(
             dirpath=run_dir,
             filename=f"{args.output_model_name}" + "_{epoch:03d}",

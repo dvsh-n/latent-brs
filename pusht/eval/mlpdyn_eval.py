@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--episode-idx", type=int, default=13858)
+    parser.add_argument("--episode-idx", type=int, default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--markov-deriv", type=int, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
@@ -188,7 +188,7 @@ def rollout_latents(
     if history.shape[0] < history_len:
         pad = history[:1].repeat(history_len - history.shape[0], 1)
         history = torch.cat([pad, history], dim=0)
-    emb = history.unsqueeze(0)
+    state = build_markov_state(history.unsqueeze(0), markov_deriv)
     pred_latents = [lat for lat in true_latents[: start_timestep + 1]]
     embed_dim = true_latents.shape[-1]
 
@@ -197,11 +197,10 @@ def rollout_latents(
         action_stop = action_start + frameskip
         act = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
         act_emb = model.action_encoder(act)
-        state = build_markov_state(emb, markov_deriv).unsqueeze(1)
-        pred_state = model.predict(state, act_emb)[:, 0]
+        pred_state = model.predict(state.unsqueeze(1), act_emb)[:, 0]
         pred = pred_state[..., :embed_dim]
         pred_latents.append(pred[0])
-        emb = torch.cat([emb, pred.unsqueeze(1)], dim=1)
+        state = pred_state
 
     return torch.stack(pred_latents, dim=0)
 

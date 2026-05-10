@@ -263,24 +263,24 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     emb = output["emb"][:, args.markov_deriv :]
     output["emb"] = emb
     act_emb = output["act_emb"]
-    rollout_emb = history_emb
+    rollout_state = build_markov_state(history_emb, args.markov_deriv)
     pred_losses = []
     pred_embs = []
     for step in range(n_preds):
-        ctx_state = build_markov_state(rollout_emb, args.markov_deriv).unsqueeze(1)
+        ctx_state = rollout_state.unsqueeze(1)
         ctx_act = act_emb[:, step : step + 1]
 
         pred_state = self.model.predict(ctx_state, ctx_act)[:, 0]
         pred_next = pred_state[..., :embed_dim]
         tgt_next = emb[:, step + 1]
         if args.markov_deriv > 0:
-            tgt_history = torch.cat((rollout_emb[:, -args.markov_deriv :].detach(), tgt_next.unsqueeze(1)), dim=1)
+            tgt_history = torch.cat((emb[:, step + 1 - args.markov_deriv : step + 1], tgt_next.unsqueeze(1)), dim=1)
         else:
             tgt_history = tgt_next.unsqueeze(1)
         tgt_state = build_markov_state(tgt_history, args.markov_deriv)
         pred_losses.append((pred_state - tgt_state).pow(2).mean())
         pred_embs.append(pred_next)
-        rollout_emb = torch.cat((rollout_emb, pred_next.unsqueeze(1)), dim=1)
+        rollout_state = pred_state
 
     output["pred_emb"] = torch.stack(pred_embs, dim=1)
     output["pred_loss"] = torch.stack(pred_losses).mean()
