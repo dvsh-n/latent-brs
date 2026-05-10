@@ -19,7 +19,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, preprocess_pixels
+from ogbench_cube.train.mlpdyn_train import (
+    LeWMOGBenchCubeDataset,
+    build_markov_state,
+    preprocess_pixels,
+    required_markov_history,
+)
 
 DEFAULT_DATASET_PATH = "ogbench_cube/data/expert_data/ogbench_cube_expert.h5"
 DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn"
@@ -34,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--episode-idx", type=int, default=None)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--history-size", type=int, default=None)
+    parser.add_argument("--markov-deriv", type=int, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
     parser.add_argument("--frameskip", type=int, default=None)
     parser.add_argument("--img-size", type=int, default=None)
@@ -66,7 +71,7 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
 
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -> None:
     defaults = {
-        "history_size": 1,
+        "markov_deriv": 1,
         "num_preds": 1,
         "frameskip": 1,
         "img_size": 224,
@@ -86,15 +91,14 @@ def require_device(device_arg: str) -> torch.device:
 
 
 def valid_episode_indices(dataset_path: Path, *, args: argparse.Namespace) -> np.ndarray:
-    if int(args.history_size) < 1:
-        raise ValueError("history_size must be positive.")
+    if int(args.markov_deriv) < 0:
+        raise ValueError("markov_deriv must be non-negative.")
     with h5py.File(dataset_path, "r") as h5:
         ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
-    num_steps = int(args.history_size) + int(args.num_preds)
+    num_steps = 1 + int(args.num_preds)
     required_last_frame_offset = (num_steps - 1) * int(args.frameskip)
-    action_start_step = int(args.history_size) - 1
     action_steps = int(args.num_preds)
-    required_action_end_offset = (action_start_step + action_steps) * int(args.frameskip)
+    required_action_end_offset = action_steps * int(args.frameskip)
     required_offset = max(required_last_frame_offset, required_action_end_offset)
     return np.flatnonzero(ep_len - 1 - required_offset >= 0)
 
@@ -117,7 +121,7 @@ def load_episode(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dataset = LeWMOGBenchCubeDataset(
         dataset_path,
-        history_size=args.history_size,
+        markov_deriv=args.markov_deriv,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,
@@ -160,53 +164,52 @@ def rollout_latents(
     true_latents: torch.Tensor,
     actions: torch.Tensor,
     *,
-    history_size: int,
+    markov_deriv: int,
     frameskip: int,
     max_rollout_steps: int | None,
 ) -> torch.Tensor:
     device = true_latents.device
-    rollout_steps = (true_latents.shape[0] - 1 - (history_size - 1) * frameskip) // frameskip
+    rollout_steps = (true_latents.shape[0] - 1) // frameskip
     if max_rollout_steps is not None:
         rollout_steps = min(rollout_steps, max_rollout_steps)
     if rollout_steps < 1:
         raise ValueError("Not enough actions for a rollout with the requested history/frameskip.")
-    if history_size < 1:
-        raise ValueError("history_size must be positive.")
+    if markov_deriv < 0:
+        raise ValueError("markov_deriv must be non-negative.")
 
-    emb = true_latents[:history_size].unsqueeze(0).clone()
-    pred_latents = [emb[0, step] for step in range(history_size)]
+    history_len = required_markov_history(markov_deriv)
+    history = true_latents[:1]
+    if history_len > 1:
+        history = torch.cat((history[:1].repeat(history_len - 1, 1), history), dim=0)
+    state = build_markov_state(history.unsqueeze(0), markov_deriv)
+    pred_latents = [true_latents[0]]
     embed_dim = true_latents.shape[-1]
 
     for step in range(rollout_steps):
-        action_start = (step + history_size - 1) * frameskip
+        action_start = step * frameskip
         action_stop = action_start + frameskip
         act = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
         act_emb = model.action_encoder(act)
-        current = emb[:, -1]
-        if emb.shape[1] >= 2:
-            delta = current - emb[:, -2]
-        else:
-            delta = torch.zeros_like(current)
-        state = torch.cat((current, delta), dim=-1).unsqueeze(1)
-        pred_state = model.predict(state, act_emb)[:, 0]
+        pred_state = model.predict(state.unsqueeze(1), act_emb)[:, 0]
         pred = pred_state[..., :embed_dim]
         pred_latents.append(pred[0])
-        emb = torch.cat([emb, pred.unsqueeze(1)], dim=1)
+        state = pred_state
 
     return torch.stack(pred_latents, dim=0)
 
 
-def compute_metrics(true_latents: torch.Tensor, pred_latents: torch.Tensor, *, history_size: int) -> dict[str, object]:
-    length = min(true_latents.shape[0], pred_latents.shape[0])
-    if length <= history_size:
+def compute_metrics(true_latents: torch.Tensor, pred_latents: torch.Tensor, *, frameskip: int) -> dict[str, object]:
+    pred_indices = np.arange(1, pred_latents.shape[0], dtype=np.int64) * frameskip
+    pred_indices = pred_indices[pred_indices < true_latents.shape[0]]
+    if pred_indices.size == 0:
         raise ValueError("Rollout is not longer than the warm-start history.")
-    true = true_latents[history_size:length].float().cpu()
-    pred = pred_latents[history_size:length].float().cpu()
+    true = true_latents[pred_indices].float().cpu()
+    pred = pred_latents[1 : 1 + pred_indices.size].float().cpu()
     err = pred - true
     rmse_per_step = err.pow(2).mean(dim=-1).sqrt()
     rmse_per_dim = err.pow(2).mean(dim=0).sqrt()
     return {
-        "num_context_steps": int(history_size),
+        "num_context_steps": 1,
         "num_rollout_steps": int(true.shape[0]),
         "embed_dim": int(true.shape[-1]),
         "mean_rmse": float(rmse_per_step.mean()),
@@ -223,7 +226,7 @@ def plot_latents(
     *,
     out_dir: Path,
     episode_idx: int,
-    history_size: int,
+    num_context_steps: int,
 ) -> list[Path]:
     length = min(true_latents.shape[0], pred_latents.shape[0])
     true = true_latents[:length].float().cpu().numpy()
@@ -242,8 +245,8 @@ def plot_latents(
         for axis, dim in zip(axes, range(start_dim, end_dim)):
             axis.plot(steps, true[:, dim], label="true", linewidth=1.5)
             axis.plot(steps, pred[:, dim], label="rollout", linewidth=1.2, linestyle="--")
-            if history_size > 1:
-                axis.axvline(history_size - 0.5, color="black", alpha=0.25, linewidth=1)
+            if num_context_steps > 0:
+                axis.axvline(num_context_steps - 0.5, color="black", alpha=0.25, linewidth=1)
             axis.set_ylabel(f"z{dim}")
             axis.grid(True, alpha=0.25)
         if start_dim == end_dim:
@@ -284,7 +287,7 @@ def main() -> None:
     with h5py.File(dataset_path, "r") as h5:
         num_episodes = int(h5["ep_len"].shape[0])
     if valid_episodes.size == 0:
-        raise ValueError("No episodes are long enough for the requested history/num_preds/frameskip settings.")
+        raise ValueError("No episodes are long enough for the requested markov_deriv/num_preds/frameskip settings.")
     episode_idx = args.episode_idx
     if episode_idx is None:
         episode_idx = int(np.random.default_rng().choice(valid_episodes))
@@ -292,7 +295,7 @@ def main() -> None:
         raise IndexError(f"episode_idx {episode_idx} is out of range [0, {num_episodes}).")
     if episode_idx not in set(valid_episodes.tolist()):
         raise ValueError(
-            f"episode_idx {episode_idx} is too short for history_size={args.history_size}, "
+            f"episode_idx {episode_idx} is too short for markov_deriv={args.markov_deriv}, "
             f"num_preds={args.num_preds}, frameskip={args.frameskip}."
         )
 
@@ -308,12 +311,12 @@ def main() -> None:
         model,
         true_latents,
         actions.to(device),
-        history_size=args.history_size,
+        markov_deriv=args.markov_deriv,
         frameskip=args.frameskip,
         max_rollout_steps=args.max_rollout_steps,
     )
 
-    metrics = compute_metrics(true_latents, pred_latents, history_size=args.history_size)
+    metrics = compute_metrics(true_latents, pred_latents, frameskip=args.frameskip)
     metrics.update(
         {
             "episode_idx": episode_idx,
@@ -321,10 +324,10 @@ def main() -> None:
             "checkpoint": str(checkpoint_path),
             "config_path": str(model_dir / "config.json"),
             "dataset_path": str(dataset_path),
-            "history_size": args.history_size,
+            "markov_deriv": args.markov_deriv,
             "action_history_size": 1,
-            "state_space": "latent_plus_latent_delta",
-            "markov_state_dim": int(true_latents.shape[-1] * 2),
+            "state_space": "latent_plus_finite_differences",
+            "markov_state_dim": int(true_latents.shape[-1] * (args.markov_deriv + 1)),
             "num_preds": args.num_preds,
             "frameskip": args.frameskip,
         }
@@ -338,7 +341,7 @@ def main() -> None:
         pred_latents,
         out_dir=out_dir,
         episode_idx=episode_idx,
-        history_size=args.history_size,
+        num_context_steps=1,
     )
     print(
         json.dumps(
@@ -348,7 +351,7 @@ def main() -> None:
                 "final_rmse": metrics["final_rmse"],
                 "checkpoint": str(checkpoint_path),
                 "action_history_size": 1,
-                "state_space": "latent_plus_latent_delta",
+                "state_space": "latent_plus_finite_differences",
                 "metrics_path": str(metrics_path),
                 "plot_paths": [str(path) for path in plot_paths],
             },

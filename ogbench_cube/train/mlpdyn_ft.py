@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=18)
-    parser.add_argument("--history-size", type=int, default=1)
+    parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=6, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=5)
 
@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     if args.freeze_projector_epochs < 0:
         parser.error("--freeze-projector-epochs must be non-negative.")
     args.frameskip = FIXED_FRAMESKIP
-    args.markov_state_dim = 2 * args.embed_dim
+    args.markov_state_dim = (args.markov_deriv + 1) * args.embed_dim
     return args
 
 
@@ -98,25 +98,25 @@ class LeWMOGBenchCubeDataset(Dataset):
         self,
         dataset_path: Path,
         *,
-        history_size: int,
+        markov_deriv: int,
         num_preds: int,
         frameskip: int,
         img_size: int,
         action_dim: int,
     ) -> None:
         self.dataset_path = dataset_path
-        self.history_size = int(history_size)
+        self.markov_deriv = int(markov_deriv)
         self.num_preds = int(num_preds)
         self.frameskip = int(frameskip)
-        self.num_steps = self.history_size + self.num_preds
+        self.num_steps = 1 + self.num_preds
         self.action_steps = self.num_preds
         self.img_size = int(img_size)
         self.action_dim = int(action_dim)
         self.effective_action_dim = self.frameskip * self.action_dim
         self._h5: h5py.File | None = None
 
-        if self.history_size < 1:
-            raise ValueError("history_size must be positive.")
+        if self.markov_deriv < 0:
+            raise ValueError("markov_deriv must be non-negative.")
         if self.num_preds < 1:
             raise ValueError("num_preds must be positive.")
         if self.frameskip < 1:
@@ -135,15 +135,14 @@ class LeWMOGBenchCubeDataset(Dataset):
 
         self.samples: list[tuple[int, int]] = []
         required_last_frame_offset = (self.num_steps - 1) * self.frameskip
-        action_start_step = self.history_size - 1
-        required_action_end_offset = (action_start_step + self.action_steps) * self.frameskip
+        required_action_end_offset = self.action_steps * self.frameskip
         required_offset = max(required_last_frame_offset, required_action_end_offset)
         for ep_idx, ep_len in enumerate(self.ep_len.tolist()):
             max_start = ep_len - 1 - required_offset
             for start in range(max_start + 1):
                 self.samples.append((ep_idx, start))
         if not self.samples:
-            raise ValueError("No valid training windows found. Check frameskip/history/num_preds.")
+            raise ValueError("No valid training windows found. Check frameskip/markov_deriv/num_preds.")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -162,14 +161,16 @@ class LeWMOGBenchCubeDataset(Dataset):
         pixel_rows = base + frame_offsets
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
         pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
-        has_prev = start >= self.frameskip
-        prev_row = base - self.frameskip if has_prev else base
-        prev_pixels_np = np.asarray(h5["pixels"][prev_row], dtype=np.uint8)
-        prev_pixels = torch.from_numpy(prev_pixels_np).permute(2, 0, 1).contiguous()
+        if self.markov_deriv > 0:
+            prev_offsets = np.arange(self.markov_deriv, 0, -1, dtype=np.int64) * self.frameskip
+            prev_rows = int(self.ep_offset[ep_idx]) + np.maximum(start - prev_offsets, 0)
+            prev_pixels_np = np.stack([np.asarray(h5["pixels"][int(row)], dtype=np.uint8) for row in prev_rows], axis=0)
+            prev_pixels = torch.from_numpy(prev_pixels_np).permute(0, 3, 1, 2).contiguous()
+        else:
+            prev_pixels = pixels[:0].clone()
 
         action_blocks = []
-        first_action_step = self.history_size - 1
-        for step in range(first_action_step, first_action_step + self.action_steps):
+        for step in range(self.action_steps):
             action_start = base + step * self.frameskip
             action_stop = action_start + self.frameskip
             block = np.asarray(h5["action"][action_start:action_stop], dtype=np.float32)
@@ -179,7 +180,6 @@ class LeWMOGBenchCubeDataset(Dataset):
         return {
             "pixels": pixels,
             "prev_pixels": prev_pixels,
-            "has_prev": torch.tensor(has_prev, dtype=torch.bool),
             "action": torch.stack(action_blocks, dim=0).float(),
         }
 
@@ -249,6 +249,31 @@ def temporal_straightening_loss(emb: torch.Tensor, eps: float = 1e-8) -> torch.T
     return (1.0 - cosine).mean()
 
 
+def required_markov_history(markov_deriv: int) -> int:
+    if markov_deriv < 0:
+        raise ValueError("markov_deriv must be non-negative.")
+    return markov_deriv + 1
+
+
+def build_markov_state(history_emb: torch.Tensor, markov_deriv: int) -> torch.Tensor:
+    squeeze = False
+    if history_emb.ndim == 2:
+        history_emb = history_emb.unsqueeze(0)
+        squeeze = True
+    context_len = required_markov_history(markov_deriv)
+    if history_emb.ndim != 3 or history_emb.shape[1] < context_len:
+        raise ValueError(
+            f"Expected history_emb with shape [batch, >= {context_len}, dim], got {tuple(history_emb.shape)}."
+        )
+    deriv_seq = history_emb[:, -context_len:]
+    components = [deriv_seq[:, -1]]
+    for _ in range(markov_deriv):
+        deriv_seq = deriv_seq[:, 1:] - deriv_seq[:, :-1]
+        components.append(deriv_seq[:, -1])
+    state = torch.cat(components, dim=-1)
+    return state[0] if squeeze else state
+
+
 def preprocess_pixels(pixels: torch.Tensor, img_size: int) -> torch.Tensor:
     pixels = pixels.float().div_(255.0)
     if pixels.shape[-2:] != (img_size, img_size):
@@ -265,41 +290,37 @@ def preprocess_pixels(pixels: torch.Tensor, img_size: int) -> torch.Tensor:
 
 
 def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
-    ctx_len = args.history_size
     n_preds = args.num_preds
     lambd = args.sigreg_weight
     embed_dim = args.embed_dim
+    markov_context_len = required_markov_history(args.markov_deriv)
 
-    prev_pixels = batch["prev_pixels"].unsqueeze(1)
-    all_pixels = torch.cat((prev_pixels, batch["pixels"]), dim=1)
+    all_pixels = torch.cat((batch["prev_pixels"], batch["pixels"]), dim=1)
     all_pixels = preprocess_pixels(all_pixels, args.img_size)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode({"pixels": all_pixels, "action": batch["action"]})
-    prev_emb = output["emb"][:, 0]
-    emb = output["emb"][:, 1:]
+    history_emb = output["emb"][:, :markov_context_len]
+    emb = output["emb"][:, args.markov_deriv :]
     output["emb"] = emb
     act_emb = output["act_emb"]
-    has_prev = batch["has_prev"].to(device=emb.device, dtype=torch.bool)
-    rollout_emb = emb[:, :ctx_len]
+    rollout_state = build_markov_state(history_emb, args.markov_deriv)
     pred_losses = []
     pred_embs = []
     for step in range(n_preds):
-        current_emb = rollout_emb[:, -1]
-        if rollout_emb.shape[1] >= 2:
-            delta_emb = current_emb - rollout_emb[:, -2]
-        else:
-            delta_emb = torch.where(has_prev[:, None], current_emb - prev_emb, torch.zeros_like(current_emb))
-        ctx_state = torch.cat((current_emb, delta_emb), dim=-1).unsqueeze(1)
+        ctx_state = rollout_state.unsqueeze(1)
         ctx_act = act_emb[:, step : step + 1]
 
         pred_state = self.model.predict(ctx_state, ctx_act)[:, 0]
         pred_next = pred_state[..., :embed_dim]
-        tgt_next = emb[:, ctx_len + step]
-        tgt_delta = tgt_next - current_emb.detach()
-        tgt_state = torch.cat((tgt_next, tgt_delta), dim=-1)
+        tgt_next = emb[:, step + 1]
+        if args.markov_deriv > 0:
+            tgt_history = torch.cat((emb[:, step + 1 - args.markov_deriv : step + 1], tgt_next.unsqueeze(1)), dim=1)
+        else:
+            tgt_history = tgt_next.unsqueeze(1)
+        tgt_state = build_markov_state(tgt_history, args.markov_deriv)
         pred_losses.append((pred_state - tgt_state).pow(2).mean())
         pred_embs.append(pred_next)
-        rollout_emb = torch.cat((rollout_emb, pred_next.unsqueeze(1)), dim=1)
+        rollout_state = pred_state
 
     output["pred_emb"] = torch.stack(pred_embs, dim=1)
     output["pred_loss"] = torch.stack(pred_losses).mean()
@@ -327,7 +348,7 @@ def build_model(args: argparse.Namespace) -> JEPA:
     )
     hidden_dim = encoder.config.hidden_size
     embed_dim = args.embed_dim
-    markov_state_dim = 2 * embed_dim
+    markov_state_dim = args.markov_state_dim
     effective_act_dim = args.frameskip * args.action_dim
 
     predictor = MLPDynamicsPredictor(
@@ -443,7 +464,7 @@ def main() -> None:
 
     dataset = LeWMOGBenchCubeDataset(
         dataset_path,
-        history_size=args.history_size,
+        markov_deriv=args.markov_deriv,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,

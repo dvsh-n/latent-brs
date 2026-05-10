@@ -20,7 +20,7 @@ import torch
 from tqdm.auto import tqdm
 
 from pusht.data.pusht_preproc import make_no_target_env, set_render_state
-from pusht.train.mlpdyn_train import LeWMPushTDataset
+from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, required_markov_history
 
 DEFAULT_DATASET_PATH = "pusht/data/pusht_expert_train_preproc.h5"
 DEFAULT_MODEL_DIR = "pusht/models/mlpdyn"
@@ -174,12 +174,15 @@ def encode_single_frame(
     return model.projector(output.last_hidden_state[:, 0])[0]
 
 
-def make_markov_state(embedding: torch.Tensor, previous_embedding: torch.Tensor | None = None) -> torch.Tensor:
-    if previous_embedding is None:
-        delta = torch.zeros_like(embedding)
-    else:
-        delta = embedding - previous_embedding
-    return torch.cat((embedding, delta), dim=-1)
+def make_markov_state(history: list[torch.Tensor], markov_deriv: int) -> torch.Tensor:
+    context_len = required_markov_history(markov_deriv)
+    if not history:
+        raise ValueError("At least one embedding is required to build the Markov state.")
+    history_tensor = torch.stack(history[-context_len:], dim=0)
+    if history_tensor.shape[0] < context_len:
+        pad = history_tensor[:1].repeat(context_len - history_tensor.shape[0], 1)
+        history_tensor = torch.cat((pad, history_tensor), dim=0)
+    return build_markov_state(history_tensor, markov_deriv)
 
 
 def normalized_to_raw_action(action_norm: np.ndarray, action_mean: np.ndarray, action_std: np.ndarray) -> np.ndarray:
@@ -459,19 +462,19 @@ def main() -> None:
     )
     model = load_model(checkpoint_path, device)
 
-    history_size = int(config.get("history_size", 1))
-    if history_size != 1:
-        raise ValueError(f"Expected history_size=1 for the MLP model, got {history_size}.")
+    markov_deriv = int(config.get("markov_deriv", 1))
+    if markov_deriv < 0:
+        raise ValueError(f"Expected non-negative markov_deriv for the MLP model, got {markov_deriv}.")
 
     img_size = int(config.get("img_size", 224))
     action_dim = int(config.get("action_dim", 2))
     embed_dim = int(config.get("embed_dim", 32))
-    markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
+    markov_state_dim = int(config.get("markov_state_dim", (markov_deriv + 1) * embed_dim))
 
     train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
     train_stats_dataset = LeWMPushTDataset(
         train_dataset_path,
-        history_size=history_size,
+        markov_deriv=markov_deriv,
         num_preds=1,
         frameskip=int(config.get("frameskip", 1)),
         img_size=img_size,
@@ -521,11 +524,13 @@ def main() -> None:
         device=device,
         frame_batch_size=args.frame_batch_size,
     )
+    history_len = required_markov_history(markov_deriv)
     start_emb = true_latents[0]
     goal_emb = true_latents[-1]
-    goal_prev_emb = true_latents[-2]
-    start_state = make_markov_state(start_emb)
-    goal_state = make_markov_state(goal_emb, goal_prev_emb)
+    start_history = [start_emb] * history_len
+    goal_history = [goal_emb] * history_len
+    start_state = make_markov_state(start_history, markov_deriv)
+    goal_state = make_markov_state(goal_history, markov_deriv)
     if int(start_state.numel()) != markov_state_dim:
         raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {start_state.numel()}.")
 
@@ -556,7 +561,8 @@ def main() -> None:
         pixel_mean=pixel_mean,
         pixel_std=pixel_std,
     )
-    current_state = make_markov_state(current_emb)
+    current_history = [current_emb] * history_len
+    current_state = make_markov_state(current_history, markov_deriv)
     goal_state_np = goal_state.detach().cpu().numpy().astype(np.float64)
     goal_block = state_np[-1, 2:5].astype(np.float32)
     current_block = current_block_pose(env)
@@ -597,7 +603,9 @@ def main() -> None:
             pixel_mean=pixel_mean,
             pixel_std=pixel_std,
         )
-        current_state = make_markov_state(next_emb, current_emb)
+        current_history.append(next_emb)
+        current_history = current_history[-history_len:]
+        current_state = make_markov_state(current_history, markov_deriv)
         current_emb = next_emb
         current_block = current_block_pose(env)
 
@@ -633,9 +641,9 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "config_path": str(model_dir / "config.json"),
         "dataset_path": str(dataset_path),
-        "history_size": history_size,
+        "markov_deriv": markov_deriv,
         "action_history_size": 1,
-        "state_space": "latent_plus_latent_delta",
+        "state_space": "latent_plus_finite_differences",
         "markov_state_dim": markov_state_dim,
         "horizon": args.horizon,
         "max_mpc_steps": args.max_mpc_steps,

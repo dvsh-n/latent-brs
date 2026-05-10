@@ -24,7 +24,7 @@ import torch
 from ogbench.manipspace import lie
 from tqdm.auto import tqdm
 
-from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset
+from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
 DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn"
@@ -177,12 +177,15 @@ def encode_single_frame(
     return model.projector(output.last_hidden_state[:, 0])[0]
 
 
-def make_markov_state(embedding: torch.Tensor, previous_embedding: torch.Tensor | None = None) -> torch.Tensor:
-    if previous_embedding is None:
-        delta = torch.zeros_like(embedding)
-    else:
-        delta = embedding - previous_embedding
-    return torch.cat((embedding, delta), dim=-1)
+def make_markov_state(history: list[torch.Tensor], markov_deriv: int) -> torch.Tensor:
+    context_len = required_markov_history(markov_deriv)
+    if not history:
+        raise ValueError("At least one embedding is required to build the Markov state.")
+    history_tensor = torch.stack(history[-context_len:], dim=0)
+    if history_tensor.shape[0] < context_len:
+        pad = history_tensor[:1].repeat(context_len - history_tensor.shape[0], 1)
+        history_tensor = torch.cat((pad, history_tensor), dim=0)
+    return build_markov_state(history_tensor, markov_deriv)
 
 
 def normalized_to_raw_action(action_norm: np.ndarray, action_mean: np.ndarray, action_std: np.ndarray) -> np.ndarray:
@@ -518,19 +521,19 @@ def main() -> None:
     )
     model = load_model(checkpoint_path, device)
 
-    history_size = int(config.get("history_size", 1))
-    if history_size != 1:
-        raise ValueError(f"Expected history_size=1 for the MLP model, got {history_size}.")
+    markov_deriv = int(config.get("markov_deriv", 1))
+    if markov_deriv < 0:
+        raise ValueError(f"Expected non-negative markov_deriv for the MLP model, got {markov_deriv}.")
 
     img_size = int(config.get("img_size", 224))
     action_dim = int(config.get("action_dim", 5))
     embed_dim = int(config.get("embed_dim", 24))
-    markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
+    markov_state_dim = int(config.get("markov_state_dim", (markov_deriv + 1) * embed_dim))
 
     train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
     train_stats_dataset = LeWMOGBenchCubeDataset(
         train_dataset_path,
-        history_size=history_size,
+        markov_deriv=markov_deriv,
         num_preds=1,
         frameskip=int(config.get("frameskip", 1)),
         img_size=img_size,
@@ -630,8 +633,11 @@ def main() -> None:
         pixel_mean=pixel_mean,
         pixel_std=pixel_std,
     )
-    current_state = make_markov_state(current_emb)
-    goal_state = make_markov_state(goal_emb)
+    history_len = required_markov_history(markov_deriv)
+    current_history = [current_emb] * history_len
+    goal_history = [goal_emb] * history_len
+    current_state = make_markov_state(current_history, markov_deriv)
+    goal_state = make_markov_state(goal_history, markov_deriv)
     if int(current_state.numel()) != markov_state_dim:
         raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {current_state.numel()}.")
 
@@ -709,7 +715,9 @@ def main() -> None:
             pixel_mean=pixel_mean,
             pixel_std=pixel_std,
         )
-        current_state = make_markov_state(next_emb, current_emb)
+        current_history.append(next_emb)
+        current_history = current_history[-history_len:]
+        current_state = make_markov_state(current_history, markov_deriv)
         current_emb = next_emb
 
         rollout_frames.append(current_frame.copy())
