@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DEFAULT_DATASET_PATH = Path(__file__).with_name("pusht_expert_train.h5")
+DEFAULT_DATASET_PATH = Path("pusht/data/pusht_diffusion_fixed_goal_30k.h5")
 REQUIRED_KEYS = ("ep_len", "ep_offset", "pixels", "action")
 FILTER_NAMES = {
     32001: "blosc",
