@@ -24,6 +24,7 @@ import torch
 from ogbench.manipspace import lie
 from tqdm.auto import tqdm
 
+from ogbench_cube.data.ogbench_cube_data_gen import LocalCubePlanOracle
 from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
@@ -38,6 +39,12 @@ Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 20
 EPISODE_IDX = None
+MAX_ORACLE_STEPS = 80
+ORACLE_SEGMENT_DT = 0.4
+ORACLE_NOISE = 0.0
+ORACLE_NOISE_SMOOTHING = 0.5
+GRASP_CONTACT_THRESHOLD = 0.5
+GRASP_ALIGNMENT_THRESHOLD = 0.03
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-max-episode-steps", type=int, default=None)
     parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--video-fps", type=int, default=VIDEO_FPS)
+    parser.add_argument("--max-oracle-steps", type=int, default=MAX_ORACLE_STEPS)
+    parser.add_argument("--oracle-segment-dt", type=float, default=ORACLE_SEGMENT_DT)
+    parser.add_argument("--oracle-noise", type=float, default=ORACLE_NOISE)
+    parser.add_argument("--oracle-noise-smoothing", type=float, default=ORACLE_NOISE_SMOOTHING)
+    parser.add_argument("--grasp-contact-threshold", type=float, default=GRASP_CONTACT_THRESHOLD)
+    parser.add_argument("--grasp-alignment-threshold", type=float, default=GRASP_ALIGNMENT_THRESHOLD)
     parser.add_argument("--q-terminal", type=float, default=Q_TERMINAL)
     parser.add_argument("--q-stage", type=float, default=Q_STAGE)
     parser.add_argument("--r-control", type=float, default=R_CONTROL)
@@ -195,6 +208,24 @@ def normalized_to_raw_action(action_norm: np.ndarray, action_mean: np.ndarray, a
 
 def angular_distance(a: float, b: float) -> float:
     return float(np.abs(np.arctan2(np.sin(a - b), np.cos(a - b))))
+
+
+def action_to_standardized(action: np.ndarray, action_mean: np.ndarray, action_std: np.ndarray) -> np.ndarray:
+    return ((action.astype(np.float32) - action_mean.reshape(-1)) / action_std.reshape(-1)).astype(np.float32)
+
+
+def cube_is_grasped(
+    info: dict[str, np.ndarray],
+    *,
+    contact_threshold: float,
+    alignment_threshold: float,
+) -> bool:
+    target_block = int(info["privileged/target_block"])
+    block_pos = np.asarray(info[f"privileged/block_{target_block}_pos"], dtype=np.float32)
+    effector_pos = np.asarray(info["proprio/effector_pos"], dtype=np.float32)
+    gripper_contact = float(np.asarray(info["proprio/gripper_contact"], dtype=np.float32)[0])
+    block_alignment = float(np.linalg.norm(block_pos - effector_pos))
+    return bool(gripper_contact >= contact_threshold and block_alignment <= alignment_threshold)
 
 
 def load_dataset_episode(
@@ -574,7 +605,7 @@ def main() -> None:
     max_episode_steps = (
         int(args.env_max_episode_steps)
         if args.env_max_episode_steps is not None
-        else max(dataset_max_episode_steps, int(args.max_mpc_steps) + 1)
+        else max(dataset_max_episode_steps, int(args.max_oracle_steps) + int(args.max_mpc_steps) + 1)
     )
     qpos_np = np.asarray(episode["qpos"], dtype=np.float32)
     qvel_np = np.asarray(episode["qvel"], dtype=np.float32)
@@ -593,6 +624,12 @@ def main() -> None:
         max_episode_steps=max_episode_steps,
         width=width,
         height=height,
+    )
+    oracle = LocalCubePlanOracle(
+        env=env,
+        segment_dt=args.oracle_segment_dt,
+        noise=args.oracle_noise,
+        noise_smoothing=args.oracle_noise_smoothing,
     )
 
     start_frame, start_info = reset_env_to_state(
@@ -692,66 +729,143 @@ def main() -> None:
             goal_block_yaw,
         )
     ]
+    used_oracle_before_mpc = False
+    oracle_grasped = cube_is_grasped(
+        current_info,
+        contact_threshold=args.grasp_contact_threshold,
+        alignment_threshold=args.grasp_alignment_threshold,
+    )
+    oracle_steps_executed = 0
+    mpc_steps_executed = 0
+    handoff_step = 0 if oracle_grasped else None
     solve_times_ms: list[float] = []
     ilqr_iterations: list[int] = []
     ilqr_costs: list[float] = []
     stop_reason = "max_mpc_steps"
+    terminated = False
+    truncated = False
 
-    pbar = tqdm(range(args.max_mpc_steps), desc="MPC Steps")
-    for _ in pbar:
-        current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
-        _, u_plan, solve_time, n_iters, plan_cost = mpc_solver.solve(current_state_np, goal_state_np)
-        solve_times_ms.append(solve_time * 1000.0)
-        ilqr_iterations.append(int(n_iters))
-        ilqr_costs.append(float(plan_cost))
+    if not oracle_grasped:
+        used_oracle_before_mpc = True
+        oracle.reset(None, current_info)
+        oracle_pbar = tqdm(range(args.max_oracle_steps), desc="Oracle Grasp")
+        for _ in oracle_pbar:
+            oracle_action = np.asarray(oracle.select_action(None, current_info), dtype=np.float32)
+            oracle_action_std = action_to_standardized(oracle_action, action_mean, action_std)
+            executed_actions_raw.append(oracle_action.copy())
+            executed_actions_norm.append(oracle_action_std.copy())
 
-        u0_norm = u_plan[0].astype(np.float32)
-        u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
-        executed_actions_norm.append(u0_norm.copy())
-        executed_actions_raw.append(u0_raw.copy())
+            _, _, terminated, truncated, step_info = env.step(oracle_action)
+            current_info = step_info
+            current_frame = np.asarray(env.unwrapped.render(camera=camera), dtype=np.uint8)
+            next_emb = encode_single_frame(
+                model,
+                current_frame,
+                device=device,
+                img_size=img_size,
+                pixel_mean=pixel_mean,
+                pixel_std=pixel_std,
+            )
+            current_history.append(next_emb)
+            current_history = current_history[-history_len:]
+            current_state = make_markov_state(current_history, markov_deriv)
+            current_emb = next_emb
 
-        _, _, terminated, truncated, step_info = env.step(u0_raw)
-        current_info = step_info
-        current_frame = np.asarray(env.unwrapped.render(camera=camera), dtype=np.uint8)
-        next_emb = encode_single_frame(
-            model,
-            current_frame,
-            device=device,
-            img_size=img_size,
-            pixel_mean=pixel_mean,
-            pixel_std=pixel_std,
-        )
-        current_history.append(next_emb)
-        current_history = current_history[-history_len:]
-        current_state = make_markov_state(current_history, markov_deriv)
-        current_emb = next_emb
+            oracle_steps_executed += 1
+            rollout_frames.append(current_frame.copy())
+            latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
+            embedding_goal_distance = float(torch.linalg.vector_norm(current_emb - goal_emb).item())
+            cube_goal_distance = float(np.linalg.norm(np.asarray(current_info["privileged/block_0_pos"]) - goal_block_pos))
+            cube_yaw_error = angular_distance(
+                float(current_info["privileged/block_0_yaw"][0]),
+                goal_block_yaw,
+            )
+            latent_goal_distances.append(latent_goal_distance)
+            embedding_goal_distances.append(embedding_goal_distance)
+            cube_goal_distances.append(cube_goal_distance)
+            cube_yaw_errors.append(cube_yaw_error)
 
-        rollout_frames.append(current_frame.copy())
-        latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
-        embedding_goal_distance = float(torch.linalg.vector_norm(current_emb - goal_emb).item())
-        cube_goal_distance = float(np.linalg.norm(np.asarray(current_info["privileged/block_0_pos"]) - goal_block_pos))
-        cube_yaw_error = angular_distance(
-            float(current_info["privileged/block_0_yaw"][0]),
-            goal_block_yaw,
-        )
-        latent_goal_distances.append(latent_goal_distance)
-        embedding_goal_distances.append(embedding_goal_distance)
-        cube_goal_distances.append(cube_goal_distance)
-        cube_yaw_errors.append(cube_yaw_error)
-
-        pbar.set_postfix(
-            solve_ms=f"{solve_times_ms[-1]:.1f}",
-            iters=f"{ilqr_iterations[-1]}",
-            latent_goal=f"{latent_goal_distance:.3f}",
-            cube_goal=f"{cube_goal_distance:.3f}",
-        )
-
-        if terminated or truncated:
-            if truncated and len(executed_actions_raw) >= int(args.max_mpc_steps):
-                stop_reason = "max_mpc_steps"
-            else:
+            oracle_grasped = cube_is_grasped(
+                current_info,
+                contact_threshold=args.grasp_contact_threshold,
+                alignment_threshold=args.grasp_alignment_threshold,
+            )
+            oracle_pbar.set_postfix(
+                grasped=f"{int(oracle_grasped)}",
+                latent_goal=f"{latent_goal_distance:.3f}",
+                cube_goal=f"{cube_goal_distance:.3f}",
+            )
+            if oracle_grasped:
+                handoff_step = int(len(executed_actions_raw))
+                break
+            if terminated or truncated:
                 stop_reason = "terminated" if terminated else "truncated"
-            break
+                break
+        oracle_pbar.close()
+
+    if oracle_grasped and not (terminated or truncated):
+        pbar = tqdm(range(args.max_mpc_steps), desc="MPC Steps")
+        for _ in pbar:
+            current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
+            _, u_plan, solve_time, n_iters, plan_cost = mpc_solver.solve(current_state_np, goal_state_np)
+            solve_times_ms.append(solve_time * 1000.0)
+            ilqr_iterations.append(int(n_iters))
+            ilqr_costs.append(float(plan_cost))
+
+            u0_norm = u_plan[0].astype(np.float32)
+            u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
+            executed_actions_norm.append(u0_norm.copy())
+            executed_actions_raw.append(u0_raw.copy())
+
+            _, _, terminated, truncated, step_info = env.step(u0_raw)
+            current_info = step_info
+            current_frame = np.asarray(env.unwrapped.render(camera=camera), dtype=np.uint8)
+            next_emb = encode_single_frame(
+                model,
+                current_frame,
+                device=device,
+                img_size=img_size,
+                pixel_mean=pixel_mean,
+                pixel_std=pixel_std,
+            )
+            current_history.append(next_emb)
+            current_history = current_history[-history_len:]
+            current_state = make_markov_state(current_history, markov_deriv)
+            current_emb = next_emb
+
+            mpc_steps_executed += 1
+            rollout_frames.append(current_frame.copy())
+            latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
+            embedding_goal_distance = float(torch.linalg.vector_norm(current_emb - goal_emb).item())
+            cube_goal_distance = float(np.linalg.norm(np.asarray(current_info["privileged/block_0_pos"]) - goal_block_pos))
+            cube_yaw_error = angular_distance(
+                float(current_info["privileged/block_0_yaw"][0]),
+                goal_block_yaw,
+            )
+            latent_goal_distances.append(latent_goal_distance)
+            embedding_goal_distances.append(embedding_goal_distance)
+            cube_goal_distances.append(cube_goal_distance)
+            cube_yaw_errors.append(cube_yaw_error)
+
+            pbar.set_postfix(
+                solve_ms=f"{solve_times_ms[-1]:.1f}",
+                iters=f"{ilqr_iterations[-1]}",
+                latent_goal=f"{latent_goal_distance:.3f}",
+                cube_goal=f"{cube_goal_distance:.3f}",
+            )
+
+            if terminated or truncated:
+                if truncated and mpc_steps_executed >= int(args.max_mpc_steps):
+                    stop_reason = "max_mpc_steps"
+                else:
+                    stop_reason = "terminated" if terminated else "truncated"
+                break
+        pbar.close()
+    elif not oracle_grasped and not (terminated or truncated):
+        stop_reason = "oracle_failed_to_grasp"
+
+    if oracle_grasped and mpc_steps_executed >= int(args.max_mpc_steps) and not (terminated or truncated):
+        stop_reason = "max_mpc_steps"
 
     final_info = current_info
     metrics = {
@@ -767,6 +881,11 @@ def main() -> None:
         "dataset_max_episode_steps": dataset_max_episode_steps,
         "env_max_episode_steps": max_episode_steps,
         "num_executed_steps": int(len(executed_actions_raw)),
+        "oracle_steps_executed": int(oracle_steps_executed),
+        "mpc_steps_executed": int(mpc_steps_executed),
+        "used_oracle_before_mpc": bool(used_oracle_before_mpc),
+        "oracle_grasped": bool(oracle_grasped),
+        "handoff_step": None if handoff_step is None else int(handoff_step),
         "stop_reason": stop_reason,
         "latent_goal_distance_initial": float(latent_goal_distances[0]),
         "latent_goal_distance_final": float(latent_goal_distances[-1]),
