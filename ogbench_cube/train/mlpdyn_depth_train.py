@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from ogbench_cube.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "ogbench_cube/data/expert_data/ogbench_cube_expert.h5"
+DEFAULT_DATASET_PATH = "ogbench_cube/data/expert_data_depth/ogbench_cube_expert_depth.h5"
 DEFAULT_RUN_DIR = "ogbench_cube/models/mlpdyn_depth"
 FINETUNE_DIR = None
 FIXED_FRAMESKIP = 1
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictor-depth", type=int, default=2)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.005)
+    parser.add_argument("--sigreg-weight", type=float, default=0.009)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
     parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
@@ -144,14 +144,6 @@ class LeWMOGBenchCubeDepthDataset(Dataset):
             self._h5 = h5py.File(self.dataset_path, "r")
         return self._h5
 
-    @staticmethod
-    def _combine_rgb_depth(rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
-        if depth.ndim == 3 and depth.shape[-1] == 1:
-            depth = depth[..., 0]
-        if depth.ndim != 2:
-            raise ValueError(f"Expected depth frame with shape (H, W), got {depth.shape}.")
-        return np.concatenate((rgb, depth[..., None]), axis=-1)
-
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         h5 = self._file()
         ep_idx, start = self.samples[index]
@@ -161,11 +153,8 @@ class LeWMOGBenchCubeDepthDataset(Dataset):
         pixel_rows = base + frame_offsets
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
         depth_np = np.asarray(h5["depth"][pixel_rows], dtype=np.float32)
-        rgbd_np = np.stack(
-            [self._combine_rgb_depth(rgb, depth) for rgb, depth in zip(pixels_np, depth_np, strict=False)],
-            axis=0,
-        )
-        pixels = torch.from_numpy(rgbd_np).permute(0, 3, 1, 2).contiguous()
+        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
+        depth = torch.from_numpy(depth_np[:, None, :, :]).contiguous()
 
         if self.markov_deriv > 0:
             prev_offsets = np.arange(self.markov_deriv, 0, -1, dtype=np.int64) * self.frameskip
@@ -173,13 +162,11 @@ class LeWMOGBenchCubeDepthDataset(Dataset):
             # h5py fancy indexing requires strictly increasing indices; boundary padding can repeat rows.
             prev_pixels_np = np.stack([np.asarray(h5["pixels"][int(row)], dtype=np.uint8) for row in prev_rows], axis=0)
             prev_depth_np = np.stack([np.asarray(h5["depth"][int(row)], dtype=np.float32) for row in prev_rows], axis=0)
-            prev_rgbd_np = np.stack(
-                [self._combine_rgb_depth(rgb, depth) for rgb, depth in zip(prev_pixels_np, prev_depth_np, strict=False)],
-                axis=0,
-            )
-            prev_pixels = torch.from_numpy(prev_rgbd_np).permute(0, 3, 1, 2).contiguous()
+            prev_pixels = torch.from_numpy(prev_pixels_np).permute(0, 3, 1, 2).contiguous()
+            prev_depth = torch.from_numpy(prev_depth_np[:, None, :, :]).contiguous()
         else:
             prev_pixels = pixels[:0].clone()
+            prev_depth = depth[:0].clone()
 
         action_blocks = []
         for step in range(self.action_steps):
@@ -191,7 +178,9 @@ class LeWMOGBenchCubeDepthDataset(Dataset):
 
         return {
             "pixels": pixels,
+            "depth": depth,
             "prev_pixels": prev_pixels,
+            "prev_depth": prev_depth,
             "action": torch.stack(action_blocks, dim=0).float(),
         }
 
@@ -261,9 +250,15 @@ def build_markov_state(history_emb: torch.Tensor, markov_deriv: int) -> torch.Te
     return state[0] if squeeze else state
 
 
-def preprocess_pixels(pixels: torch.Tensor, img_size: int, depth_min: float, depth_max: float) -> torch.Tensor:
-    rgb = pixels[:, :, :3].float().div_(255.0)
-    depth = pixels[:, :, 3:4].float()
+def preprocess_pixels(
+    rgb: torch.Tensor,
+    depth: torch.Tensor,
+    img_size: int,
+    depth_min: float,
+    depth_max: float,
+) -> torch.Tensor:
+    rgb = rgb.float().div_(255.0)
+    depth = depth.float()
     if rgb.shape[-2:] != (img_size, img_size):
         batch_size, time_steps = rgb.shape[:2]
         rgb = F.interpolate(
@@ -295,8 +290,9 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     embed_dim = args.embed_dim
     markov_context_len = required_markov_history(args.markov_deriv)
 
-    all_pixels = torch.cat((batch["prev_pixels"], batch["pixels"]), dim=1)
-    all_pixels = preprocess_pixels(all_pixels, args.img_size, args.depth_min, args.depth_max)
+    all_rgb = torch.cat((batch["prev_pixels"], batch["pixels"]), dim=1)
+    all_depth = torch.cat((batch["prev_depth"], batch["depth"]), dim=1)
+    all_pixels = preprocess_pixels(all_rgb, all_depth, args.img_size, args.depth_min, args.depth_max)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode({"pixels": all_pixels, "action": batch["action"]})
     history_emb = output["emb"][:, :markov_context_len]
@@ -343,6 +339,10 @@ def ensure_input_channels(encoder: torch.nn.Module, in_chans: int) -> torch.nn.M
     if not isinstance(patch_proj, nn.Conv2d):
         raise TypeError(f"Expected Conv2d patch projection, got {type(patch_proj).__name__}.")
     if patch_proj.in_channels == in_chans:
+        if hasattr(encoder, "config"):
+            encoder.config.num_channels = in_chans
+        if hasattr(encoder.embeddings.patch_embeddings, "num_channels"):
+            encoder.embeddings.patch_embeddings.num_channels = in_chans
         return encoder
 
     new_proj = nn.Conv2d(
@@ -365,6 +365,10 @@ def ensure_input_channels(encoder: torch.nn.Module, in_chans: int) -> torch.nn.M
         if patch_proj.bias is not None:
             new_proj.bias.copy_(patch_proj.bias)
     encoder.embeddings.patch_embeddings.projection = new_proj
+    if hasattr(encoder, "config"):
+        encoder.config.num_channels = in_chans
+    if hasattr(encoder.embeddings.patch_embeddings, "num_channels"):
+        encoder.embeddings.patch_embeddings.num_channels = in_chans
     return encoder
 
 
@@ -375,7 +379,7 @@ def build_model(args: argparse.Namespace) -> JEPA:
         image_size=args.img_size,
         pretrained=False,
         use_mask_token=False,
-        in_chans=INPUT_CHANNELS,
+        num_channels=INPUT_CHANNELS,
     )
     encoder = ensure_input_channels(encoder, INPUT_CHANNELS)
     hidden_dim = encoder.config.hidden_size

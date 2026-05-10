@@ -24,8 +24,8 @@ from scipy.ndimage import gaussian_filter1d
 from tqdm.auto import tqdm
 from ogbench.manipspace import lie
 
-DEFAULT_OUTDIR = "ogbench_cube/data/expert_data_depth"
-DEFAULT_OUTPUT_NAME = "ogbench_cube_expert_depth.h5"
+DEFAULT_OUTDIR = "ogbench_cube/data/test_data_depth"
+DEFAULT_OUTPUT_NAME = "ogbench_cube_test_depth.h5"
 DEFAULT_ENV_NAME = "cube-single-v0"
 DEFAULT_SIM_FREQ_HZ = 500.0
 DEFAULT_CONTROL_DECIMATION = 25

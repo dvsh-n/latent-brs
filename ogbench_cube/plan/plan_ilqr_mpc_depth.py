@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan in OGBench cube pixel space with nominal iLQR MPC over a Markov-state MLP world model."""
+"""Plan in OGBench cube RGB-D space with nominal iLQR MPC over a Markov-state MLP world model."""
 
 from __future__ import annotations
 
@@ -24,14 +24,19 @@ import torch
 from ogbench.manipspace import lie
 from tqdm.auto import tqdm
 
-from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, build_markov_state, required_markov_history
+from ogbench_cube.train.mlpdyn_depth_train import (
+    LeWMOGBenchCubeDepthDataset,
+    build_markov_state,
+    preprocess_pixels,
+    required_markov_history,
+)
 
-DEFAULT_TEST_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
-DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn"
-DEFAULT_OUT_DIR = "ogbench_cube/plan/ilqr_mpc_mlpdyn"
+DEFAULT_TEST_DATASET_PATH = "ogbench_cube/data/expert_data_depth/ogbench_cube_expert_depth.h5"
+DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_depth"
+DEFAULT_OUT_DIR = "ogbench_cube/plan/ilqr_mpc_mlpdyn_depth"
 
 DEVICE = "auto"
-HORIZON = 15
+HORIZON = 35
 MAX_MPC_STEPS = 120
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005
@@ -122,30 +127,6 @@ def save_rollout_video(frames: list[np.ndarray], out_dir: Path, fps: int) -> Pat
         return gif_path
 
 
-def preprocess_pixels(
-    pixels: np.ndarray | torch.Tensor,
-    *,
-    img_size: int,
-    pixel_mean: torch.Tensor,
-    pixel_std: torch.Tensor,
-) -> torch.Tensor:
-    if isinstance(pixels, np.ndarray):
-        tensor = torch.from_numpy(np.ascontiguousarray(pixels))
-    else:
-        tensor = pixels
-    if tensor.ndim == 3:
-        tensor = tensor.unsqueeze(0)
-    tensor = tensor.permute(0, 3, 1, 2).float().div_(255.0)
-    if tuple(tensor.shape[-2:]) != (img_size, img_size):
-        tensor = torch.nn.functional.interpolate(
-            tensor,
-            size=(img_size, img_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-    return (tensor - pixel_mean) / pixel_std
-
-
 @torch.no_grad()
 def encode_frames(
     model: torch.nn.Module,
@@ -166,15 +147,18 @@ def encode_frames(
 @torch.no_grad()
 def encode_single_frame(
     model: torch.nn.Module,
-    pixel: np.ndarray,
+    rgb: np.ndarray,
+    depth: np.ndarray,
     *,
     device: torch.device,
     img_size: int,
-    pixel_mean: torch.Tensor,
-    pixel_std: torch.Tensor,
+    depth_min: float,
+    depth_max: float,
 ) -> torch.Tensor:
-    batch = preprocess_pixels(pixel, img_size=img_size, pixel_mean=pixel_mean, pixel_std=pixel_std).to(device)
-    output = model.encoder(batch, interpolate_pos_encoding=True)
+    rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+    depth_tensor = torch.from_numpy(np.ascontiguousarray(depth)).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    batch = preprocess_pixels(rgb_tensor, depth_tensor, img_size, depth_min, depth_max)[0, 0].to(device)
+    output = model.encoder(batch.unsqueeze(0), interpolate_pos_encoding=True)
     return model.projector(output.last_hidden_state[:, 0])[0]
 
 
@@ -202,11 +186,14 @@ def load_dataset_episode(
     episode_idx: int,
 ) -> dict[str, np.ndarray | int | float | str]:
     with h5py.File(dataset_path, "r") as h5:
+        if "depth" not in h5:
+            raise ValueError(f"Dataset does not contain a 'depth' dataset: {dataset_path}")
         ep_len = int(h5["ep_len"][episode_idx])
         ep_offset = int(h5["ep_offset"][episode_idx])
         rows = np.arange(ep_offset, ep_offset + ep_len, dtype=np.int64)
         return {
             "pixels": np.asarray(h5["pixels"][rows], dtype=np.uint8),
+            "depth": np.asarray(h5["depth"][rows], dtype=np.float32),
             "action": np.asarray(h5["action"][rows], dtype=np.float32),
             "observation": np.asarray(h5["observation"][rows], dtype=np.float32),
             "qpos": np.asarray(h5["qpos"][rows], dtype=np.float32),
@@ -281,7 +268,7 @@ def reset_env_to_state(
     target_block_pos: np.ndarray,
     target_block_yaw: float,
     camera: str,
-) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     env.reset(seed=seed)
     unwrapped = env.unwrapped
     unwrapped._data.qpos[: qpos.shape[0]] = np.asarray(qpos, dtype=np.float64)
@@ -295,8 +282,9 @@ def reset_env_to_state(
     mujoco.mj_forward(unwrapped._model, unwrapped._data)
     unwrapped.post_step()
     frame = np.asarray(unwrapped.render(camera=camera), dtype=np.uint8)
+    depth = np.asarray(unwrapped.render(camera=camera, depth=True), dtype=np.float32)
     info = unwrapped.get_step_info()
-    return frame, info
+    return frame, depth, info
 
 
 class MarkovDynamicsTorch:
@@ -530,9 +518,11 @@ def main() -> None:
     action_dim = int(config.get("action_dim", 5))
     embed_dim = int(config.get("embed_dim", 24))
     markov_state_dim = int(config.get("markov_state_dim", (markov_deriv + 1) * embed_dim))
+    depth_min = float(config.get("depth_min", 0.0))
+    depth_max = float(config.get("depth_max", 10.0))
 
     train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
-    train_stats_dataset = LeWMOGBenchCubeDataset(
+    train_stats_dataset = LeWMOGBenchCubeDepthDataset(
         train_dataset_path,
         markov_deriv=markov_deriv,
         num_preds=1,
@@ -540,8 +530,6 @@ def main() -> None:
         img_size=img_size,
         action_dim=action_dim,
     )
-    pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
-    pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
     action_mean = train_stats_dataset.action_mean.astype(np.float32)
     action_std = train_stats_dataset.action_std.astype(np.float32)
 
@@ -581,6 +569,7 @@ def main() -> None:
     target_block_pos_np = np.asarray(episode["target_block_pos"], dtype=np.float32)
     target_block_yaw_np = np.asarray(episode["target_block_yaw"], dtype=np.float32)
     dataset_pixels_np = np.asarray(episode["pixels"], dtype=np.uint8)
+    dataset_depth_np = np.asarray(episode["depth"], dtype=np.float32)
 
     run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
     out_dir = out_root / run_name
@@ -595,7 +584,7 @@ def main() -> None:
         height=height,
     )
 
-    start_frame, start_info = reset_env_to_state(
+    start_frame, start_depth, start_info = reset_env_to_state(
         env,
         seed=episode_seed,
         qpos=qpos_np[0],
@@ -604,7 +593,7 @@ def main() -> None:
         target_block_yaw=float(target_block_yaw_np[0, 0]),
         camera=camera,
     )
-    goal_frame, goal_info = reset_env_to_state(
+    goal_frame, goal_depth, goal_info = reset_env_to_state(
         env,
         seed=episode_seed,
         qpos=qpos_np[-1],
@@ -613,7 +602,7 @@ def main() -> None:
         target_block_yaw=float(target_block_yaw_np[-1, 0]),
         camera=camera,
     )
-    current_frame, current_info = reset_env_to_state(
+    current_frame, current_depth, current_info = reset_env_to_state(
         env,
         seed=episode_seed,
         qpos=qpos_np[0],
@@ -626,18 +615,20 @@ def main() -> None:
     goal_emb = encode_single_frame(
         model,
         goal_frame,
+        goal_depth,
         device=device,
         img_size=img_size,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
+        depth_min=depth_min,
+        depth_max=depth_max,
     )
     current_emb = encode_single_frame(
         model,
         current_frame,
+        current_depth,
         device=device,
         img_size=img_size,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
+        depth_min=depth_min,
+        depth_max=depth_max,
     )
     history_len = required_markov_history(markov_deriv)
     current_history = [current_emb] * history_len
@@ -647,15 +638,12 @@ def main() -> None:
     if int(current_state.numel()) != markov_state_dim:
         raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {current_state.numel()}.")
 
-    dataset_pixels = preprocess_pixels(
-        dataset_pixels_np,
-        img_size=img_size,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
-    )
+    dataset_pixels = torch.from_numpy(np.ascontiguousarray(dataset_pixels_np)).permute(0, 3, 1, 2).unsqueeze(0)
+    dataset_depth = torch.from_numpy(np.ascontiguousarray(dataset_depth_np)).unsqueeze(0).unsqueeze(2)
+    dataset_rgbd = preprocess_pixels(dataset_pixels, dataset_depth, img_size, depth_min, depth_max)[0]
     true_latents = encode_frames(
         model,
-        dataset_pixels,
+        dataset_rgbd,
         device=device,
         frame_batch_size=args.frame_batch_size,
     )
@@ -713,13 +701,15 @@ def main() -> None:
         _, _, terminated, truncated, step_info = env.step(u0_raw)
         current_info = step_info
         current_frame = np.asarray(env.unwrapped.render(camera=camera), dtype=np.uint8)
+        current_depth = np.asarray(env.unwrapped.render(camera=camera, depth=True), dtype=np.float32)
         next_emb = encode_single_frame(
             model,
             current_frame,
+            current_depth,
             device=device,
             img_size=img_size,
-            pixel_mean=pixel_mean,
-            pixel_std=pixel_std,
+            depth_min=depth_min,
+            depth_max=depth_max,
         )
         current_history.append(next_emb)
         current_history = current_history[-history_len:]
@@ -762,6 +752,8 @@ def main() -> None:
         "env_name": env_name,
         "camera": camera,
         "img_size": img_size,
+        "depth_min": depth_min,
+        "depth_max": depth_max,
         "horizon": int(args.horizon),
         "max_mpc_steps": int(args.max_mpc_steps),
         "dataset_max_episode_steps": dataset_max_episode_steps,
@@ -793,6 +785,8 @@ def main() -> None:
         "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
         "dataset_start_pixel_l2": float(np.linalg.norm(start_frame.astype(np.float32) - dataset_pixels_np[0].astype(np.float32))),
         "dataset_goal_pixel_l2": float(np.linalg.norm(goal_frame.astype(np.float32) - dataset_pixels_np[-1].astype(np.float32))),
+        "dataset_start_depth_l2": float(np.linalg.norm(start_depth.astype(np.float32) - dataset_depth_np[0].astype(np.float32))),
+        "dataset_goal_depth_l2": float(np.linalg.norm(goal_depth.astype(np.float32) - dataset_depth_np[-1].astype(np.float32))),
         "dataset_goal_latent_distance": float(torch.linalg.vector_norm(true_latents[-1] - goal_emb).item()),
     }
 
