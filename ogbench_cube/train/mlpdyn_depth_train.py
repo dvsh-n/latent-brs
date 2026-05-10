@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a PushT latent dynamics model from image rollouts."""
+"""Train an LE-WM-style JEPA with RGB-D inputs and a Markov latent-state MLP dynamics predictor."""
 
 from __future__ import annotations
 
@@ -16,42 +16,48 @@ import lightning as pl
 import numpy as np
 import stable_pretraining as spt
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset, random_split
 
-from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
+from ogbench_cube.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_expert_train_preproc.h5"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn"
+DEFAULT_DATASET_PATH = "ogbench_cube/data/expert_data/ogbench_cube_expert.h5"
+DEFAULT_RUN_DIR = "ogbench_cube/models/mlpdyn_depth"
+FINETUNE_DIR = None
 FIXED_FRAMESKIP = 1
+INPUT_CHANNELS = 4
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--output-model-name", default="mlpdyn")
+    parser.add_argument("--finetune-dir", type=Path, default=FINETUNE_DIR)
+    parser.add_argument("--output-model-name", default="lewm_depth")
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--train-split", type=float, default=1.0)
 
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=48)
+    parser.add_argument("--embed-dim", type=int, default=24)
     parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
-    parser.add_argument("--action-dim", type=int, default=2)
+    parser.add_argument("--action-dim", type=int, default=5)
+    parser.add_argument("--depth-min", type=float, default=0.0)
+    parser.add_argument("--depth-max", type=float, default=10.0)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
-    parser.add_argument("--predictor-depth", type=int, default=3)
+    parser.add_argument("--predictor-depth", type=int, default=2)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.009)
+    parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=50)
@@ -77,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-class LeWMPushTDataset(Dataset):
+class LeWMOGBenchCubeDepthDataset(Dataset):
     def __init__(
         self,
         dataset_path: Path,
@@ -107,6 +113,8 @@ class LeWMPushTDataset(Dataset):
             raise ValueError("frameskip must be positive.")
 
         with h5py.File(self.dataset_path, "r") as h5:
+            if "depth" not in h5:
+                raise ValueError(f"Dataset does not contain a 'depth' dataset: {self.dataset_path}")
             self.ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
             self.ep_offset = np.asarray(h5["ep_offset"][:], dtype=np.int64)
             if int(h5["action"].shape[-1]) != self.action_dim:
@@ -136,6 +144,14 @@ class LeWMPushTDataset(Dataset):
             self._h5 = h5py.File(self.dataset_path, "r")
         return self._h5
 
+    @staticmethod
+    def _combine_rgb_depth(rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        if depth.ndim != 2:
+            raise ValueError(f"Expected depth frame with shape (H, W), got {depth.shape}.")
+        return np.concatenate((rgb, depth[..., None]), axis=-1)
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         h5 = self._file()
         ep_idx, start = self.samples[index]
@@ -144,13 +160,24 @@ class LeWMPushTDataset(Dataset):
         frame_offsets = np.arange(self.num_steps, dtype=np.int64) * self.frameskip
         pixel_rows = base + frame_offsets
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
-        pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
+        depth_np = np.asarray(h5["depth"][pixel_rows], dtype=np.float32)
+        rgbd_np = np.stack(
+            [self._combine_rgb_depth(rgb, depth) for rgb, depth in zip(pixels_np, depth_np, strict=False)],
+            axis=0,
+        )
+        pixels = torch.from_numpy(rgbd_np).permute(0, 3, 1, 2).contiguous()
+
         if self.markov_deriv > 0:
             prev_offsets = np.arange(self.markov_deriv, 0, -1, dtype=np.int64) * self.frameskip
             prev_rows = int(self.ep_offset[ep_idx]) + np.maximum(start - prev_offsets, 0)
             # h5py fancy indexing requires strictly increasing indices; boundary padding can repeat rows.
             prev_pixels_np = np.stack([np.asarray(h5["pixels"][int(row)], dtype=np.uint8) for row in prev_rows], axis=0)
-            prev_pixels = torch.from_numpy(prev_pixels_np).permute(0, 3, 1, 2).contiguous()
+            prev_depth_np = np.stack([np.asarray(h5["depth"][int(row)], dtype=np.float32) for row in prev_rows], axis=0)
+            prev_rgbd_np = np.stack(
+                [self._combine_rgb_depth(rgb, depth) for rgb, depth in zip(prev_pixels_np, prev_depth_np, strict=False)],
+                axis=0,
+            )
+            prev_pixels = torch.from_numpy(prev_rgbd_np).permute(0, 3, 1, 2).contiguous()
         else:
             prev_pixels = pixels[:0].clone()
 
@@ -234,19 +261,32 @@ def build_markov_state(history_emb: torch.Tensor, markov_deriv: int) -> torch.Te
     return state[0] if squeeze else state
 
 
-def preprocess_pixels(pixels: torch.Tensor, img_size: int) -> torch.Tensor:
-    pixels = pixels.float().div_(255.0)
-    if pixels.shape[-2:] != (img_size, img_size):
-        batch_size, time_steps = pixels.shape[:2]
-        pixels = F.interpolate(
-            pixels.view(batch_size * time_steps, *pixels.shape[2:]),
+def preprocess_pixels(pixels: torch.Tensor, img_size: int, depth_min: float, depth_max: float) -> torch.Tensor:
+    rgb = pixels[:, :, :3].float().div_(255.0)
+    depth = pixels[:, :, 3:4].float()
+    if rgb.shape[-2:] != (img_size, img_size):
+        batch_size, time_steps = rgb.shape[:2]
+        rgb = F.interpolate(
+            rgb.view(batch_size * time_steps, *rgb.shape[2:]),
             size=(img_size, img_size),
             mode="bilinear",
             align_corners=False,
-        ).view(batch_size, time_steps, *pixels.shape[2:3], img_size, img_size)
-    pixel_mean = pixels.new_tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
-    pixel_std = pixels.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
-    return (pixels - pixel_mean) / pixel_std
+        ).view(batch_size, time_steps, 3, img_size, img_size)
+        depth = F.interpolate(
+            depth.view(batch_size * time_steps, *depth.shape[2:]),
+            size=(img_size, img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).view(batch_size, time_steps, 1, img_size, img_size)
+
+    pixel_mean = rgb.new_tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+    pixel_std = rgb.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+    rgb = (rgb - pixel_mean) / pixel_std
+
+    depth = depth.clamp_(min=depth_min, max=depth_max)
+    depth = (depth - depth_min) / max(depth_max - depth_min, 1e-6)
+    depth = depth * 2.0 - 1.0
+    return torch.cat((rgb, depth), dim=2)
 
 
 def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argparse.Namespace):
@@ -256,7 +296,7 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     markov_context_len = required_markov_history(args.markov_deriv)
 
     all_pixels = torch.cat((batch["prev_pixels"], batch["pixels"]), dim=1)
-    all_pixels = preprocess_pixels(all_pixels, args.img_size)
+    all_pixels = preprocess_pixels(all_pixels, args.img_size, args.depth_min, args.depth_max)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode({"pixels": all_pixels, "action": batch["action"]})
     history_emb = output["emb"][:, :markov_context_len]
@@ -298,6 +338,36 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
     return output
 
 
+def ensure_input_channels(encoder: torch.nn.Module, in_chans: int) -> torch.nn.Module:
+    patch_proj = encoder.embeddings.patch_embeddings.projection
+    if not isinstance(patch_proj, nn.Conv2d):
+        raise TypeError(f"Expected Conv2d patch projection, got {type(patch_proj).__name__}.")
+    if patch_proj.in_channels == in_chans:
+        return encoder
+
+    new_proj = nn.Conv2d(
+        in_chans,
+        patch_proj.out_channels,
+        kernel_size=patch_proj.kernel_size,
+        stride=patch_proj.stride,
+        padding=patch_proj.padding,
+        dilation=patch_proj.dilation,
+        groups=patch_proj.groups,
+        bias=patch_proj.bias is not None,
+    )
+    with torch.no_grad():
+        new_proj.weight.zero_()
+        copy_chans = min(patch_proj.in_channels, in_chans)
+        new_proj.weight[:, :copy_chans] = patch_proj.weight[:, :copy_chans]
+        if in_chans > patch_proj.in_channels:
+            mean_weight = patch_proj.weight.mean(dim=1, keepdim=True)
+            new_proj.weight[:, patch_proj.in_channels:] = mean_weight
+        if patch_proj.bias is not None:
+            new_proj.bias.copy_(patch_proj.bias)
+    encoder.embeddings.patch_embeddings.projection = new_proj
+    return encoder
+
+
 def build_model(args: argparse.Namespace) -> JEPA:
     encoder = spt.backbone.utils.vit_hf(
         args.encoder_scale,
@@ -305,7 +375,9 @@ def build_model(args: argparse.Namespace) -> JEPA:
         image_size=args.img_size,
         pretrained=False,
         use_mask_token=False,
+        in_chans=INPUT_CHANNELS,
     )
+    encoder = ensure_input_channels(encoder, INPUT_CHANNELS)
     hidden_dim = encoder.config.hidden_size
     embed_dim = args.embed_dim
     markov_state_dim = args.markov_state_dim
@@ -366,18 +438,27 @@ def main() -> None:
 
     dataset_path = args.dataset_path.expanduser().resolve()
     run_dir = args.run_dir.expanduser().resolve()
-    output_run_dir = run_dir
-    ckpt_path = output_run_dir / "last.ckpt"
-    if output_run_dir.exists() and not ckpt_path.is_file():
-        raise FileExistsError(
-            f"Run dir already exists but does not contain a resumable checkpoint: {output_run_dir}"
-        )
+    finetune_dir = args.finetune_dir.expanduser().resolve() if args.finetune_dir is not None else None
+    if finetune_dir is None:
+        output_run_dir = run_dir
+        ckpt_path = output_run_dir / "last.ckpt"
+        if output_run_dir.exists() and not ckpt_path.is_file():
+            raise FileExistsError(
+                f"Run dir already exists but does not contain a resumable checkpoint: {output_run_dir}"
+            )
+    else:
+        ckpt_path = run_dir / "last.ckpt"
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Finetune source checkpoint not found: {ckpt_path}")
+        output_run_dir = finetune_dir
+        if output_run_dir.exists():
+            raise FileExistsError(f"Finetune output dir already exists: {output_run_dir}")
 
     spt.set(cache_dir=str(output_run_dir))
     if not dataset_path.is_file():
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
 
-    dataset = LeWMPushTDataset(
+    dataset = LeWMOGBenchCubeDepthDataset(
         dataset_path,
         markov_deriv=args.markov_deriv,
         num_preds=args.num_preds,
@@ -434,6 +515,7 @@ def main() -> None:
     output_run_dir.mkdir(parents=True, exist_ok=True)
     config = vars(args).copy()
     config["run_dir"] = str(run_dir)
+    config["finetune_dir"] = str(finetune_dir) if finetune_dir is not None else None
     config["output_run_dir"] = str(output_run_dir)
     config["resume_checkpoint"] = str(ckpt_path) if ckpt_path.is_file() else None
     with (output_run_dir / "config.json").open("w") as f:

@@ -37,7 +37,7 @@ Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 20
-EPISODE_IDX = None
+EPISODE_IDX = 0
 
 
 def parse_args() -> argparse.Namespace:

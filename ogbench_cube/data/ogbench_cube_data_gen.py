@@ -24,13 +24,14 @@ from scipy.ndimage import gaussian_filter1d
 from tqdm.auto import tqdm
 from ogbench.manipspace import lie
 
-DEFAULT_OUTDIR = "ogbench_cube/data/test_data"
-DEFAULT_OUTPUT_NAME = "ogbench_cube_test.h5"
+DEFAULT_OUTDIR = "ogbench_cube/data/expert_data_depth"
+DEFAULT_OUTPUT_NAME = "ogbench_cube_expert_depth.h5"
 DEFAULT_ENV_NAME = "cube-single-v0"
 DEFAULT_SIM_FREQ_HZ = 500.0
 DEFAULT_CONTROL_DECIMATION = 25
 VISUALIZE_TARGET = False
 DETERMINISTIC_ARM_START = True
+SAVE_DEPTH = True
 XY_SAMPLING_BOUNDS = np.asarray([[0.30, -0.25], [0.5, 0.25]], dtype=np.float32) # x (front back), y (left right), [x_min, y_min] and [x_max, y_max]
 Z_SAMPLING_BOUNDS = np.asarray([0.02, 0.30], dtype=np.float32)
 THETA_SAMPLING_BOUNDS = np.asarray([0.0, 2.0 * np.pi], dtype=np.float32)
@@ -495,6 +496,7 @@ def collect_trajectory(
     oracle: object,
     trajectory_seed: int,
     camera: str,
+    save_depth: bool,
     goal_threshold: float,
     goal_yaw_threshold: float,
     post_goal_steps: int,
@@ -512,6 +514,7 @@ def collect_trajectory(
 
     observations = [np.asarray(ob, dtype=np.float32)]
     frames = [np.asarray(env.unwrapped.render(camera=camera), dtype=np.uint8)]
+    depth_frames = [np.asarray(env.unwrapped.render(camera=camera, depth=True), dtype=np.float32)] if save_depth else []
     actions: list[np.ndarray] = []
     qpos = [np.asarray(info["qpos"], dtype=np.float32)]
     qvel = [np.asarray(info["qvel"], dtype=np.float32)]
@@ -542,6 +545,8 @@ def collect_trajectory(
         actions.append(action)
         observations.append(np.asarray(next_ob, dtype=np.float32))
         frames.append(np.asarray(env.unwrapped.render(camera=camera), dtype=np.uint8))
+        if save_depth:
+            depth_frames.append(np.asarray(env.unwrapped.render(camera=camera, depth=True), dtype=np.float32))
 
         step_info = extract_step_info(next_info)
         qpos.append(step_info["qpos"])
@@ -584,6 +589,8 @@ def collect_trajectory(
         "target_block_yaw": np.stack(target_block_yaw, axis=0),
         "time": np.stack(time, axis=0),
     }
+    if save_depth:
+        data["depth"] = np.stack(depth_frames, axis=0)
     return data, total_reward, bool(terminated), bool(truncated), bool(goal_seen)
 
 
@@ -652,6 +659,7 @@ def main() -> None:
             lie_module=lie,
         )
     sample_frame = np.asarray(env.unwrapped.render(camera=args.camera), dtype=np.uint8)
+    sample_depth = np.asarray(env.unwrapped.render(camera=args.camera, depth=True), dtype=np.float32) if SAVE_DEPTH else None
     obs_dim = int(np.asarray(sample_ob).shape[0])
     qpos_dim = int(np.asarray(sample_info["qpos"]).shape[0])
     qvel_dim = int(np.asarray(sample_info["qvel"]).shape[0])
@@ -688,6 +696,7 @@ def main() -> None:
         h5.attrs["video_dir"] = str(video_dir)
         h5.attrs["video_resolution"] = json.dumps([args.height, args.width])
         h5.attrs["camera"] = args.camera
+        h5.attrs["save_depth"] = SAVE_DEPTH
         h5.attrs["target_visualization"] = VISUALIZE_TARGET
         h5.attrs["deterministic_arm_start"] = DETERMINISTIC_ARM_START
         h5.attrs["video_fps"] = control_freq_hz
@@ -724,6 +733,18 @@ def main() -> None:
             compression=compression,
             chunks=(1, *sample_frame.shape),
         )
+        depth_ds = (
+            create_resizable_dataset(
+                h5,
+                "depth",
+                sample_depth.shape,
+                np.float32,
+                compression=compression,
+                chunks=(1, *sample_depth.shape),
+            )
+            if SAVE_DEPTH
+            else None
+        )
         action_ds = create_resizable_dataset(h5, "action", (ACTION_DIM,), np.float32, chunks=True)
         obs_ds = create_resizable_dataset(h5, "observation", (obs_dim,), np.float32, chunks=True)
         qpos_ds = create_resizable_dataset(h5, "qpos", (qpos_dim,), np.float32, chunks=True)
@@ -756,6 +777,7 @@ def main() -> None:
                     oracle=oracle,
                     trajectory_seed=trajectory_seed,
                     camera=args.camera,
+                    save_depth=SAVE_DEPTH,
                     goal_threshold=args.goal_threshold,
                     goal_yaw_threshold=args.goal_yaw_threshold,
                     post_goal_steps=args.post_goal_steps,
@@ -782,6 +804,8 @@ def main() -> None:
                 padded_actions[-1] = np.nan
 
                 offset, _ = append_rows(pixels_ds, trajectory["pixels"])
+                if depth_ds is not None:
+                    append_rows(depth_ds, trajectory["depth"])
                 append_rows(action_ds, padded_actions)
                 append_rows(obs_ds, trajectory["observation"])
                 append_rows(qpos_ds, trajectory["qpos"])
