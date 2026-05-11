@@ -23,8 +23,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_expert_train_preproc.h5"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_fixed_goal_30k.h5"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_withgreenT"
 FIXED_FRAMESKIP = 1
 
 
