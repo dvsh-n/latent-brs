@@ -37,7 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=1000)
-    parser.add_argument("--max-diffusion-steps", type=int, default=300)
     parser.add_argument("--max-mpc-steps", type=int, default=300)
     parser.add_argument("--horizon", type=int, default=25)
     parser.add_argument("--frame-batch-size", type=int, default=32)
@@ -446,56 +445,6 @@ class ILQRTrajectoryTracker:
         )
 
 
-def rollout_diffusion_reference(
-    *,
-    bundle: Any,
-    seed: int,
-    max_steps: int,
-    action_mode: str,
-    render_width: int,
-    render_height: int,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
-    env = make_pusht_env(
-        ENV_ID,
-        obs_type="pixels_agent_pos",
-        render_mode="rgb_array",
-        max_episode_steps=max_steps,
-        observation_width=render_width,
-        observation_height=render_height,
-        visualization_width=render_width,
-        visualization_height=render_height,
-    )
-    try:
-        bundle.policy.reset()
-        observation, _ = env.reset(seed=seed)
-        diffusion_frames = [np.asarray(env.render(), dtype=np.uint8)]
-        states = [extract_full_state(env)]
-        block_poses = [current_block_pose(env).copy()]
-        agent_positions = [current_agent_pos(env).copy()]
-        actions = []
-
-        for _ in tqdm(range(max_steps), desc="Diffusion rollout"):
-            action = select_expert_action(bundle, observation, env=env, action_mode=action_mode)
-            actions.append(np.asarray(action, dtype=np.float32).reshape(2))
-            observation, _, terminated, truncated, _ = env.step(action)
-            diffusion_frames.append(np.asarray(env.render(), dtype=np.uint8))
-            states.append(extract_full_state(env))
-            block_poses.append(current_block_pose(env).copy())
-            agent_positions.append(current_agent_pos(env).copy())
-            if terminated or truncated:
-                break
-    finally:
-        env.close()
-
-    ref_env = make_no_target_env(height=render_height, width=render_width, max_episode_steps=max_steps)
-    try:
-        reference_frames = [reset_env_to_state(ref_env, state).copy() for state in states]
-    finally:
-        ref_env.close()
-
-    return states, actions, diffusion_frames, reference_frames, block_poses, agent_positions
-
-
 def build_reference_markov_states(
     *,
     model: torch.nn.Module,
@@ -525,13 +474,67 @@ def build_reference_markov_states(
     return torch.stack(markov_states, dim=0)
 
 
-def reference_window(reference_states: torch.Tensor, start_idx: int, horizon: int) -> np.ndarray:
-    last = reference_states.shape[0] - 1
-    window = []
-    for offset in range(horizon + 1):
-        idx = min(start_idx + offset, last)
-        window.append(reference_states[idx])
-    return torch.stack(window, dim=0).detach().cpu().numpy().astype(np.float64)
+def rollout_diffusion_mpc_plan(
+    *,
+    bundle: Any,
+    start_state: np.ndarray,
+    horizon: int,
+    action_mode: str,
+    render_width: int,
+    render_height: int,
+) -> dict[str, list[np.ndarray]]:
+    plan_env = make_pusht_env(
+        ENV_ID,
+        obs_type="pixels_agent_pos",
+        render_mode="rgb_array",
+        max_episode_steps=max(horizon, 1),
+        observation_width=render_width,
+        observation_height=render_height,
+        visualization_width=render_width,
+        visualization_height=render_height,
+    )
+    no_target_render_env = make_no_target_env(height=render_height, width=render_width, max_episode_steps=max(horizon, 1))
+    try:
+        plan_env.reset(seed=0)
+        initial_visible_frame = reset_env_to_state(plan_env.unwrapped, start_state).copy()
+        initial_hidden_frame = reset_env_to_state(no_target_render_env, start_state).copy()
+        bundle.policy.reset()
+        observation = {
+            "pixels": initial_visible_frame,
+            "agent_pos": current_agent_pos(plan_env).copy(),
+        }
+
+        visible_frames = [initial_visible_frame]
+        hidden_frames = [initial_hidden_frame]
+        states = [np.asarray(start_state, dtype=np.float64).copy()]
+        block_poses = [current_block_pose(plan_env).copy()]
+        agent_positions = [current_agent_pos(plan_env).copy()]
+        actions_env = []
+
+        for _ in range(horizon):
+            action_env = select_expert_action(bundle, observation, env=plan_env, action_mode=action_mode)
+            actions_env.append(np.asarray(action_env, dtype=np.float32).reshape(2))
+            observation, _, terminated, truncated, _ = plan_env.step(action_env)
+            next_state = extract_full_state(plan_env)
+            visible_frames.append(np.asarray(plan_env.render(), dtype=np.uint8))
+            hidden_frames.append(reset_env_to_state(no_target_render_env, next_state).copy())
+            states.append(next_state)
+            block_poses.append(current_block_pose(plan_env).copy())
+            agent_positions.append(current_agent_pos(plan_env).copy())
+            if terminated or truncated:
+                break
+    finally:
+        no_target_render_env.close()
+        plan_env.close()
+
+    return {
+        "states": states,
+        "actions_env": actions_env,
+        "visible_frames": visible_frames,
+        "hidden_frames": hidden_frames,
+        "block_poses": block_poses,
+        "agent_positions": agent_positions,
+    }
 
 
 def main() -> None:
@@ -584,45 +587,29 @@ def main() -> None:
     out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    (
-        reference_states_raw,
-        diffusion_actions_env,
-        diffusion_frames,
-        reference_frames,
-        reference_block_poses,
-        reference_agent_positions,
-    ) = rollout_diffusion_reference(
-        bundle=diffusion_bundle,
-        seed=args.seed,
-        max_steps=args.max_diffusion_steps,
-        action_mode=args.action_mode,
-        render_width=img_size,
-        render_height=img_size,
+    init_env = make_pusht_env(
+        ENV_ID,
+        obs_type="pixels_agent_pos",
+        render_mode="rgb_array",
+        max_episode_steps=max(args.max_mpc_steps, 1),
+        observation_width=img_size,
+        observation_height=img_size,
+        visualization_width=img_size,
+        visualization_height=img_size,
     )
+    try:
+        init_env.reset(seed=args.seed)
+        start_state = extract_full_state(init_env)
+        start_visible_frame = np.asarray(init_env.render(), dtype=np.uint8)
+    finally:
+        init_env.close()
 
-    reference_markov = build_reference_markov_states(
-        model=model,
-        reference_frames=reference_frames,
-        device=device,
-        img_size=img_size,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
-        frame_batch_size=args.frame_batch_size,
-        markov_deriv=markov_deriv,
-    )
-    if int(reference_markov.shape[-1]) != markov_state_dim:
-        raise ValueError(
-            f"State dimension mismatch: config says {markov_state_dim}, built {reference_markov.shape[-1]}."
-        )
-
-    save_rgb_image(out_dir / "reference_start.png", reference_frames[0])
-    save_rgb_image(out_dir / "reference_goal.png", reference_frames[-1])
-    diffusion_video_path = save_rollout_video(diffusion_frames, out_dir / "diffusion_rollout.mp4", args.video_fps)
-    reference_video_path = save_rollout_video(reference_frames, out_dir / "reference_rollout_no_target.mp4", args.video_fps)
-
-    start_state = np.asarray(reference_states_raw[0], dtype=np.float64)
     track_env = make_no_target_env(height=img_size, width=img_size, max_episode_steps=args.max_mpc_steps)
     current_frame = reset_env_to_state(track_env, start_state)
+    initial_block_pose = current_block_pose(track_env).copy()
+    initial_agent_pos = current_agent_pos(track_env).copy()
+    save_rgb_image(out_dir / "start_visible.png", start_visible_frame)
+    save_rgb_image(out_dir / "start_tracking_frame.png", current_frame)
 
     dynamics = MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
     tracker = ILQRTrajectoryTracker(
@@ -650,25 +637,80 @@ def main() -> None:
     current_state = make_markov_state(current_history, markov_deriv)
 
     tracking_frames = [current_frame.copy()]
+    diffusion_plan_videos: list[str] = []
+    hidden_plan_videos: list[str] = []
+    first_reference_frames: list[np.ndarray] = [current_frame.copy()]
     executed_actions_norm: list[np.ndarray] = []
     executed_actions_raw: list[np.ndarray] = []
     executed_actions_env: list[np.ndarray] = []
+    diffusion_plan_actions_env: list[list[list[float]]] = []
+    diffusion_plan_states_raw: list[list[list[float]]] = []
+    diffusion_plan_block_poses: list[list[list[float]]] = []
+    diffusion_plan_agent_positions: list[list[list[float]]] = []
     solve_times_ms: list[float] = []
     ilqr_iterations: list[int] = []
     ilqr_costs: list[float] = []
-    latent_track_errors = [float(torch.linalg.vector_norm(current_state - reference_markov[0]).item())]
-    block_track_errors = [block_pose_distance(current_block_pose(track_env), reference_block_poses[0])]
+    latent_track_errors: list[float] = []
+    block_track_errors: list[float] = []
     stop_reason = "max_mpc_steps"
 
     try:
         pbar = tqdm(range(args.max_mpc_steps), desc="Tracking MPC")
         for step_idx in pbar:
-            if step_idx >= reference_markov.shape[0] - 1:
-                stop_reason = "reference_complete"
+            current_raw_state = extract_full_state(track_env)
+            diffusion_plan = rollout_diffusion_mpc_plan(
+                bundle=diffusion_bundle,
+                start_state=current_raw_state,
+                horizon=args.horizon,
+                action_mode=args.action_mode,
+                render_width=img_size,
+                render_height=img_size,
+            )
+            reference_markov = build_reference_markov_states(
+                model=model,
+                reference_frames=diffusion_plan["hidden_frames"],
+                device=device,
+                img_size=img_size,
+                pixel_mean=pixel_mean,
+                pixel_std=pixel_std,
+                frame_batch_size=args.frame_batch_size,
+                markov_deriv=markov_deriv,
+            )
+            if int(reference_markov.shape[-1]) != markov_state_dim:
+                raise ValueError(
+                    f"State dimension mismatch: config says {markov_state_dim}, built {reference_markov.shape[-1]}."
+                )
+
+            diffusion_plan_actions_env.append(
+                [np.asarray(action, dtype=np.float32).tolist() for action in diffusion_plan["actions_env"]]
+            )
+            diffusion_plan_states_raw.append([np.asarray(state, dtype=np.float64).tolist() for state in diffusion_plan["states"]])
+            diffusion_plan_block_poses.append(
+                [np.asarray(block_pose, dtype=np.float32).tolist() for block_pose in diffusion_plan["block_poses"]]
+            )
+            diffusion_plan_agent_positions.append(
+                [np.asarray(agent_pos, dtype=np.float32).tolist() for agent_pos in diffusion_plan["agent_positions"]]
+            )
+
+            if len(diffusion_plan["visible_frames"]) >= 2:
+                first_reference_frames.append(diffusion_plan["hidden_frames"][1].copy())
+            else:
+                first_reference_frames.append(diffusion_plan["hidden_frames"][0].copy())
+
+            if step_idx < 5:
+                diffusion_plan_videos.append(
+                    str(save_rollout_video(diffusion_plan["visible_frames"], out_dir / f"diffusion_plan_{step_idx:03d}.mp4", args.video_fps))
+                )
+                hidden_plan_videos.append(
+                    str(save_rollout_video(diffusion_plan["hidden_frames"], out_dir / f"hidden_plan_{step_idx:03d}.mp4", args.video_fps))
+                )
+
+            if reference_markov.shape[0] < 2:
+                stop_reason = "diffusion_plan_too_short"
                 break
 
             x0_np = current_state.detach().cpu().numpy().astype(np.float64)
-            x_ref_np = reference_window(reference_markov, step_idx, args.horizon)
+            x_ref_np = reference_markov.detach().cpu().numpy().astype(np.float64)
             _, u_plan, solve_time, n_iters, plan_cost = tracker.solve(x0_np, x_ref_np)
             solve_times_ms.append(solve_time * 1000.0)
             ilqr_iterations.append(int(n_iters))
@@ -695,9 +737,9 @@ def main() -> None:
             current_history = current_history[-history_len:]
             current_state = make_markov_state(current_history, markov_deriv)
 
-            ref_idx = min(step_idx + 1, len(reference_block_poses) - 1)
+            ref_idx = min(1, reference_markov.shape[0] - 1)
             latent_error = float(torch.linalg.vector_norm(current_state - reference_markov[ref_idx]).item())
-            block_error = block_pose_distance(current_block_pose(track_env), reference_block_poses[ref_idx])
+            block_error = block_pose_distance(current_block_pose(track_env), diffusion_plan["block_poses"][ref_idx])
             latent_track_errors.append(latent_error)
             block_track_errors.append(block_error)
             tracking_frames.append(current_frame.copy())
@@ -719,6 +761,7 @@ def main() -> None:
         track_env.close()
 
     tracking_video_path = save_rollout_video(tracking_frames, out_dir / "tracking_rollout.mp4", args.video_fps)
+    reference_preview_path = save_rollout_video(first_reference_frames, out_dir / "reference_first_step_preview.mp4", args.video_fps)
 
     metrics = {
         "seed": args.seed,
@@ -729,30 +772,30 @@ def main() -> None:
         "markov_deriv": markov_deriv,
         "markov_state_dim": markov_state_dim,
         "horizon": args.horizon,
-        "max_diffusion_steps": args.max_diffusion_steps,
         "max_mpc_steps": args.max_mpc_steps,
         "stop_reason": stop_reason,
-        "num_reference_frames": len(reference_frames),
         "num_tracking_steps": len(executed_actions_env),
         "env_action_scale": ENV_ACTION_SCALE,
-        "reference_initial_block_pose": np.asarray(reference_block_poses[0]).tolist(),
-        "reference_final_block_pose": np.asarray(reference_block_poses[-1]).tolist(),
+        "initial_block_pose": initial_block_pose.tolist(),
+        "initial_agent_pos": initial_agent_pos.tolist(),
+        "start_state_raw": np.asarray(start_state, dtype=np.float64).tolist(),
         "final_block_pose": final_block_pose.tolist(),
-        "reference_initial_agent_pos": np.asarray(reference_agent_positions[0]).tolist(),
-        "reference_final_agent_pos": np.asarray(reference_agent_positions[-1]).tolist(),
         "final_agent_pos": final_agent_pos.tolist(),
         "latent_track_errors": latent_track_errors,
         "block_track_errors": block_track_errors,
         "solve_times_ms": solve_times_ms,
         "ilqr_iterations": ilqr_iterations,
         "ilqr_costs": ilqr_costs,
-        "diffusion_actions_env": [action.tolist() for action in diffusion_actions_env],
+        "diffusion_plan_actions_env": diffusion_plan_actions_env,
+        "diffusion_plan_states_raw": diffusion_plan_states_raw,
+        "diffusion_plan_block_poses": diffusion_plan_block_poses,
+        "diffusion_plan_agent_positions": diffusion_plan_agent_positions,
         "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
         "executed_actions_raw": [action.tolist() for action in executed_actions_raw],
         "executed_actions_env": [action.tolist() for action in executed_actions_env],
-        "reference_states_raw": [np.asarray(state).tolist() for state in reference_states_raw],
-        "diffusion_video_path": str(diffusion_video_path),
-        "reference_video_path": str(reference_video_path),
+        "diffusion_plan_videos": diffusion_plan_videos,
+        "hidden_plan_videos": hidden_plan_videos,
+        "reference_preview_path": str(reference_preview_path),
         "tracking_video_path": str(tracking_video_path),
     }
     metrics_path = out_dir / "metrics.json"
@@ -764,10 +807,9 @@ def main() -> None:
             {
                 "seed": args.seed,
                 "stop_reason": stop_reason,
-                "num_reference_frames": len(reference_frames),
                 "num_tracking_steps": len(executed_actions_env),
-                "latent_track_error_final": latent_track_errors[-1],
-                "block_track_error_final": block_track_errors[-1],
+                "latent_track_error_final": latent_track_errors[-1] if latent_track_errors else None,
+                "block_track_error_final": block_track_errors[-1] if block_track_errors else None,
                 "metrics_path": str(metrics_path),
                 "tracking_video_path": str(tracking_video_path),
             },
