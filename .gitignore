@@ -1,6 +1,7 @@
 latent_brs_venv/
 temp_venv/
 /.codex
+/.agents
 .vscode/
 .claude/
 reacher/models/reacher-v5-sac-expert/
@@ -16,6 +17,7 @@ reacher/models/lewm_reacher*/
 *.mp4
 *.png
 *.pkl
+*.gif
 *.z**
 **/runs/
 **/__pycache__/

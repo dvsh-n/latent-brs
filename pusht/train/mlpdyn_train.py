@@ -23,8 +23,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_fixed_goal_30k.h5"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn_withgreenT"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_withgreenT_1"
 FIXED_FRAMESKIP = 1
 
 
@@ -40,19 +40,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=48)
-    parser.add_argument("--markov-deriv", type=int, default=1)
-    parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
+    parser.add_argument("--markov-deriv", type=int, default=2)
+    parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
     parser.add_argument("--predictor-depth", type=int, default=3)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.009)
+    parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
-    parser.add_argument("--straighten-weight", type=float, default=1e-2)
+    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten-weight", type=float, default=1e-3)
 
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=120)
@@ -146,11 +146,8 @@ class LeWMPushTDataset(Dataset):
         pixels_np = np.asarray(h5["pixels"][pixel_rows], dtype=np.uint8)
         pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
         if self.markov_deriv > 0:
-            prev_offsets = np.arange(self.markov_deriv, 0, -1, dtype=np.int64) * self.frameskip
-            prev_rows = int(self.ep_offset[ep_idx]) + np.maximum(start - prev_offsets, 0)
-            # h5py fancy indexing requires strictly increasing indices; boundary padding can repeat rows.
-            prev_pixels_np = np.stack([np.asarray(h5["pixels"][int(row)], dtype=np.uint8) for row in prev_rows], axis=0)
-            prev_pixels = torch.from_numpy(prev_pixels_np).permute(0, 3, 1, 2).contiguous()
+            # Causal boundary handling: each sampled window starts from its own first frame.
+            prev_pixels = pixels[:1].repeat(self.markov_deriv, 1, 1, 1)
         else:
             prev_pixels = pixels[:0].clone()
 
@@ -221,10 +218,15 @@ def build_markov_state(history_emb: torch.Tensor, markov_deriv: int) -> torch.Te
         history_emb = history_emb.unsqueeze(0)
         squeeze = True
     context_len = required_markov_history(markov_deriv)
-    if history_emb.ndim != 3 or history_emb.shape[1] < context_len:
+    if history_emb.ndim != 3:
         raise ValueError(
-            f"Expected history_emb with shape [batch, >= {context_len}, dim], got {tuple(history_emb.shape)}."
+            f"Expected history_emb with shape [batch, time, dim], got {tuple(history_emb.shape)}."
         )
+    if history_emb.shape[1] < 1:
+        raise ValueError("history_emb must contain at least one frame.")
+    if history_emb.shape[1] < context_len:
+        pad = history_emb[:, :1].expand(-1, context_len - history_emb.shape[1], -1)
+        history_emb = torch.cat((pad, history_emb), dim=1)
     deriv_seq = history_emb[:, -context_len:]
     components = [deriv_seq[:, -1]]
     for _ in range(markov_deriv):
@@ -273,10 +275,7 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
         pred_state = self.model.predict(ctx_state, ctx_act)[:, 0]
         pred_next = pred_state[..., :embed_dim]
         tgt_next = emb[:, step + 1]
-        if args.markov_deriv > 0:
-            tgt_history = torch.cat((emb[:, step + 1 - args.markov_deriv : step + 1], tgt_next.unsqueeze(1)), dim=1)
-        else:
-            tgt_history = tgt_next.unsqueeze(1)
+        tgt_history = emb[:, : step + 2]
         tgt_state = build_markov_state(tgt_history, args.markov_deriv)
         pred_losses.append((pred_state - tgt_state).pow(2).mean())
         pred_embs.append(pred_next)

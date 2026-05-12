@@ -25,11 +25,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obs-type", default="pixels_agent_pos")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--episodes", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=300)
-    parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--video-name", default="diffusion_plan.mp4")
     parser.add_argument("--action-mode", default="auto", choices=["auto", "absolute", "relative"])
+    parser.add_argument(
+        "--control-interval",
+        type=int,
+        default=3,
+        help="Query the policy every N env steps and hold the last action in between.",
+    )
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--display", action="store_true")
     return parser.parse_args()
@@ -67,6 +72,9 @@ def extract_goal_pose(env) -> list[float] | None:
 
 
 def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[str, object]:
+    if args.control_interval < 1:
+        raise ValueError("--control-interval must be >= 1.")
+
     env = make_pusht_env(
         args.env_id,
         obs_type=args.obs_type,
@@ -74,23 +82,29 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
         max_episode_steps=args.max_steps,
     )
     bundle.policy.reset()
-    observation, info = env.reset(seed=args.seed + episode_idx)
+    observation, info = env.reset()
 
     frames = [render_frame(env)]
     total_reward = 0.0
     success = False
     steps = 0
+    control_updates = 0
+    action = None
 
-    for _ in trange(args.max_steps, desc=f"episode {episode_idx}", unit="step"):
-        action = select_expert_action(bundle, observation, env=env, action_mode=args.action_mode)
+    for step_idx in trange(args.max_steps, desc=f"episode {episode_idx}", unit="step"):
+        if action is None or step_idx % args.control_interval == 0:
+            action = select_expert_action(bundle, observation, env=env, action_mode=args.action_mode)
+            control_updates += 1
+
         next_observation, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
         success = bool(terminated or info.get("is_success", False) or info.get("success", False))
         steps += 1
 
-        frame = render_frame(env)
-        frames.append(frame)
-        maybe_display(frame, args.display)
+        if steps % args.control_interval == 0 or terminated or truncated:
+            frame = render_frame(env)
+            frames.append(frame)
+            maybe_display(frame, args.display)
 
         observation = next_observation
         if terminated or truncated:
@@ -100,6 +114,7 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     final_agent_pos = get_pusht_agent_pos(env).tolist()
     goal_pose = extract_goal_pose(env)
     env.close()
+    stored_steps = len(frames)
 
     video_path = None
     if not args.no_video:
@@ -109,8 +124,9 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
 
     return {
         "episode": episode_idx,
-        "seed": args.seed + episode_idx,
-        "steps": steps,
+        "env_steps": steps,
+        "stored_steps": stored_steps,
+        "control_updates": control_updates,
         "total_reward": total_reward,
         "success": success,
         "goal_pose": goal_pose,
@@ -134,7 +150,9 @@ def main() -> None:
 
     for result in results:
         print(
-            f"episode={result['episode']} steps={result['steps']} reward={result['total_reward']:.3f} "
+            f"episode={result['episode']} stored_steps={result['stored_steps']} "
+            f"env_steps={result['env_steps']} control_updates={result['control_updates']} "
+            f"reward={result['total_reward']:.3f} "
             f"success={result['success']} video={result['video_path']}"
         )
     print(f"Saved metrics to {metrics_path}")

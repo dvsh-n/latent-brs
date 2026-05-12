@@ -19,3 +19,6 @@
 [submodule "third_party/ogbench"]
 	path = third_party/ogbench
 	url = https://github.com/seohongpark/ogbench.git
+[submodule "third_party/stable-worldmodel"]
+	path = third_party/stable-worldmodel
+	url = https://github.com/galilai-group/stable-worldmodel.git
