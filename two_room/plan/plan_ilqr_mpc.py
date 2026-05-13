@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 """Plan in Two Room pixel space with nominal iLQR MPC over a Markov-state MLP world model."""
 
 from __future__ import annotations
