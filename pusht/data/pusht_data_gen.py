@@ -14,6 +14,11 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
+try:
+    import hdf5plugin
+except ModuleNotFoundError:
+    hdf5plugin = None
+
 from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env
 from pusht.shared.utils import env_action_from_policy_action, load_expert_policy_bundle
 
@@ -42,6 +47,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--async-envs", action="store_true", default=True)
     parser.add_argument("--keep-failures", action="store_true", default=True)
     parser.add_argument("--hide-target", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--pixel-compression",
+        choices=("blosc", "lzf", "gzip", "none"),
+        default="lzf",
+        help="Compression for stored pixel frames.",
+    )
+    parser.add_argument(
+        "--pixel-chunk-frames",
+        type=int,
+        default=100,
+        help="Number of frames per pixels chunk in the output HDF5.",
+    )
     return parser.parse_args()
 
 
@@ -158,9 +175,11 @@ def _policy_action_to_relative_action(policy_action: np.ndarray, agent_pos: np.n
 
 
 class H5EpisodeWriter:
-    def __init__(self, out_path: Path):
+    def __init__(self, out_path: Path, *, pixel_compression: str, pixel_chunk_frames: int):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         self.out_path = out_path
+        self.pixel_compression = pixel_compression
+        self.pixel_chunk_frames = pixel_chunk_frames
         self.num_episodes = 0
         self.num_frames = 0
         self.h5 = h5py.File(out_path, "w")
@@ -172,6 +191,25 @@ class H5EpisodeWriter:
         self.h5.create_dataset("episode_idx", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=True)
         self.h5.create_dataset("step_idx", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=True)
 
+    def _pixel_create_kwargs(self, image_shape: tuple[int, int, int]) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"chunks": (self.pixel_chunk_frames, *image_shape)}
+        if self.pixel_compression == "none":
+            return kwargs
+        if self.pixel_compression == "lzf":
+            return {**kwargs, "compression": "lzf"}
+        if self.pixel_compression == "gzip":
+            return {**kwargs, "compression": "gzip", "compression_opts": 4, "shuffle": True}
+        if hdf5plugin is None:
+            raise ModuleNotFoundError("Install hdf5plugin or use --pixel-compression lzf/gzip/none.")
+        return {
+            **kwargs,
+            **hdf5plugin.Blosc(
+                cname="lz4",
+                clevel=5,
+                shuffle=hdf5plugin.Blosc.SHUFFLE,
+            ),
+        }
+
     def _ensure_pixels_dataset(self, image_shape: tuple[int, int, int]) -> None:
         if "pixels" in self.h5:
             return
@@ -180,7 +218,7 @@ class H5EpisodeWriter:
             shape=(0, *image_shape),
             maxshape=(None, *image_shape),
             dtype=np.uint8,
-            chunks=(1, *image_shape),
+            **self._pixel_create_kwargs(image_shape),
         )
 
     def append_episodes(
@@ -379,11 +417,17 @@ def main() -> None:
         raise ValueError("--control-interval must be >= 1.")
     if args.num_envs < 1:
         raise ValueError("--num-envs must be >= 1.")
+    if args.pixel_chunk_frames < 1:
+        raise ValueError("--pixel-chunk-frames must be >= 1.")
     if args.out.exists():
         raise FileExistsError(f"Output already exists: {args.out}")
 
     bundle = load_expert_policy_bundle(args.model_dir, device=args.device)
-    writer = H5EpisodeWriter(args.out)
+    writer = H5EpisodeWriter(
+        args.out,
+        pixel_compression=args.pixel_compression,
+        pixel_chunk_frames=args.pixel_chunk_frames,
+    )
     env = make_vector_env(args)
     action_space = getattr(env, "single_action_space", getattr(env, "action_space", None))
     saved = 0

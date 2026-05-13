@@ -25,17 +25,17 @@ from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, prepr
 DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
 DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_withgreenT_1"
 DEFAULT_OUT_DIR = "pusht/eval/mlpdyn_eval"
-DEFAULT_START_TIMESTEP = 25
+DEFAULT_START_TIMESTEP = 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
-    parser.add_argument("--checkpoint", type=Path, default="pusht/models/mlpdyn_withgreenT_1/mlpdyn_epoch_5_object.ckpt")
+    parser.add_argument("--checkpoint", type=Path, default="pusht/models/mlpdyn_withgreenT_1/mlpdyn_epoch_7_object.ckpt")
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--episode-idx", type=int, default=9838)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--markov-deriv", type=int, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
     parser.add_argument("--frameskip", type=int, default=None)
