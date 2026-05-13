@@ -24,28 +24,26 @@ if str(REPO_ROOT) not in sys.path:
 from two_room.shared import TwoRoomLayout, make_two_room_env, reset_two_room_env_to_state
 
 
-DEFAULT_TEST_DATASET_PATH = "two_room/data/test_data/two_room_test.h5"
 DEFAULT_MODEL_DIR = "two_room/models/mlpdyn"
 DEFAULT_OUT_DIR = "two_room/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-HORIZON = 35
+SAME_ROOM = True
+HORIZON = 25
 MAX_MPC_STEPS = 120
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
+DELTA_Q_SCALE = 1e-3
 VIDEO_FPS = 10
-EPISODE_IDX = None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=Path(DEFAULT_MODEL_DIR))
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--episode-idx", type=int, default=EPISODE_IDX)
     parser.add_argument("--horizon", type=int, default=HORIZON)
     parser.add_argument("--max-mpc-steps", type=int, default=MAX_MPC_STEPS)
     parser.add_argument("--frame-batch-size", type=int, default=32)
@@ -53,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-terminal", type=float, default=Q_TERMINAL)
     parser.add_argument("--q-stage", type=float, default=Q_STAGE)
     parser.add_argument("--r-control", type=float, default=R_CONTROL)
-    parser.add_argument("--ilqr-max-iters", type=int, default=15)
+    parser.add_argument("--ilqr-max-iters", type=int, default=50)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=None)
@@ -192,44 +190,34 @@ def load_action_stats(dataset_path: Path, action_dim: int) -> tuple[np.ndarray, 
     return action_mean, np.maximum(action_std, 1e-6)
 
 
-def load_dataset_episode(dataset_path: Path, episode_idx: int) -> dict[str, np.ndarray | int | float | bool]:
-    with h5py.File(dataset_path, "r") as h5:
-        ep_len = int(h5["ep_len"][episode_idx])
-        ep_offset = int(h5["ep_offset"][episode_idx])
-        rows = np.arange(ep_offset, ep_offset + ep_len, dtype=np.int64)
-        return {
-            "pixels": np.asarray(h5["pixels"][rows], dtype=np.uint8),
-            "action": np.asarray(h5["action"][rows], dtype=np.float32),
-            "observation": np.asarray(h5["observation"][rows], dtype=np.float32),
-            "state": np.asarray(h5["state"][rows], dtype=np.float32),
-            "goal_state": np.asarray(h5["goal_state"][rows], dtype=np.float32),
-            "wall_axis": np.asarray(h5["wall_axis"][rows], dtype=np.int64),
-            "wall_thickness": np.asarray(h5["wall_thickness"][rows], dtype=np.int64),
-            "door_positions": np.asarray(h5["door_positions"][rows], dtype=np.float32),
-            "door_sizes": np.asarray(h5["door_sizes"][rows], dtype=np.float32),
-            "episode_seed": int(h5["episode_seed"][episode_idx]),
-            "agent_speed": float(h5.attrs.get("agent_speed", 5.0)),
-            "success_distance": float(h5.attrs.get("success_distance", 16.0)),
-            "render_target": bool(h5.attrs.get("render_target", False)),
-            "height": int(h5["pixels"].shape[1]),
-            "width": int(h5["pixels"].shape[2]),
-        }
+def room_side(state: np.ndarray, wall_axis: int) -> int:
+    room_idx = 0 if wall_axis == 1 else 1
+    return int(float(state[room_idx]) >= 112.0)
 
 
-def make_episode_layout(episode: dict[str, np.ndarray | int | float | bool]) -> TwoRoomLayout:
-    wall_axis = int(np.asarray(episode["wall_axis"])[0, 0])
-    wall_thickness = int(np.asarray(episode["wall_thickness"])[0, 0])
-    door_positions_all = np.asarray(episode["door_positions"])[0]
-    door_sizes_all = np.asarray(episode["door_sizes"])[0]
-    valid = door_sizes_all > 0
-    door_positions = tuple(float(v) for v in door_positions_all[valid])
-    door_sizes = tuple(float(v) for v in door_sizes_all[valid])
-    return TwoRoomLayout(
-        wall_axis=wall_axis,
-        wall_thickness=wall_thickness,
-        door_positions=door_positions,
-        door_sizes=door_sizes,
-    )
+def sample_start_and_goal(
+    env,
+    *,
+    same_room: bool,
+    seed: int | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    _, info = env.reset(seed=seed)
+    start_state = np.asarray(info["state"], dtype=np.float32)
+    goal_state = np.asarray(info["goal_state"], dtype=np.float32)
+
+    if same_room:
+        start_side = room_side(start_state, env.wall_axis)
+        for _ in range(256):
+            candidate = env._sample_position_in_room(start_side)
+            if float(np.linalg.norm(candidate - start_state)) > max(env.SUCCESS_DISTANCE * 1.5, env.agent_speed * 2.0):
+                goal_state = np.asarray(candidate, dtype=np.float32)
+                break
+        else:
+            goal_state = np.asarray(env._sample_position_in_room(start_side), dtype=np.float32)
+        env.set_goal_state(goal_state)
+
+    frame = reset_two_room_env_to_state(env, start_state, goal_state=goal_state)
+    return start_state, goal_state, frame
 
 
 def goal_reached(current_state: np.ndarray, goal_state: np.ndarray, threshold: float) -> tuple[bool, float]:
@@ -289,6 +277,12 @@ class ILQRMPCSolver:
         self.prev_u_guess = torch.zeros((self.horizon, self.action_dim), dtype=torch.float32, device=device)
         self.eye_x = torch.eye(self.state_dim, dtype=torch.float32, device=device)
         self.eye_u = torch.eye(self.action_dim, dtype=torch.float32, device=device)
+        half_state_dim = self.state_dim // 2
+        if 2 * half_state_dim != self.state_dim:
+            raise ValueError(f"Expected an even Markov state dimension, got {self.state_dim}.")
+        q_diag = torch.ones(self.state_dim, dtype=torch.float32, device=device)
+        q_diag[half_state_dim:] = DELTA_Q_SCALE
+        self.q_state = torch.diag(q_diag)
         self.line_search_alphas = (1.0, 0.5, 0.25, 0.1, 0.05, 0.01)
 
     def _make_initial_action_guess(self) -> torch.Tensor:
@@ -312,10 +306,10 @@ class ILQRMPCSolver:
         cost = torch.zeros((), dtype=x_traj.dtype, device=x_traj.device)
         for step in range(self.horizon):
             state_err = x_traj[step] - x_goal
-            cost = cost + self.q_stage * torch.dot(state_err, state_err)
+            cost = cost + self.q_stage * (state_err @ self.q_state @ state_err)
             cost = cost + self.r_control * torch.dot(u_seq[step], u_seq[step])
         terminal_err = x_traj[self.horizon] - x_goal
-        cost = cost + self.q_terminal * torch.dot(terminal_err, terminal_err)
+        cost = cost + self.q_terminal * (terminal_err @ self.q_state @ terminal_err)
         return cost
 
     def _linearize_dynamics(self, x_traj: torch.Tensor, u_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -355,8 +349,8 @@ class ILQRMPCSolver:
             kk_seq = torch.empty((self.horizon, self.action_dim, self.state_dim), dtype=torch.float32, device=self.device)
 
             terminal_err = x_traj[self.horizon] - x_goal
-            v_x = 2.0 * self.q_terminal * terminal_err
-            v_xx = 2.0 * self.q_terminal * self.eye_x
+            v_x = 2.0 * self.q_terminal * (self.q_state @ terminal_err)
+            v_xx = 2.0 * self.q_terminal * self.q_state
             backward_ok = True
 
             for step in range(self.horizon - 1, -1, -1):
@@ -365,9 +359,9 @@ class ILQRMPCSolver:
                 a = a_seq[step]
                 b = b_seq[step]
 
-                l_x = 2.0 * self.q_stage * x_err
+                l_x = 2.0 * self.q_stage * (self.q_state @ x_err)
                 l_u = 2.0 * self.r_control * u
-                l_xx = 2.0 * self.q_stage * self.eye_x
+                l_xx = 2.0 * self.q_stage * self.q_state
                 l_uu = 2.0 * self.r_control * self.eye_u
 
                 q_x = l_x + a.T @ v_x
@@ -444,7 +438,6 @@ def main() -> None:
     args = parse_args()
     device = require_device(args.device)
     model_dir = args.model_dir.expanduser().resolve()
-    dataset_path = args.dataset_path.expanduser().resolve()
     out_root = args.out_dir.expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -465,45 +458,27 @@ def main() -> None:
     embed_dim = int(config.get("embed_dim", 24))
     markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
 
-    train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
+    train_dataset_path = Path(str(config["dataset_path"])).expanduser().resolve()
     action_mean, action_std = load_action_stats(train_dataset_path, action_dim)
+    sample_seed = args.seed
+    layout = TwoRoomLayout()
+    probe_env = make_two_room_env(render_mode="rgb_array", render_target=False, layout=layout)
+    height = int(probe_env.IMG_SIZE)
+    width = int(probe_env.IMG_SIZE)
+    success_distance = float(probe_env.SUCCESS_DISTANCE)
+    probe_env.close()
 
-    with h5py.File(dataset_path, "r") as h5:
-        ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
-    valid_episodes = np.flatnonzero(ep_len >= 1)
-    if valid_episodes.size == 0:
-        raise ValueError("Need at least one test trajectory with 1 or more frames.")
-
-    rng = np.random.default_rng(args.seed)
-    if args.episode_idx is None:
-        episode_idx = int(rng.choice(valid_episodes))
-    else:
-        episode_idx = int(args.episode_idx)
-        if episode_idx < 0 or episode_idx >= ep_len.shape[0]:
-            raise ValueError(f"--episode-idx must be in [0, {ep_len.shape[0] - 1}], got {episode_idx}.")
-        if ep_len[episode_idx] < 1:
-            raise ValueError(f"--episode-idx {episode_idx} must have at least 1 frame, got {ep_len[episode_idx]}.")
-
-    episode = load_dataset_episode(dataset_path, episode_idx)
-    state_np = np.asarray(episode["state"], dtype=np.float32)
-    goal_state_np = np.asarray(episode["goal_state"], dtype=np.float32)
-    start_state = state_np[0]
-    goal_state = goal_state_np[0]
-    height = int(episode["height"])
-    width = int(episode["width"])
-    success_distance = float(episode["success_distance"])
-
-    run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
+    run_name = f"{int(time.time())}_sampled"
     out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env = make_two_room_env(
         render_mode="rgb_array",
-        render_target=bool(episode["render_target"]),
-        agent_speed=float(episode["agent_speed"]),
-        layout=make_episode_layout(episode),
+        render_target=False,
+        agent_speed=5.0,
+        layout=layout,
     )
-    start_frame = reset_two_room_env_to_state(env, start_state, goal_state=goal_state)
+    start_state, goal_state, start_frame = sample_start_and_goal(env, same_room=SAME_ROOM, seed=sample_seed)
     goal_frame = reset_two_room_env_to_state(env, goal_state, goal_state=goal_state)
     current_frame = reset_two_room_env_to_state(env, start_state, goal_state=goal_state)
 
@@ -597,10 +572,11 @@ def main() -> None:
 
     video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
     metrics = {
-        "episode_idx": episode_idx,
-        "episode_seed": int(episode["episode_seed"]),
+        "episode_idx": None,
+        "sample_seed": sample_seed,
         "checkpoint_path": str(checkpoint_path),
-        "dataset_path": str(dataset_path),
+        "dataset_path": str(train_dataset_path),
+        "same_room": bool(SAME_ROOM),
         "start_state": start_state.tolist(),
         "goal_state": goal_state.tolist(),
         "final_state": current_state.tolist(),

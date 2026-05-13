@@ -31,7 +31,7 @@ DEFAULT_START_TIMESTEP = 0
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
-    parser.add_argument("--checkpoint", type=Path, default="pusht/models/mlpdyn_withgreenT_1/mlpdyn_epoch_2_object.ckpt")
+    parser.add_argument("--checkpoint", type=Path, default="pusht/models/mlpdyn_withgreenT_1/mlpdyn_epoch_16_object.ckpt")
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--episode-idx", type=int, default=9838)
