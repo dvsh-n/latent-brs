@@ -12,6 +12,7 @@ from pathlib import Path, PosixPath
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import h5py
+import hdf5plugin  # noqa: F401
 import lightning as pl
 import numpy as np
 import stable_pretraining as spt
@@ -23,8 +24,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_expert_train.h5"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn_withgreenT_2"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_lewm_dataset"
 FIXED_FRAMESKIP = 1
 
 
@@ -48,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictor-depth", type=int, default=3)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.005)
+    parser.add_argument("--sigreg-weight", type=float, default=0.009)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
     parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")

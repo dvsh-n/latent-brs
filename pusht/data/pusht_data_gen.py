@@ -19,11 +19,16 @@ try:
 except ModuleNotFoundError:
     hdf5plugin = None
 
+from pusht.plan.random_spline_plan import RandomSplineController
+from pusht.plan.random_spline_plan import DEFAULT_SPLINE_SAMPLING_ATTEMPTS
 from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env
 from pusht.shared.utils import env_action_from_policy_action, load_expert_policy_bundle
 
 DEFAULT_MODEL_DIR = Path("pusht/models")
-DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_diffusion_train.h5")
+DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_train.h5")
+ROLLOUT_MODES = ("expert", "expert_plus_noise", "random_spline")
+RATIOS = (0.4, 0.2, 0.4)  # expert, expert_plus_noise, random_spline
+DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500, 250)
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,9 +37,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--env-id", default=DEFAULT_PUSHT_ENV_ID)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    parser.add_argument("--num-episodes", type=int, default=10_000)
+    parser.add_argument("--num-episodes", type=int, default=20_000)
     parser.add_argument("--start-seed", type=int, default=0)
-    parser.add_argument("--episode-length", type=int, default=500)
+    parser.add_argument(
+        "--max-steps-expert",
+        type=int,
+        default=DEFAULT_MAX_ENV_STEPS_BY_MODE[0],
+        help="Max env steps for expert rollouts.",
+    )
+    parser.add_argument(
+        "--max-steps-expert-noisy",
+        type=int,
+        default=DEFAULT_MAX_ENV_STEPS_BY_MODE[1],
+        help="Max env steps for expert_plus_noise rollouts.",
+    )
+    parser.add_argument(
+        "--max-steps-random-spline",
+        type=int,
+        default=DEFAULT_MAX_ENV_STEPS_BY_MODE[2],
+        help="Max env steps for random_spline rollouts.",
+    )
     parser.add_argument("--image-height", type=int, default=224)
     parser.add_argument("--image-width", type=int, default=224)
     parser.add_argument(
@@ -47,6 +69,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--async-envs", action="store_true", default=True)
     parser.add_argument("--keep-failures", action="store_true", default=True)
     parser.add_argument("--hide-target", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--expert-noise-std", type=float, default=0.2)
+    parser.add_argument("--num-spline-points", type=int, default=80)
+    parser.add_argument("--circle-min-radius", type=float, default=45.0)
+    parser.add_argument("--circle-max-radius", type=float, default=85.0)
+    parser.add_argument("--min-angle-separation-deg", type=float, default=30.0)
+    parser.add_argument("--angle-jitter-deg", type=float, default=60.0)
+    parser.add_argument(
+        "--spline-sampling-attempts",
+        type=int,
+        default=DEFAULT_SPLINE_SAMPLING_ATTEMPTS,
+        help="How many times to resample random-spline geometry before giving up.",
+    )
+    parser.add_argument("--waypoint-tol", type=float, default=18.0)
+    parser.add_argument("--kp", type=float, default=1.0)
+    parser.add_argument("--kd", type=float, default=0.18)
+    parser.add_argument("--max-action-delta", type=float, default=80.0)
     parser.add_argument(
         "--pixel-compression",
         choices=("blosc", "lzf", "gzip", "none"),
@@ -174,6 +212,104 @@ def _policy_action_to_relative_action(policy_action: np.ndarray, agent_pos: np.n
     return np.clip((policy_action - agent_pos) / 100.0, -1.0, 1.0).astype(np.float32)
 
 
+def _rollout_probabilities(args: argparse.Namespace) -> np.ndarray:
+    ratios = np.asarray(RATIOS, dtype=np.float64)
+    if ratios.shape != (len(ROLLOUT_MODES),):
+        raise ValueError(f"RATIOS must have length {len(ROLLOUT_MODES)}.")
+    if np.any(ratios < 0.0):
+        raise ValueError("Rollout ratios cannot be negative.")
+    total = float(ratios.sum())
+    if total <= 0.0:
+        raise ValueError("At least one rollout ratio must be positive.")
+    return ratios / total
+
+
+def _sample_rollout_modes(args: argparse.Namespace, rng: np.random.Generator, count: int) -> list[str]:
+    return [str(mode) for mode in rng.choice(ROLLOUT_MODES, size=count, p=_rollout_probabilities(args))]
+
+
+def _mode_max_steps(args: argparse.Namespace, mode: str) -> int:
+    mapping = {
+        "expert": args.max_steps_expert,
+        "expert_plus_noise": args.max_steps_expert_noisy,
+        "random_spline": args.max_steps_random_spline,
+    }
+    return int(mapping[mode])
+
+
+def _max_episode_steps(args: argparse.Namespace) -> int:
+    return max(_mode_max_steps(args, mode) for mode in ROLLOUT_MODES)
+
+
+def _clip_action_to_space(actions: np.ndarray, action_space: gym.Space | None) -> np.ndarray:
+    if action_space is None:
+        return np.asarray(actions, dtype=np.float32)
+    high = np.asarray(getattr(action_space, "high", None))
+    low = np.asarray(getattr(action_space, "low", None))
+    if high.shape != actions.shape[1:] or low.shape != actions.shape[1:]:
+        return np.asarray(actions, dtype=np.float32)
+    return np.clip(actions, low, high).astype(np.float32)
+
+
+def _apply_expert_noise(
+    expert_env_action: np.ndarray,
+    agent_pos: np.ndarray,
+    action_space: gym.Space | None,
+    rng: np.random.Generator,
+    noise_std: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    noise = rng.normal(loc=0.0, scale=noise_std, size=expert_env_action.shape).astype(np.float32)
+    noisy_env_action = _clip_action_to_space(expert_env_action[None, :] + noise[None, :], action_space)[0]
+
+    if action_space is not None:
+        high = np.asarray(getattr(action_space, "high", None))
+        low = np.asarray(getattr(action_space, "low", None))
+        if high.shape == (2,) and low.shape == (2,) and np.all(high <= 1.0) and np.all(low >= -1.0):
+            return noisy_env_action, noisy_env_action.copy()
+
+    noisy_logged_action = _policy_action_to_relative_action(
+        noisy_env_action,
+        np.asarray(agent_pos, dtype=np.float32),
+    )
+    return noisy_env_action, noisy_logged_action
+
+
+def _make_random_spline_controller(
+    args: argparse.Namespace,
+    raw_observation: dict[str, Any],
+    rng: np.random.Generator,
+) -> RandomSplineController:
+    return RandomSplineController.from_observation(
+        raw_observation,
+        rng=rng,
+        num_points=args.num_spline_points,
+        circle_min_radius=args.circle_min_radius,
+        circle_max_radius=args.circle_max_radius,
+        min_angle_separation_deg=args.min_angle_separation_deg,
+        angle_jitter_deg=args.angle_jitter_deg,
+        waypoint_tol=args.waypoint_tol,
+        kp=args.kp,
+        kd=args.kd,
+        max_action_delta=args.max_action_delta,
+        spline_sampling_attempts=args.spline_sampling_attempts,
+    )
+
+
+def _relative_action_to_env_action(
+    relative_action: np.ndarray,
+    agent_pos: np.ndarray,
+    action_space: gym.Space | None,
+) -> np.ndarray:
+    env_action = np.asarray(agent_pos, dtype=np.float32) + 100.0 * np.asarray(relative_action, dtype=np.float32)
+    if action_space is None:
+        return env_action.astype(np.float32)
+    high = np.asarray(getattr(action_space, "high", None))
+    low = np.asarray(getattr(action_space, "low", None))
+    if high.shape != env_action.shape or low.shape != env_action.shape:
+        return env_action.astype(np.float32)
+    return np.clip(env_action, low, high).astype(np.float32)
+
+
 class H5EpisodeWriter:
     def __init__(self, out_path: Path, *, pixel_compression: str, pixel_chunk_frames: int):
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +326,7 @@ class H5EpisodeWriter:
         self.h5.create_dataset("proprio", shape=(0, 4), maxshape=(None, 4), dtype=np.float32, chunks=True)
         self.h5.create_dataset("episode_idx", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=True)
         self.h5.create_dataset("step_idx", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=True)
+        self.h5.create_dataset("rollout_mode", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=True)
 
     def _pixel_create_kwargs(self, image_shape: tuple[int, int, int]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"chunks": (self.pixel_chunk_frames, *image_shape)}
@@ -223,22 +360,28 @@ class H5EpisodeWriter:
 
     def append_episodes(
         self,
-        episodes: list[tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]]],
+        episodes: list[tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray], int]],
     ) -> None:
         episodes = [episode for episode in episodes if len(episode[1]) > 0]
         if not episodes:
             return
 
-        ep_lengths = np.asarray([len(ep_actions) for _, ep_actions, _, _ in episodes], dtype=np.int32)
-        flat_pixels = [frame for ep_pixels, _, _, _ in episodes for frame in ep_pixels]
-        flat_actions = [frame for _, ep_actions, _, _ in episodes for frame in ep_actions]
-        flat_states = [frame for _, _, ep_states, _ in episodes for frame in ep_states]
-        flat_proprios = [frame for _, _, _, ep_proprios in episodes for frame in ep_proprios]
+        ep_lengths = np.asarray([len(ep_actions) for _, ep_actions, _, _, _ in episodes], dtype=np.int32)
+        flat_pixels = [frame for ep_pixels, _, _, _, _ in episodes for frame in ep_pixels]
+        flat_actions = [frame for _, ep_actions, _, _, _ in episodes for frame in ep_actions]
+        flat_states = [frame for _, _, ep_states, _, _ in episodes for frame in ep_states]
+        flat_proprios = [frame for _, _, _, ep_proprios, _ in episodes for frame in ep_proprios]
 
         pixel_array = np.stack(flat_pixels).astype(np.uint8, copy=False)
         action_array = np.stack(flat_actions).astype(np.float32, copy=False)
         state_array = np.stack(flat_states).astype(np.float32, copy=False)
         proprio_array = np.stack(flat_proprios).astype(np.float32, copy=False)
+        rollout_mode_array = np.concatenate(
+            [
+                np.full(length, rollout_mode, dtype=np.int64)
+                for length, (_, _, _, _, rollout_mode) in zip(ep_lengths, episodes, strict=True)
+            ]
+        )
         episode_idx_array = np.repeat(
             np.arange(self.num_episodes, self.num_episodes + len(episodes), dtype=np.int64),
             ep_lengths,
@@ -268,6 +411,7 @@ class H5EpisodeWriter:
             "proprio": proprio_array,
             "episode_idx": episode_idx_array,
             "step_idx": step_idx_array,
+            "rollout_mode": rollout_mode_array,
         }
         for name, array in arrays.items():
             dataset = self.h5[name]
@@ -293,7 +437,7 @@ def make_env(args: argparse.Namespace):
         args.env_id,
         obs_type="pixels_agent_pos",
         render_mode="rgb_array",
-        max_episode_steps=args.episode_length,
+        max_episode_steps=_max_episode_steps(args),
         observation_width=args.image_width,
         observation_height=args.image_height,
         visualization_width=args.image_width,
@@ -419,10 +563,24 @@ def main() -> None:
         raise ValueError("--num-envs must be >= 1.")
     if args.pixel_chunk_frames < 1:
         raise ValueError("--pixel-chunk-frames must be >= 1.")
+    if args.max_steps_expert < 1:
+        raise ValueError("--max-steps-expert must be >= 1.")
+    if args.max_steps_expert_noisy < 1:
+        raise ValueError("--max-steps-expert-noisy must be >= 1.")
+    if args.max_steps_random_spline < 1:
+        raise ValueError("--max-steps-random-spline must be >= 1.")
+    if args.expert_noise_std < 0.0:
+        raise ValueError("--expert-noise-std must be >= 0.")
+    if args.spline_sampling_attempts < 1:
+        raise ValueError("--spline-sampling-attempts must be >= 1.")
     if args.out.exists():
         raise FileExistsError(f"Output already exists: {args.out}")
 
-    bundle = load_expert_policy_bundle(args.model_dir, device=args.device)
+    bundle = (
+        load_expert_policy_bundle(args.model_dir, device=args.device)
+        if RATIOS[0] + RATIOS[1] > 0.0
+        else None
+    )
     writer = H5EpisodeWriter(
         args.out,
         pixel_compression=args.pixel_compression,
@@ -430,6 +588,7 @@ def main() -> None:
     )
     env = make_vector_env(args)
     action_space = getattr(env, "single_action_space", getattr(env, "action_space", None))
+    mode_rng = np.random.default_rng(args.start_seed)
     saved = 0
     attempts = 0
 
@@ -438,21 +597,84 @@ def main() -> None:
             while saved < args.num_episodes:
                 reset_seeds = [args.start_seed + attempts + env_idx for env_idx in range(args.num_envs)]
                 attempts += args.num_envs
-                bundle.policy.reset()
+                if bundle is not None:
+                    bundle.policy.reset()
                 raw_observations, _ = env.reset(seed=reset_seeds)
                 previous_actions = np.zeros((args.num_envs, 2), dtype=np.float32)
                 active = np.ones(args.num_envs, dtype=bool)
                 env_actions = np.zeros((args.num_envs, 2), dtype=np.float32)
                 logged_actions = np.zeros((args.num_envs, 2), dtype=np.float32)
+                rollout_modes = _sample_rollout_modes(args, mode_rng, args.num_envs)
+                max_steps_by_env = np.asarray([_mode_max_steps(args, mode) for mode in rollout_modes], dtype=np.int32)
+                episode_rngs = [np.random.default_rng(reset_seeds[env_idx]) for env_idx in range(args.num_envs)]
+                controllers: list[RandomSplineController | None] = [None] * args.num_envs
+                for env_idx, rollout_mode in enumerate(rollout_modes):
+                    if rollout_mode != "random_spline":
+                        continue
+                    controllers[env_idx] = _make_random_spline_controller(
+                        args,
+                        _slice_observation(raw_observations, env_idx),
+                        episode_rngs[env_idx],
+                    )
                 batch_pixels: list[list[np.ndarray]] = [[] for _ in range(args.num_envs)]
                 batch_actions: list[list[np.ndarray]] = [[] for _ in range(args.num_envs)]
                 batch_states: list[list[np.ndarray]] = [[] for _ in range(args.num_envs)]
                 batch_proprios: list[list[np.ndarray]] = [[] for _ in range(args.num_envs)]
                 batch_success = np.zeros(args.num_envs, dtype=bool)
 
-                for step_idx in range(args.episode_length):
+                for step_idx in range(_max_episode_steps(args)):
+                    reached_cap = active & (step_idx >= max_steps_by_env)
+                    active[reached_cap] = False
+                    if not active.any():
+                        break
+
                     if step_idx % args.control_interval == 0:
-                        env_actions, logged_actions = _select_expert_actions(bundle, raw_observations, action_space)
+                        env_actions.fill(0.0)
+                        logged_actions.fill(0.0)
+                        if "expert" in rollout_modes or "expert_plus_noise" in rollout_modes:
+                            if bundle is None:
+                                raise RuntimeError("Sampled expert rollout but no expert policy bundle was loaded.")
+                            expert_env_actions, expert_logged_actions = _select_expert_actions(
+                                bundle,
+                                raw_observations,
+                                action_space,
+                            )
+                            expert_mask = np.asarray(
+                                [active[idx] and rollout_modes[idx] == "expert" for idx in range(args.num_envs)],
+                                dtype=bool,
+                            )
+                            env_actions[expert_mask] = expert_env_actions[expert_mask]
+                            logged_actions[expert_mask] = expert_logged_actions[expert_mask]
+                            noisy_mask = np.asarray(
+                                [active[idx] and rollout_modes[idx] == "expert_plus_noise" for idx in range(args.num_envs)],
+                                dtype=bool,
+                            )
+                            noisy_indices = np.flatnonzero(noisy_mask)
+                            for env_idx in noisy_indices:
+                                noisy_env_action, noisy_logged_action = _apply_expert_noise(
+                                    expert_env_actions[env_idx],
+                                    np.asarray(raw_observations["agent_pos"][env_idx], dtype=np.float32),
+                                    action_space,
+                                    episode_rngs[env_idx],
+                                    args.expert_noise_std,
+                                )
+                                env_actions[env_idx] = noisy_env_action
+                                logged_actions[env_idx] = noisy_logged_action
+                        for env_idx in range(args.num_envs):
+                            if not active[env_idx] or rollout_modes[env_idx] != "random_spline":
+                                continue
+                            controller = controllers[env_idx]
+                            if controller is None:
+                                raise RuntimeError(f"Missing random spline controller for env {env_idx}.")
+                            raw_observation = _slice_observation(raw_observations, env_idx)
+                            action = controller.select_action(raw_observation)
+                            agent_pos = np.asarray(raw_observation["agent_pos"], dtype=np.float32).reshape(-1)[:2]
+                            env_actions[env_idx] = _relative_action_to_env_action(
+                                action,
+                                agent_pos,
+                                action_space,
+                            )
+                            logged_actions[env_idx] = action
 
                     for env_idx in range(args.num_envs):
                         if not active[env_idx]:
@@ -460,7 +682,7 @@ def main() -> None:
                         if step_idx % args.control_interval == 0:
                             raw_observation = _slice_observation(raw_observations, env_idx)
                             batch_pixels[env_idx].append(_extract_pixels(raw_observation))
-                            batch_actions[env_idx].append(logged_actions[env_idx])
+                            batch_actions[env_idx].append(logged_actions[env_idx].copy())
                             batch_states[env_idx].append(_make_state(raw_observation, env=None))
                             batch_proprios[env_idx].append(
                                 _make_proprio(raw_observation, env=None, previous_action=previous_actions[env_idx])
@@ -478,6 +700,15 @@ def main() -> None:
                         )
                         if terminated[env_idx] or truncated[env_idx]:
                             active[env_idx] = False
+                            continue
+                        if rollout_modes[env_idx] == "random_spline":
+                            controller = controllers[env_idx]
+                            if controller is None:
+                                raise RuntimeError(f"Missing random spline controller for env {env_idx}.")
+                            raw_observation = _slice_observation(raw_observations, env_idx)
+                            if controller.reached_goal(raw_observation):
+                                active[env_idx] = False
+                                continue
                     if step_idx % args.control_interval == 0:
                         previous_actions = logged_actions.copy()
                     if not active.any():
@@ -498,6 +729,7 @@ def main() -> None:
                             batch_actions[env_idx],
                             batch_states[env_idx],
                             batch_proprios[env_idx],
+                            ROLLOUT_MODES.index(rollout_modes[env_idx]),
                         )
                     )
                     last_saved_seed = seed
@@ -509,7 +741,7 @@ def main() -> None:
                     pbar.set_postfix(
                         last_seed=last_saved_seed,
                         saved_batch=len(episodes_to_write),
-                        stored_steps=sum(len(ep_actions) for _, ep_actions, _, _ in episodes_to_write),
+                        stored_steps=sum(len(ep_actions) for _, ep_actions, _, _, _ in episodes_to_write),
                         discarded=discarded,
                         refresh=False,
                     )

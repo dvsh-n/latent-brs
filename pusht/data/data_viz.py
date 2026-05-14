@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DEFAULT_DATASET_PATH = Path("pusht/data/pusht_diffusion_train.h5")
+DEFAULT_DATASET_PATH = Path("pusht/data/pusht_train.h5")
 REQUIRED_KEYS = ("ep_len", "ep_offset", "pixels", "action")
 FILTER_NAMES = {
     32001: "blosc",
@@ -141,18 +141,50 @@ def sheet_frame_indices(num_frames: int) -> np.ndarray:
     return np.unique(np.linspace(0, num_frames - 1, count, dtype=np.int64))
 
 
+def _plot_group(ax, time: np.ndarray, values: np.ndarray, labels: list[str], title: str) -> None:
+    for dim, label in enumerate(labels):
+        ax.plot(time, values[:, dim], label=label)
+    ax.set_title(title)
+    ax.set_xlabel("Frame")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right", ncol=min(len(labels), 4))
+
+
 def plot_summary(episode: dict[str, np.ndarray], episode_idx: int, out_path: Path) -> None:
     frames = episode["pixels"]
     actions = episode["action"]
     selected = sheet_frame_indices(frames.shape[0])
     num_cols = len(selected)
 
-    trace_key = "state" if "state" in episode else "proprio" if "proprio" in episode else None
-    num_trace_rows = 2 if trace_key is not None else 1
-    height_ratios = [2.4] + [1.0] * num_trace_rows
+    row_specs: list[tuple[np.ndarray, list[str], str]] = [(actions, [f"a{dim}" for dim in range(actions.shape[1])], "Actions")]
+    if "state" in episode:
+        state = np.asarray(episode["state"], dtype=np.float32)
+        if state.shape[1] >= 7:
+            row_specs.extend(
+                [
+                    (state[:, :2], ["block_x", "block_y"], "Block Position"),
+                    (state[:, 2:4], ["cos(theta)", "sin(theta)"], "Block Orientation"),
+                    (state[:, 4:7], ["goal_x", "goal_y", "goal_theta"], "Goal Pose"),
+                ]
+            )
+        else:
+            row_specs.append((state, [f"state{dim}" for dim in range(state.shape[1])], "State"))
+    if "proprio" in episode:
+        proprio = np.asarray(episode["proprio"], dtype=np.float32)
+        if proprio.shape[1] >= 4:
+            row_specs.extend(
+                [
+                    (proprio[:, :2], ["agent_x", "agent_y"], "Agent Position"),
+                    (proprio[:, 2:4], ["prev_action_x", "prev_action_y"], "Previous Action"),
+                ]
+            )
+        else:
+            row_specs.append((proprio, [f"proprio{dim}" for dim in range(proprio.shape[1])], "Proprio"))
 
-    fig = plt.figure(figsize=(max(12, 2.0 * num_cols), 3.2 + 2.2 * num_trace_rows))
-    grid = fig.add_gridspec(1 + num_trace_rows, num_cols, height_ratios=height_ratios)
+    height_ratios = [2.4] + [1.0] * len(row_specs)
+
+    fig = plt.figure(figsize=(max(12, 2.0 * num_cols), 3.2 + 2.2 * len(row_specs)))
+    grid = fig.add_gridspec(1 + len(row_specs), num_cols, height_ratios=height_ratios)
 
     for col, frame_idx in enumerate(selected):
         ax = fig.add_subplot(grid[0, col])
@@ -161,23 +193,9 @@ def plot_summary(episode: dict[str, np.ndarray], episode_idx: int, out_path: Pat
         ax.axis("off")
 
     time = np.arange(actions.shape[0])
-    action_ax = fig.add_subplot(grid[1, :])
-    for dim in range(actions.shape[1]):
-        action_ax.plot(time, actions[:, dim], label=f"a{dim}")
-    action_ax.set_title("Actions")
-    action_ax.set_xlabel("Frame")
-    action_ax.grid(alpha=0.25)
-    action_ax.legend(loc="upper right", ncol=min(actions.shape[1], 4))
-
-    if trace_key is not None:
-        trace = np.asarray(episode[trace_key], dtype=np.float32)
-        trace_ax = fig.add_subplot(grid[2, :])
-        for dim in range(trace.shape[1]):
-            trace_ax.plot(time, trace[:, dim], label=f"{trace_key}{dim}")
-        trace_ax.set_title(trace_key.capitalize())
-        trace_ax.set_xlabel("Frame")
-        trace_ax.grid(alpha=0.25)
-        trace_ax.legend(loc="upper right", ncol=min(trace.shape[1], 7))
+    for row_idx, (values, labels, title) in enumerate(row_specs, start=1):
+        ax = fig.add_subplot(grid[row_idx, :])
+        _plot_group(ax, time, values, labels, title)
 
     fig.suptitle(f"PushT episode {episode_idx} ({frames.shape[0]} frames)", y=0.995)
     fig.tight_layout()

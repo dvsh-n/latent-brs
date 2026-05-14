@@ -13,6 +13,7 @@ from pathlib import Path, PosixPath
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import h5py
+import hdf5plugin  # noqa: F401
 import lightning as pl
 import numpy as np
 import stable_pretraining as spt
@@ -24,9 +25,9 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_expert_train_preproc.h5"
-DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
+DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_lewm_dataset"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_lewm_dataset_ft"
 FIXED_FRAMESKIP = 1
 
 
@@ -50,23 +51,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=48)
-    parser.add_argument("--markov-deriv", type=int, default=1)
-    parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
+    parser.add_argument("--markov-deriv", type=int, default=2)
+    parser.add_argument("--num-preds", type=int, default=20, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
     parser.add_argument("--predictor-depth", type=int, default=3)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
-    parser.add_argument("--sigreg-weight", type=float, default=0.009)
+    parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
     parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--freeze-encoder-epochs", type=int, default=25)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
+    parser.add_argument(
+        "--load-projector",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load projector weights from the init checkpoint.",
+    )
+    parser.add_argument(
+        "--load-mlpdyn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load MLP dynamics weights from the init checkpoint.",
+    )
     parser.add_argument("--batch-size", type=int, default=120)
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -261,10 +274,15 @@ def build_markov_state(history_emb: torch.Tensor, markov_deriv: int) -> torch.Te
         history_emb = history_emb.unsqueeze(0)
         squeeze = True
     context_len = required_markov_history(markov_deriv)
-    if history_emb.ndim != 3 or history_emb.shape[1] < context_len:
+    if history_emb.ndim != 3:
         raise ValueError(
-            f"Expected history_emb with shape [batch, >= {context_len}, dim], got {tuple(history_emb.shape)}."
+            f"Expected history_emb with shape [batch, time, dim], got {tuple(history_emb.shape)}."
         )
+    if history_emb.shape[1] < 1:
+        raise ValueError("history_emb must contain at least one frame.")
+    if history_emb.shape[1] < context_len:
+        pad = history_emb[:, :1].expand(-1, context_len - history_emb.shape[1], -1)
+        history_emb = torch.cat((pad, history_emb), dim=1)
     deriv_seq = history_emb[:, -context_len:]
     components = [deriv_seq[:, -1]]
     for _ in range(markov_deriv):
@@ -313,10 +331,7 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
         pred_state = self.model.predict(ctx_state, ctx_act)[:, 0]
         pred_next = pred_state[..., :embed_dim]
         tgt_next = emb[:, step + 1]
-        if args.markov_deriv > 0:
-            tgt_history = torch.cat((emb[:, step + 1 - args.markov_deriv : step + 1], tgt_next.unsqueeze(1)), dim=1)
-        else:
-            tgt_history = tgt_next.unsqueeze(1)
+        tgt_history = emb[:, : step + 2]
         tgt_state = build_markov_state(tgt_history, args.markov_deriv)
         pred_losses.append((pred_state - tgt_state).pow(2).mean())
         pred_embs.append(pred_next)
@@ -434,14 +449,11 @@ def resolve_resume_checkpoint(args: argparse.Namespace, run_dir: Path) -> Path |
     return checkpoint_path
 
 
-def load_pretrained_encoder(checkpoint_path: Path) -> torch.nn.Module:
+def load_pretrained_model(checkpoint_path: Path) -> JEPA:
     source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(source_model, JEPA):
         raise TypeError(f"Expected JEPA object checkpoint, got {type(source_model).__name__}.")
-    encoder = getattr(source_model, "encoder", None)
-    if encoder is None:
-        raise AttributeError("Source checkpoint does not contain model.encoder.")
-    return encoder
+    return source_model
 
 
 def main() -> None:
@@ -501,7 +513,10 @@ def main() -> None:
 
     world_model = build_model(args)
     if resume_checkpoint_path is None:
-        pretrained_encoder = load_pretrained_encoder(init_checkpoint_path)
+        pretrained_model = load_pretrained_model(init_checkpoint_path)
+        pretrained_encoder = getattr(pretrained_model, "encoder", None)
+        if pretrained_encoder is None:
+            raise AttributeError("Source checkpoint does not contain model.encoder.")
         try:
             world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
         except RuntimeError as exc:
@@ -509,6 +524,16 @@ def main() -> None:
                 "Failed to load encoder weights from the init checkpoint. "
                 "Check encoder-scale, patch-size, and encoder architecture compatibility."
             ) from exc
+        if args.load_projector:
+            pretrained_projector = getattr(pretrained_model, "projector", None)
+            if pretrained_projector is None:
+                raise AttributeError("Source checkpoint does not contain model.projector.")
+            world_model.projector.load_state_dict(pretrained_projector.state_dict(), strict=True)
+        if args.load_mlpdyn:
+            pretrained_predictor = getattr(pretrained_model, "predictor", None)
+            if pretrained_predictor is None:
+                raise AttributeError("Source checkpoint does not contain model.predictor.")
+            world_model.predictor.load_state_dict(pretrained_predictor.state_dict(), strict=True)
 
     optimizers = {
         "model_opt": {
@@ -534,12 +559,26 @@ def main() -> None:
         with (run_dir / "config.json").open("w") as f:
             json.dump(config, f, indent=2, default=str)
 
+        loaded_modules = ["encoder"]
+        if args.load_projector:
+            loaded_modules.append("projector")
+        if args.load_mlpdyn:
+            loaded_modules.append("predictor")
+
+        reinitialized_modules = ["action_encoder", "pred_proj"]
+        if not args.load_projector:
+            reinitialized_modules.insert(0, "projector")
+        if not args.load_mlpdyn:
+            reinitialized_modules.insert(1 if not args.load_projector else 0, "predictor")
+
         init_report = {
             "init_checkpoint": str(init_checkpoint_path),
-            "loaded_modules": ["encoder"],
-            "reinitialized_modules": ["projector", "predictor", "action_encoder", "pred_proj"],
+            "loaded_modules": loaded_modules,
+            "reinitialized_modules": reinitialized_modules,
             "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
             "freeze_projector_epochs": int(args.freeze_projector_epochs),
+            "load_projector": bool(args.load_projector),
+            "load_mlpdyn": bool(args.load_mlpdyn),
         }
         with (run_dir / "init_report.json").open("w") as f:
             json.dump(init_report, f, indent=2)

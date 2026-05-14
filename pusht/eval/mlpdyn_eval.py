@@ -22,8 +22,8 @@ import torch
 
 from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, preprocess_pixels, required_markov_history
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
-DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_withgreenT_1"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
+DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_lewm_dataset"
 DEFAULT_OUT_DIR = "pusht/eval/mlpdyn_eval"
 DEFAULT_START_TIMESTEP = 0
 
@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default="pusht/models/mlpdyn_withgreenT_1/mlpdyn_epoch_16_object.ckpt")
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--episode-idx", type=int, default=9838)
+    parser.add_argument("--episode-idx", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--markov-deriv", type=int, default=None)
     parser.add_argument("--num-preds", type=int, default=None)

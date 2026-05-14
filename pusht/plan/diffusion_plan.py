@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Any
 from pathlib import Path
 
 import numpy as np
 from tqdm import trange
 
 from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, get_pusht_agent_pos, get_pusht_block_pose, make_pusht_env
-from pusht.shared.utils import load_expert_policy_bundle, render_frame, select_expert_action
+from pusht.shared.utils import load_expert_policy_bundle, pusht_observation_to_policy_batch, select_expert_action
 
 DEFAULT_MODEL_DIR = Path("pusht/models")
 DEFAULT_OUT_DIR = Path("pusht/plan/diffusion_plan")
@@ -26,9 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=500)
-    parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--video-name", default="diffusion_plan.mp4")
     parser.add_argument("--action-mode", default="auto", choices=["auto", "absolute", "relative"])
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--control-noise", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--control-noise-std", type=float, default=0.2)
     parser.add_argument(
         "--control-interval",
         type=int,
@@ -64,6 +67,39 @@ def save_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
     imageio.mimsave(path, frames, fps=fps)
 
 
+def _get_video_fps(env: Any, control_interval: int) -> int:
+    metadata = getattr(env, "metadata", None) or getattr(getattr(env, "unwrapped", None), "metadata", None) or {}
+    base_fps = metadata.get("render_fps")
+    if base_fps is None:
+        dt = getattr(getattr(env, "unwrapped", None), "dt", None)
+        if dt is not None and dt > 1e-6:
+            base_fps = float(round(1.0 / dt))
+    if base_fps is None:
+        base_fps = 10.0
+    return max(1, int(round(float(base_fps) / float(control_interval))))
+
+
+def _policy_view_frame(bundle, observation: dict[str, Any], env: Any) -> np.ndarray:
+    batch = pusht_observation_to_policy_batch(
+        observation,
+        env=env,
+        image_shape=tuple(bundle.policy.config.input_features["observation.image"].shape),
+    )
+    image = batch["observation.image"][0].permute(1, 2, 0).cpu().numpy()
+    return np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _clip_action_to_space(action: np.ndarray, env: Any) -> np.ndarray:
+    action_space = getattr(env, "action_space", None)
+    if action_space is None:
+        return np.asarray(action, dtype=np.float32)
+    high = np.asarray(getattr(action_space, "high", None))
+    low = np.asarray(getattr(action_space, "low", None))
+    if high.shape != action.shape or low.shape != action.shape:
+        return np.asarray(action, dtype=np.float32)
+    return np.clip(action, low, high).astype(np.float32)
+
+
 def extract_goal_pose(env) -> list[float] | None:
     goal_pose = getattr(env.unwrapped, "goal_pose", None)
     if goal_pose is None:
@@ -74,6 +110,8 @@ def extract_goal_pose(env) -> list[float] | None:
 def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[str, object]:
     if args.control_interval < 1:
         raise ValueError("--control-interval must be >= 1.")
+    if args.control_noise_std < 0.0:
+        raise ValueError("--control-noise-std must be >= 0.")
 
     env = make_pusht_env(
         args.env_id,
@@ -82,9 +120,11 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
         max_episode_steps=args.max_steps,
     )
     bundle.policy.reset()
-    observation, info = env.reset()
+    episode_seed = None if args.seed is None else args.seed + episode_idx
+    observation, info = env.reset(seed=episode_seed)
+    rng = np.random.default_rng(episode_seed)
 
-    frames = [render_frame(env)]
+    frames = [_policy_view_frame(bundle, observation, env)]
     total_reward = 0.0
     success = False
     steps = 0
@@ -94,6 +134,9 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     for step_idx in trange(args.max_steps, desc=f"episode {episode_idx}", unit="step"):
         if action is None or step_idx % args.control_interval == 0:
             action = select_expert_action(bundle, observation, env=env, action_mode=args.action_mode)
+            if args.control_noise:
+                noise = rng.normal(loc=0.0, scale=args.control_noise_std, size=action.shape).astype(np.float32)
+                action = _clip_action_to_space(action + noise, env)
             control_updates += 1
 
         next_observation, reward, terminated, truncated, info = env.step(action)
@@ -102,7 +145,7 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
         steps += 1
 
         if steps % args.control_interval == 0 or terminated or truncated:
-            frame = render_frame(env)
+            frame = _policy_view_frame(bundle, next_observation, env)
             frames.append(frame)
             maybe_display(frame, args.display)
 
@@ -113,6 +156,7 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     final_block_pose = get_pusht_block_pose(env).tolist()
     final_agent_pos = get_pusht_agent_pos(env).tolist()
     goal_pose = extract_goal_pose(env)
+    video_fps = _get_video_fps(env, args.control_interval)
     env.close()
     stored_steps = len(frames)
 
@@ -120,15 +164,18 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     if not args.no_video:
         suffix = "" if args.episodes == 1 else f"_episode_{episode_idx:03d}"
         video_path = args.out_dir / f"{Path(args.video_name).stem}{suffix}{Path(args.video_name).suffix}"
-        save_video(video_path, frames, args.fps)
+        save_video(video_path, frames, video_fps)
 
     return {
         "episode": episode_idx,
+        "seed": episode_seed,
         "env_steps": steps,
         "stored_steps": stored_steps,
         "control_updates": control_updates,
         "total_reward": total_reward,
         "success": success,
+        "control_noise": bool(args.control_noise),
+        "control_noise_std": float(args.control_noise_std),
         "goal_pose": goal_pose,
         "final_block_pose": final_block_pose,
         "final_agent_pos": final_agent_pos,
