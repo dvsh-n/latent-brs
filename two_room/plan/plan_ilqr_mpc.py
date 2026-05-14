@@ -24,14 +24,14 @@ if str(REPO_ROOT) not in sys.path:
 from two_room.shared import TwoRoomLayout, make_two_room_env, reset_two_room_env_to_state
 
 
-DEFAULT_MODEL_DIR = "two_room/models/mlpdyn"
+DEFAULT_MODEL_DIR = "two_room/models/mlpdyn_ruitong"
 DEFAULT_OUT_DIR = "two_room/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-SAME_ROOM = True
+SAME_ROOM = False
 HORIZON = 25
 MAX_MPC_STEPS = 120
-Q_TERMINAL = 5.0
+Q_TERMINAL = 15.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 DELTA_Q_SCALE = 1e-3
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-terminal", type=float, default=Q_TERMINAL)
     parser.add_argument("--q-stage", type=float, default=Q_STAGE)
     parser.add_argument("--r-control", type=float, default=R_CONTROL)
-    parser.add_argument("--ilqr-max-iters", type=int, default=50)
+    parser.add_argument("--ilqr-max-iters", type=int, default=30)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=None)

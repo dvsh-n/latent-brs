@@ -28,8 +28,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from two_room.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "two_room/data/expert_data/two_room_expert.h5"
-DEFAULT_RUN_DIR = "two_room/models/mlpdyn"
+DEFAULT_DATASET_PATH = "two_room/data/train_data/two_room_train.h5"
+DEFAULT_RUN_DIR = "two_room/models/mlpdyn_1"
 FIXED_FRAMESKIP = 1
 
 
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=24)
+    parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--history-size", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.009)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=True)
+    parser.add_argument("--straighten", action="store_true", default=False)
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=50)

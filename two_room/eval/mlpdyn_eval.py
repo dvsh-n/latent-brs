@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-DEFAULT_DATASET_PATH = "two_room/data/expert_data/two_room_expert.h5"
+DEFAULT_DATASET_PATH = "two_room/data/train_data/two_room_train.h5"
 DEFAULT_MODEL_DIR = "two_room/models/mlpdyn"
 DEFAULT_OUT_DIR = "two_room/eval/mlpdyn_eval"
 
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--episode-idx", type=int, default=None)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="cpu")
     parser.add_argument("--history-size", type=int, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
     parser.add_argument("--frameskip", type=int, default=None)
