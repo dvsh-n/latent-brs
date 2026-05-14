@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
 import time
 
+import imageio.v2 as imageio
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -12,19 +14,29 @@ import numpy as np
 SHARED_DIR = Path(__file__).resolve().parent
 LAB_SCENE_XML = SHARED_DIR / "lab_scene_base.xml"
 IIWA_MODEL_XML = SHARED_DIR / "kuka_iiwa_14" / "iiwa14_base.xml"
+DEFAULT_VIDEO_PATH = SHARED_DIR / "lab_env_random.mp4"
 
 TABLE_SIZE = np.array([0.50, 0.75, 0.375], dtype=float)
 TABLE_CENTER = np.array([0.0, 0.0, TABLE_SIZE[2]], dtype=float)
 TABLE_TOP_Z = float(2.0 * TABLE_SIZE[2])
 
-REACH_NAME = "reach"
 EE_FIXED_ROT = np.diag([1.0, -1.0, -1.0])
 NOMINAL_TASK_STATE = np.array([0.08, 0.98, 0.42], dtype=float)
-TASK_REACH_BOUNDS = (-0.2, 0.30)
-TASK_HEIGHT_BOUNDS = (1.05, 1.4)
-TASK_WIDTH_BOUNDS = (0.05, 0.6)
+TASK_REACH_BOUNDS = (-0.1, 0.3)
+TASK_HEIGHT_BOUNDS = (1.16, 1.35)
+TASK_WIDTH_BOUNDS = (0.2, 0.75)
 LEFT_ARM_SEED = np.array([0.42, 0.95, 0.0, -1.55, 0.0, 0.75, 0.0], dtype=float)
 RIGHT_ARM_SEED = np.array([-0.42, 0.95, 0.0, -1.55, 0.0, 0.75, 0.0], dtype=float)
+DEFAULT_RENDER_WIDTH = 224
+DEFAULT_RENDER_HEIGHT = 224
+DEFAULT_RENDER_FPS = 20
+DEFAULT_VIEWER_LOOKAT = np.array([0.0, 0.0, 0.95], dtype=float)
+DEFAULT_VIEWER_DISTANCE = 1.6
+DEFAULT_VIEWER_AZIMUTH = 0.0
+DEFAULT_VIEWER_ELEVATION = -20.0
+RANDOM_SPLINE_MODE = "RANDOM_SPLINE"
+WS_EDGE_SAMPLE_MODE = "WS_EDGE_SAMPLE"
+MODE = WS_EDGE_SAMPLE_MODE
 
 
 @dataclass(frozen=True)
@@ -178,6 +190,12 @@ def build_lab_scene_xml(
     <body name="arm2_mount" pos="0.40 -0.65 0.7629" euler="0 0 180">
       <attach model="kuka_iiwa_model" body="base" prefix="arm2_"/>
     </body>
+
+    <camera name="video_cam"
+            mode="fixed"
+            pos="-1.5 0.0 1.6"
+            xyaxes="0 -1 0  0.35 0 0.94"/>
+    <!-- pos = Front/Back, Left/Right, Up/Down -->
 
     <camera name="ceiling_cam"
             mode="fixed"
@@ -482,14 +500,13 @@ class LabEnv:
 @dataclass
 class RandomSplinePolicy:
     bounds: TaskBounds
-    seed: int = 0
     segment_duration: float = 2.0
     num_waypoints: int = 6
     _rng: np.random.Generator = field(init=False)
     _waypoints: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
-        self._rng = np.random.default_rng(self.seed)
+        self._rng = np.random.default_rng()
         lower = np.array([self.bounds.reach[0], self.bounds.height[0], self.bounds.width[0]], dtype=float)
         upper = np.array([self.bounds.reach[1], self.bounds.height[1], self.bounds.width[1]], dtype=float)
         nominal = TaskState.from_array(NOMINAL_TASK_STATE).as_array()
@@ -509,32 +526,140 @@ class RandomSplinePolicy:
         return self.bounds.clip(state)
 
 
-def run_random_spline_demo() -> None:
-    env = LabEnv()
-    policy = RandomSplinePolicy(env.task_bounds, seed=7)
-    substeps = 10
-    dt = env.model.opt.timestep * substeps
-    started = time.time()
+@dataclass
+class WorkspaceEdgeSamplePolicy:
+    bounds: TaskBounds
+    segment_duration: float = 1.5
+    _segments: list[tuple[np.ndarray, np.ndarray]] = field(init=False)
 
-    with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
-        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        viewer.cam.lookat[:] = np.array([0.0, 0.0, 0.95], dtype=float)
-        viewer.cam.distance = 2.4
-        viewer.cam.azimuth = 0.0
-        viewer.cam.elevation = -18.0
-        while viewer.is_running():
-            elapsed = time.time() - started
-            desired = policy.sample(elapsed)
-            env.set_task_target(desired)
-            env.step(substeps)
-            viewer.sync()
-            sleep_time = dt - (time.time() - started - elapsed)
-            if sleep_time > 0.0:
-                time.sleep(sleep_time)
+    def __post_init__(self) -> None:
+        r0, r1 = self.bounds.reach
+        h0, h1 = self.bounds.height
+        w0, w1 = self.bounds.width
+        corners = np.array(
+            [
+                [r0, h0, w0],
+                [r1, h0, w0],
+                [r1, h1, w0],
+                [r0, h1, w0],
+                [r0, h0, w1],
+                [r1, h0, w1],
+                [r1, h1, w1],
+                [r0, h1, w1],
+            ],
+            dtype=float,
+        )
+        edge_indices = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        self._segments = [(corners[start].copy(), corners[end].copy()) for start, end in edge_indices]
+
+    def sample(self, t: float) -> TaskState:
+        local_t = max(t, 0.0) / self.segment_duration
+        segment = int(local_t) % len(self._segments)
+        alpha = local_t - int(local_t)
+        smooth = alpha * alpha * (3.0 - 2.0 * alpha)
+        start, end = self._segments[segment]
+        state = (1.0 - smooth) * start + smooth * end
+        return self.bounds.clip(state)
+
+
+def make_task_policy(mode: str, bounds: TaskBounds) -> RandomSplinePolicy | WorkspaceEdgeSamplePolicy:
+    if mode == RANDOM_SPLINE_MODE:
+        return RandomSplinePolicy(bounds)
+    if mode == WS_EDGE_SAMPLE_MODE:
+        return WorkspaceEdgeSamplePolicy(bounds)
+    raise ValueError(f"Unsupported task policy mode: {mode}")
+
+
+def run_demo(
+    output_path: Path,
+    *,
+    mode: str = RANDOM_SPLINE_MODE,
+    width: int = DEFAULT_RENDER_WIDTH,
+    height: int = DEFAULT_RENDER_HEIGHT,
+    fps: int = DEFAULT_RENDER_FPS,
+) -> Path:
+    env = LabEnv()
+    policy = make_task_policy(mode, env.task_bounds)
+    steps_per_frame = max(1, int(round(1.0 / (fps * env.model.opt.timestep))))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    camera_id = env.model.camera("video_cam").id
+
+    frames: list[np.ndarray] = []
+    frame_dt = 1.0 / fps
+    started = time.time()
+    next_frame_time = started
+
+    with mujoco.Renderer(env.model, height=height, width=width) as renderer:
+        try:
+            with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+                viewer.cam.lookat[:] = DEFAULT_VIEWER_LOOKAT
+                viewer.cam.distance = DEFAULT_VIEWER_DISTANCE
+                viewer.cam.azimuth = DEFAULT_VIEWER_AZIMUTH
+                viewer.cam.elevation = DEFAULT_VIEWER_ELEVATION
+                while viewer.is_running():
+                    elapsed = time.time() - started
+                    desired = policy.sample(elapsed)
+                    env.set_task_target(desired)
+                    env.step(steps_per_frame)
+                    viewer.sync()
+
+                    now = time.time()
+                    if now >= next_frame_time:
+                        renderer.update_scene(env.data, camera=camera_id)
+                        frames.append(renderer.render().copy())
+                        next_frame_time += frame_dt
+        except KeyboardInterrupt:
+            pass
+
+    if frames:
+        imageio.mimwrite(output_path, frames, fps=fps, quality=8, macro_block_size=1)
+    return output_path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="View and record a rope manipulation video.")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=MODE,
+        choices=[RANDOM_SPLINE_MODE, WS_EDGE_SAMPLE_MODE],
+        help="Task generator mode.",
+    )
+    parser.add_argument("--width", type=int, default=DEFAULT_RENDER_WIDTH, help="Output video width in pixels.")
+    parser.add_argument("--height", type=int, default=DEFAULT_RENDER_HEIGHT, help="Output video height in pixels.")
+    parser.add_argument("--fps", type=int, default=DEFAULT_RENDER_FPS, help="Output video frames per second.")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_VIDEO_PATH,
+        help="Output MP4 path.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    run_random_spline_demo()
+    args = parse_args()
+    output_path = run_demo(
+        args.output,
+        mode=args.mode,
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+    )
+    print(
+        {
+            "output_video": str(output_path.resolve()),
+            "mode": args.mode,
+            "width": args.width,
+            "height": args.height,
+            "fps": args.fps,
+        }
+    )
 
 
 if __name__ == "__main__":
