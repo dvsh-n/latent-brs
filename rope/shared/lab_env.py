@@ -14,7 +14,7 @@ import numpy as np
 SHARED_DIR = Path(__file__).resolve().parent
 LAB_SCENE_XML = SHARED_DIR / "lab_scene_base.xml"
 IIWA_MODEL_XML = SHARED_DIR / "kuka_iiwa_14" / "iiwa14_base.xml"
-DEFAULT_VIDEO_PATH = SHARED_DIR / "lab_env_random.mp4"
+DEFAULT_VIDEO_PATH = SHARED_DIR / "lab_env.mp4"
 
 TABLE_SIZE = np.array([0.50, 0.75, 0.375], dtype=float)
 TABLE_CENTER = np.array([0.0, 0.0, TABLE_SIZE[2]], dtype=float)
