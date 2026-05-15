@@ -22,7 +22,7 @@ import torch
 
 from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, preprocess_pixels, required_markov_history
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
 DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_lewm_dataset_ft"
 DEFAULT_OUT_DIR = "pusht/eval/mlpdyn_eval"
 DEFAULT_START_TIMESTEP = 25

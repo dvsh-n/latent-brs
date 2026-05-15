@@ -23,23 +23,28 @@ from pusht.shared.pusht_env import (
     get_pusht_agent_pos,
     get_pusht_block_pose,
     make_no_target_env,
+    make_pusht_env,
     reset_pusht_env_to_state,
 )
 from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, required_markov_history
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_expert_train_preproc.h5"
-DEFAULT_MODEL_DIR = "pusht/models/mlpdyn"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
+DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_lewm_dataset_ft"
 DEFAULT_OUT_DIR = "pusht/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-HORIZON = 25
-MAX_MPC_STEPS = 150
+HORIZON = 15
+MAX_MPC_STEPS = 100
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 10
-EPISODE_IDX = None
+EPISODE_IDX = None # 480, 12148
 ENV_ACTION_SCALE = 100.0
+PUSHT_WALL_MIN = 5.0
+PUSHT_WALL_MAX = 506.0
+PUSHT_WALL_RADIUS = 2.0
+PUSHT_AGENT_RADIUS = 15.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,8 +205,26 @@ def normalized_to_raw_action(action_norm: np.ndarray, action_mean: np.ndarray, a
     return (action_norm * action_std.reshape(-1) + action_mean.reshape(-1)).astype(np.float32)
 
 
-def raw_to_env_action(raw_action: np.ndarray, agent_pos: np.ndarray) -> np.ndarray:
-    return (agent_pos.astype(np.float32) + ENV_ACTION_SCALE * raw_action.astype(np.float32)).astype(np.float32)
+def raw_to_env_action(
+    raw_action: np.ndarray,
+    agent_pos: np.ndarray,
+    *,
+    action_low: np.ndarray | None = None,
+    action_high: np.ndarray | None = None,
+) -> np.ndarray:
+    action = (agent_pos.astype(np.float32) + ENV_ACTION_SCALE * raw_action.astype(np.float32)).astype(np.float32)
+    if action_low is not None and action_high is not None:
+        action = np.clip(action, action_low.astype(np.float32), action_high.astype(np.float32))
+    return action
+
+
+def pusht_agent_action_bounds() -> tuple[np.ndarray, np.ndarray]:
+    # Keep the blue pusher fully inside the inner edge of the rendered gray walls.
+    min_coord = PUSHT_WALL_MIN + PUSHT_WALL_RADIUS + PUSHT_AGENT_RADIUS
+    max_coord = PUSHT_WALL_MAX - PUSHT_WALL_RADIUS - PUSHT_AGENT_RADIUS
+    low = np.full((2,), min_coord, dtype=np.float32)
+    high = np.full((2,), max_coord, dtype=np.float32)
+    return low, high
 
 
 def angle_diff(angle: float, target: float) -> float:
@@ -237,8 +260,21 @@ def load_dataset_episode(
         }
 
 
-def make_render_env(*, width: int, height: int) -> Any:
+def make_planning_env(*, width: int, height: int) -> Any:
     return make_no_target_env(height=height, width=width)
+
+
+def make_visualization_env(*, width: int, height: int) -> Any:
+    env = make_pusht_env(
+        obs_type="pixels",
+        render_mode="rgb_array",
+        observation_width=width,
+        observation_height=height,
+        visualization_width=width,
+        visualization_height=height,
+    )
+    env.reset(seed=0)
+    return env
 
 
 def reset_env_to_state(env: Any, state: np.ndarray) -> np.ndarray:
@@ -251,6 +287,35 @@ def current_block_pose(env: Any) -> np.ndarray:
 
 def current_agent_pos(env: Any) -> np.ndarray:
     return get_pusht_agent_pos(env)
+
+
+def extract_full_state(env: Any) -> np.ndarray:
+    base_env = getattr(env, "unwrapped", env)
+    if hasattr(base_env, "get_state"):
+        return np.asarray(base_env.get_state(), dtype=np.float64).reshape(-1)
+
+    if not (
+        hasattr(base_env, "agent")
+        and hasattr(base_env.agent, "position")
+        and hasattr(base_env.agent, "velocity")
+        and hasattr(base_env, "block")
+        and hasattr(base_env.block, "position")
+        and hasattr(base_env.block, "angle")
+    ):
+        raise AttributeError("PushT env does not expose get_state() and is missing agent/block bodies.")
+
+    return np.asarray(
+        [
+            float(base_env.agent.position.x),
+            float(base_env.agent.position.y),
+            float(base_env.block.position.x),
+            float(base_env.block.position.y),
+            float(base_env.block.angle),
+            float(base_env.agent.velocity.x),
+            float(base_env.agent.velocity.y),
+        ],
+        dtype=np.float64,
+    )
 
 
 class MarkovDynamicsTorch:
@@ -551,103 +616,132 @@ def main() -> None:
     save_rgb_image(out_dir / "start_image.png", pixels_np[0])
     save_rgb_image(out_dir / "goal_image.png", pixels_np[-1])
 
-    env = make_render_env(width=width, height=height)
-    render_start = reset_env_to_state(env, state_np[0])
-    dynamics = MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
-    mpc_solver = ILQRMPCSolver(
-        dynamics,
-        horizon=args.horizon,
-        q_terminal=args.q_terminal,
-        q_stage=args.q_stage,
-        r_control=args.r_control,
-        max_iters=args.ilqr_max_iters,
-        tol=args.ilqr_tol,
-        regularization=args.ilqr_regularization,
-        device=device,
-    )
-
-    current_frame = render_start
-    current_emb = encode_single_frame(
-        model,
-        current_frame,
-        device=device,
-        img_size=img_size,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
-    )
-    current_history = [current_emb] * history_len
-    current_state = make_markov_state(current_history, markov_deriv)
-    goal_state_np = goal_state.detach().cpu().numpy().astype(np.float64)
-    goal_block = state_np[-1, 2:5].astype(np.float32)
-    current_block = current_block_pose(env)
-
-    rollout_frames = [current_frame.copy()]
     executed_actions_raw: list[np.ndarray] = []
     executed_actions_norm: list[np.ndarray] = []
     executed_actions_env: list[np.ndarray] = []
-    latent_goal_distances = [float(torch.linalg.vector_norm(current_state - goal_state).item())]
-    block_goal_distances = [block_pose_distance(current_block, goal_block)]
     solve_times_ms: list[float] = []
     ilqr_iterations: list[int] = []
     ilqr_costs: list[float] = []
     stop_reason = "max_mpc_steps"
+    video_path: str | None = None
+    final_block = state_np[0, 2:5].astype(np.float32)
+    final_agent = state_np[0, :2].astype(np.float32)
+    goal_block = state_np[-1, 2:5].astype(np.float32)
+    rollout_frames: list[np.ndarray] = []
+    latent_goal_distances: list[float] = []
+    block_goal_distances: list[float] = []
+    num_action_clips = 0
 
-    pbar = tqdm(range(args.max_mpc_steps), desc="MPC Steps")
-    for _ in pbar:
-        current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
-        _, u_plan, solve_time, n_iters, plan_cost = mpc_solver.solve(current_state_np, goal_state_np)
-        solve_times_ms.append(solve_time * 1000.0)
-        ilqr_iterations.append(int(n_iters))
-        ilqr_costs.append(float(plan_cost))
+    plan_env = make_planning_env(width=width, height=height)
+    viz_env = make_visualization_env(width=width, height=height)
+    try:
+        action_low, action_high = pusht_agent_action_bounds()
+        hidden_start = reset_env_to_state(plan_env, state_np[0])
+        visible_start = reset_env_to_state(viz_env.unwrapped, state_np[0])
+        dynamics = MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
+        mpc_solver = ILQRMPCSolver(
+            dynamics,
+            horizon=args.horizon,
+            q_terminal=args.q_terminal,
+            q_stage=args.q_stage,
+            r_control=args.r_control,
+            max_iters=args.ilqr_max_iters,
+            tol=args.ilqr_tol,
+            regularization=args.ilqr_regularization,
+            device=device,
+        )
 
-        u0_norm = u_plan[0].astype(np.float32)
-        u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
-        u0_env = raw_to_env_action(u0_raw, current_agent_pos(env))
-        executed_actions_norm.append(u0_norm.copy())
-        executed_actions_raw.append(u0_raw.copy())
-        executed_actions_env.append(u0_env.copy())
-
-        _, _, terminated, truncated, _ = env.step(u0_env)
-        current_frame = np.asarray(env._render(visualize=False), dtype=np.uint8)
-        next_emb = encode_single_frame(
+        current_hidden_frame = hidden_start
+        current_emb = encode_single_frame(
             model,
-            current_frame,
+            current_hidden_frame,
             device=device,
             img_size=img_size,
             pixel_mean=pixel_mean,
             pixel_std=pixel_std,
         )
-        current_history.append(next_emb)
-        current_history = current_history[-history_len:]
+        current_history = [current_emb] * history_len
         current_state = make_markov_state(current_history, markov_deriv)
-        current_emb = next_emb
-        current_block = current_block_pose(env)
+        goal_state_np = goal_state.detach().cpu().numpy().astype(np.float64)
+        current_block = current_block_pose(plan_env)
 
-        rollout_frames.append(current_frame.copy())
-        latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
-        block_goal_distance = block_pose_distance(current_block, goal_block)
-        latent_goal_distances.append(latent_goal_distance)
-        block_goal_distances.append(block_goal_distance)
+        rollout_frames = [visible_start.copy()]
+        latent_goal_distances = [float(torch.linalg.vector_norm(current_state - goal_state).item())]
+        block_goal_distances = [block_pose_distance(current_block, goal_block)]
 
-        pbar.set_postfix(
-            solve_ms=f"{solve_times_ms[-1]:.1f}",
-            iters=f"{ilqr_iterations[-1]}",
-            latent_goal=f"{latent_goal_distance:.3f}",
-            block_goal=f"{block_goal_distance:.3f}",
-        )
+        pbar = tqdm(range(args.max_mpc_steps), desc="MPC Steps")
+        try:
+            for _ in pbar:
+                current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
+                _, u_plan, solve_time, n_iters, plan_cost = mpc_solver.solve(current_state_np, goal_state_np)
+                solve_times_ms.append(solve_time * 1000.0)
+                ilqr_iterations.append(int(n_iters))
+                ilqr_costs.append(float(plan_cost))
 
-        reached_goal, _ = goal_reached(current_block, goal_block)
-        if reached_goal:
-            stop_reason = "goal_reached"
-            break
-        if terminated or truncated:
-            stop_reason = "terminated" if terminated else "truncated"
-            break
+                u0_norm = u_plan[0].astype(np.float32)
+                u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
+                unclipped_u0_env = raw_to_env_action(u0_raw, current_agent_pos(plan_env))
+                u0_env = raw_to_env_action(
+                    u0_raw,
+                    current_agent_pos(plan_env),
+                    action_low=action_low,
+                    action_high=action_high,
+                )
+                if not np.allclose(u0_env, unclipped_u0_env):
+                    num_action_clips += 1
+                executed_actions_norm.append(u0_norm.copy())
+                executed_actions_raw.append(u0_raw.copy())
+                executed_actions_env.append(u0_env.copy())
 
-    final_block = current_block_pose(env)
-    final_agent = current_agent_pos(env)
-    video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
-    env.close()
+                _, _, terminated, truncated, _ = plan_env.step(u0_env)
+                current_hidden_frame = np.asarray(plan_env._render(visualize=False), dtype=np.uint8)
+                next_emb = encode_single_frame(
+                    model,
+                    current_hidden_frame,
+                    device=device,
+                    img_size=img_size,
+                    pixel_mean=pixel_mean,
+                    pixel_std=pixel_std,
+                )
+                current_history.append(next_emb)
+                current_history = current_history[-history_len:]
+                current_state = make_markov_state(current_history, markov_deriv)
+                current_block = current_block_pose(plan_env)
+
+                synced_state = extract_full_state(plan_env)
+                visible_frame = reset_env_to_state(viz_env.unwrapped, synced_state)
+
+                rollout_frames.append(visible_frame.copy())
+                latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
+                block_goal_distance = block_pose_distance(current_block, goal_block)
+                latent_goal_distances.append(latent_goal_distance)
+                block_goal_distances.append(block_goal_distance)
+
+                pbar.set_postfix(
+                    solve_ms=f"{solve_times_ms[-1]:.1f}",
+                    iters=f"{ilqr_iterations[-1]}",
+                    latent_goal=f"{latent_goal_distance:.3f}",
+                    block_goal=f"{block_goal_distance:.3f}",
+                )
+
+                reached_goal, _ = goal_reached(current_block, goal_block)
+                if reached_goal:
+                    stop_reason = "goal_reached"
+                    break
+                if terminated or truncated:
+                    stop_reason = "terminated" if terminated else "truncated"
+                    break
+        except KeyboardInterrupt:
+            stop_reason = "keyboard_interrupt"
+        finally:
+            pbar.close()
+
+        final_block = current_block_pose(plan_env)
+        final_agent = current_agent_pos(plan_env)
+        video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
+    finally:
+        plan_env.close()
+        viz_env.close()
 
     metrics = {
         "episode_idx": episode_idx,
@@ -666,6 +760,9 @@ def main() -> None:
         "num_mpc_steps": len(executed_actions_norm),
         "action_space": "normalized_dataset_action_then_raw_then_absolute_env_target",
         "env_action_scale": ENV_ACTION_SCALE,
+        "action_target_low": action_low.tolist(),
+        "action_target_high": action_high.tolist(),
+        "num_action_clips": num_action_clips,
         "start_agent_pos": state_np[0, :2].tolist(),
         "goal_block_pose": goal_block.tolist(),
         "final_agent_pos": final_agent.tolist(),
