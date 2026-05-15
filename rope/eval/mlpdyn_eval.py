@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate Markov-state MLP latent rollouts on one PushT trajectory."""
+"""Evaluate Markov-state MLP-predictor LE-WM latent rollouts on one OGBench cube trajectory."""
 
 from __future__ import annotations
 
@@ -19,23 +19,26 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from rope.train.mlpdyn_train import (
+    LeWMRopeDataset,
+    build_markov_state,
+    preprocess_pixels,
+    required_markov_history,
+)
 
-from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, preprocess_pixels, required_markov_history
-
-DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
-DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_lewm_dataset_ft"
-DEFAULT_OUT_DIR = "pusht/eval/mlpdyn_eval"
-DEFAULT_START_TIMESTEP = 25
+DEFAULT_DATASET_PATH = "rope/data/expert_data/rope_random_cubic_spline.h5"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn"
+DEFAULT_OUT_DIR = "rope/eval/mlpdyn_eval"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
-    parser.add_argument("--checkpoint", type=Path, default="pusht/models/mlpdyn_withgreenT_1/mlpdyn_epoch_16_object.ckpt")
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--episode-idx", type=int, default=18207)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--episode-idx", type=int, default=None)
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--markov-deriv", type=int, default=None)
     parser.add_argument("--num-preds", type=int, default=None)
     parser.add_argument("--frameskip", type=int, default=None)
@@ -43,7 +46,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-dim", type=int, default=None)
     parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--max-rollout-steps", type=int, default=None)
-    parser.add_argument("--start-timestep", type=int, default=DEFAULT_START_TIMESTEP)
     return parser.parse_args()
 
 
@@ -70,10 +72,10 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, object]) -> None:
     defaults = {
         "markov_deriv": 1,
-        "num_preds": 5,
+        "num_preds": 1,
         "frameskip": 1,
         "img_size": 224,
-        "action_dim": 2,
+        "action_dim": 5,
     }
     for key, fallback in defaults.items():
         if getattr(args, key) is None:
@@ -117,7 +119,7 @@ def load_episode(
     *,
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    dataset = LeWMPushTDataset(
+    dataset = LeWMRopeDataset(
         dataset_path,
         markov_deriv=args.markov_deriv,
         num_preds=args.num_preds,
@@ -131,6 +133,7 @@ def load_episode(
         rows = np.arange(ep_offset, ep_offset + ep_len, dtype=np.int64)
         pixels_np = np.asarray(h5["pixels"][rows], dtype=np.uint8)
         pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
+        pixels = preprocess_pixels(pixels.unsqueeze(0), args.img_size)[0]
 
         actions = np.asarray(h5["action"][rows], dtype=np.float32)
         actions = (np.nan_to_num(actions, nan=0.0) - dataset.action_mean) / dataset.action_std
@@ -144,13 +147,11 @@ def encode_frames(
     pixels: torch.Tensor,
     *,
     device: torch.device,
-    img_size: int,
     frame_batch_size: int,
 ) -> torch.Tensor:
     latents = []
     for start in range(0, pixels.shape[0], frame_batch_size):
         chunk = pixels[start : start + frame_batch_size].to(device)
-        chunk = preprocess_pixels(chunk.unsqueeze(0), img_size)[0]
         output = model.encoder(chunk, interpolate_pos_encoding=True)
         emb = model.projector(output.last_hidden_state[:, 0])
         latents.append(emb)
@@ -163,37 +164,29 @@ def rollout_latents(
     true_latents: torch.Tensor,
     actions: torch.Tensor,
     *,
-    start_timestep: int,
     markov_deriv: int,
     frameskip: int,
     max_rollout_steps: int | None,
 ) -> torch.Tensor:
     device = true_latents.device
-    if start_timestep < 0:
-        raise ValueError("start_timestep must be non-negative.")
-    if start_timestep >= true_latents.shape[0] - 1:
-        raise ValueError("start_timestep must leave at least one future frame to predict.")
-
-    rollout_steps = (true_latents.shape[0] - 1 - start_timestep) // frameskip
+    rollout_steps = (true_latents.shape[0] - 1) // frameskip
     if max_rollout_steps is not None:
         rollout_steps = min(rollout_steps, max_rollout_steps)
     if rollout_steps < 1:
-        raise ValueError("Not enough actions for a rollout with the requested start_timestep/history/frameskip.")
+        raise ValueError("Not enough actions for a rollout with the requested history/frameskip.")
     if markov_deriv < 0:
         raise ValueError("markov_deriv must be non-negative.")
 
     history_len = required_markov_history(markov_deriv)
-    history_start = max(0, start_timestep - history_len + 1)
-    history = true_latents[history_start : start_timestep + 1]
-    if history.shape[0] < history_len:
-        pad = history[:1].repeat(history_len - history.shape[0], 1)
-        history = torch.cat([pad, history], dim=0)
+    history = true_latents[:1]
+    if history_len > 1:
+        history = torch.cat((history[:1].repeat(history_len - 1, 1), history), dim=0)
     state = build_markov_state(history.unsqueeze(0), markov_deriv)
-    pred_latents = [lat for lat in true_latents[: start_timestep + 1]]
+    pred_latents = [true_latents[0]]
     embed_dim = true_latents.shape[-1]
 
     for step in range(rollout_steps):
-        action_start = start_timestep + step * frameskip
+        action_start = step * frameskip
         action_stop = action_start + frameskip
         act = actions[action_start:action_stop].reshape(1, 1, -1).to(device)
         act_emb = model.action_encoder(act)
@@ -205,28 +198,18 @@ def rollout_latents(
     return torch.stack(pred_latents, dim=0)
 
 
-def compute_metrics(
-    true_latents: torch.Tensor,
-    pred_latents: torch.Tensor,
-    *,
-    start_timestep: int,
-    frameskip: int,
-) -> dict[str, object]:
-    num_pred_steps = pred_latents.shape[0] - (start_timestep + 1)
-    pred_indices = start_timestep + np.arange(1, num_pred_steps + 1, dtype=np.int64) * frameskip
+def compute_metrics(true_latents: torch.Tensor, pred_latents: torch.Tensor, *, frameskip: int) -> dict[str, object]:
+    pred_indices = np.arange(1, pred_latents.shape[0], dtype=np.int64) * frameskip
+    pred_indices = pred_indices[pred_indices < true_latents.shape[0]]
     if pred_indices.size == 0:
         raise ValueError("Rollout is not longer than the warm-start history.")
-    max_valid = true_latents.shape[0]
-    pred_indices = pred_indices[pred_indices < max_valid]
-    if pred_indices.size == 0:
-        raise ValueError("No valid predicted timesteps remain after alignment.")
     true = true_latents[pred_indices].float().cpu()
-    pred = pred_latents[start_timestep + 1 : start_timestep + 1 + pred_indices.size].float().cpu()
+    pred = pred_latents[1 : 1 + pred_indices.size].float().cpu()
     err = pred - true
     rmse_per_step = err.pow(2).mean(dim=-1).sqrt()
     rmse_per_dim = err.pow(2).mean(dim=0).sqrt()
     return {
-        "num_context_steps": start_timestep + 1,
+        "num_context_steps": 1,
         "num_rollout_steps": int(true.shape[0]),
         "embed_dim": int(true.shape[-1]),
         "mean_rmse": float(rmse_per_step.mean()),
@@ -271,7 +254,7 @@ def plot_latents(
             axes[0].set_axis_off()
         axes[0].legend(loc="upper right")
         axes[-1].set_xlabel("trajectory frame")
-        fig.suptitle(f"PushT Markov MLP latent rollout episode {episode_idx}, dims {start_dim}-{end_dim - 1}")
+        fig.suptitle(f"Markov MLP LE-WM latent rollout episode {episode_idx}, dims {start_dim}-{end_dim - 1}")
         fig.tight_layout()
         path = out_dir / f"episode_{episode_idx:05d}_latents_part_{plot_idx}.png"
         fig.savefig(path, dpi=160)
@@ -322,25 +305,18 @@ def main() -> None:
         model,
         pixels,
         device=device,
-        img_size=args.img_size,
         frame_batch_size=args.frame_batch_size,
     )
     pred_latents = rollout_latents(
         model,
         true_latents,
         actions.to(device),
-        start_timestep=args.start_timestep,
         markov_deriv=args.markov_deriv,
         frameskip=args.frameskip,
         max_rollout_steps=args.max_rollout_steps,
     )
 
-    metrics = compute_metrics(
-        true_latents,
-        pred_latents,
-        start_timestep=args.start_timestep,
-        frameskip=args.frameskip,
-    )
+    metrics = compute_metrics(true_latents, pred_latents, frameskip=args.frameskip)
     metrics.update(
         {
             "episode_idx": episode_idx,
@@ -354,7 +330,6 @@ def main() -> None:
             "markov_state_dim": int(true_latents.shape[-1] * (args.markov_deriv + 1)),
             "num_preds": args.num_preds,
             "frameskip": args.frameskip,
-            "start_timestep": args.start_timestep,
         }
     )
     metrics_path = out_dir / f"episode_{episode_idx:05d}_metrics.json"
@@ -366,7 +341,7 @@ def main() -> None:
         pred_latents,
         out_dir=out_dir,
         episode_idx=episode_idx,
-        num_context_steps=args.start_timestep + 1,
+        num_context_steps=1,
     )
     print(
         json.dumps(

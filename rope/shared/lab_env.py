@@ -9,6 +9,7 @@ import imageio.v2 as imageio
 import mujoco
 import mujoco.viewer
 import numpy as np
+from scipy.interpolate import CubicSpline
 
 
 SHARED_DIR = Path(__file__).resolve().parent
@@ -34,9 +35,10 @@ DEFAULT_VIEWER_LOOKAT = np.array([0.0, 0.0, 0.95], dtype=float)
 DEFAULT_VIEWER_DISTANCE = 1.6
 DEFAULT_VIEWER_AZIMUTH = 0.0
 DEFAULT_VIEWER_ELEVATION = -20.0
-RANDOM_SPLINE_MODE = "RANDOM_SPLINE"
+RANDOM_CUBIC_SPLINE_MODE = "RANDOM_CUBIC_SPLINE"
+RANDOM_WAYPOINT_MODE = "RANDOM_WAYPOINT"
 WS_EDGE_SAMPLE_MODE = "WS_EDGE_SAMPLE"
-MODE = WS_EDGE_SAMPLE_MODE
+MODE = RANDOM_CUBIC_SPLINE_MODE
 
 
 @dataclass(frozen=True)
@@ -498,15 +500,16 @@ class LabEnv:
 
 
 @dataclass
-class RandomSplinePolicy:
+class RandomWaypointPolicy:
     bounds: TaskBounds
     segment_duration: float = 2.0
     num_waypoints: int = 6
+    seed: int | None = None
     _rng: np.random.Generator = field(init=False)
     _waypoints: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
-        self._rng = np.random.default_rng()
+        self._rng = np.random.default_rng(self.seed)
         lower = np.array([self.bounds.reach[0], self.bounds.height[0], self.bounds.width[0]], dtype=float)
         upper = np.array([self.bounds.reach[1], self.bounds.height[1], self.bounds.width[1]], dtype=float)
         nominal = TaskState.from_array(NOMINAL_TASK_STATE).as_array()
@@ -518,11 +521,48 @@ class RandomSplinePolicy:
 
     def sample(self, t: float) -> TaskState:
         total_segments = len(self._waypoints) - 1
-        local_t = max(t, 0.0) / self.segment_duration
-        segment = int(local_t) % total_segments
-        alpha = local_t - int(local_t)
+        local_t = np.clip(max(t, 0.0) / self.segment_duration, 0.0, float(total_segments))
+        segment = min(int(local_t), total_segments - 1)
+        alpha = min(local_t - segment, 1.0)
         smooth = alpha * alpha * (3.0 - 2.0 * alpha)
         state = (1.0 - smooth) * self._waypoints[segment] + smooth * self._waypoints[segment + 1]
+        return self.bounds.clip(state)
+
+
+@dataclass
+class RandomSplinePolicy:
+    bounds: TaskBounds
+    segment_duration: float = 2.0
+    midpoint_inflation_scale: float = 0.08
+    seed: int | None = None
+    _rng: np.random.Generator = field(init=False)
+    _control_points: np.ndarray = field(init=False)
+    _spline: CubicSpline = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._rng = np.random.default_rng(self.seed)
+        self._control_points = self._sample_control_points()
+        self._spline = CubicSpline(
+            np.array([0.0, 0.5, 1.0], dtype=float),
+            self._control_points,
+            axis=0,
+            bc_type=((1, np.zeros(3, dtype=float)), (1, np.zeros(3, dtype=float))),
+        )
+
+    def _sample_control_points(self) -> np.ndarray:
+        lower = np.array([self.bounds.reach[0], self.bounds.height[0], self.bounds.width[0]], dtype=float)
+        upper = np.array([self.bounds.reach[1], self.bounds.height[1], self.bounds.width[1]], dtype=float)
+        extent = upper - lower
+        inflated_lower = lower - self.midpoint_inflation_scale * extent
+        inflated_upper = upper + self.midpoint_inflation_scale * extent
+        start = self._rng.uniform(lower, upper)
+        midpoint = self._rng.uniform(inflated_lower, inflated_upper)
+        end = self._rng.uniform(lower, upper)
+        return np.stack([start, midpoint, end], axis=0)
+
+    def sample(self, t: float) -> TaskState:
+        alpha = np.clip(max(t, 0.0) / self.segment_duration, 0.0, 1.0)
+        state = np.asarray(self._spline(alpha), dtype=float)
         return self.bounds.clip(state)
 
 
@@ -557,18 +597,20 @@ class WorkspaceEdgeSamplePolicy:
         self._segments = [(corners[start].copy(), corners[end].copy()) for start, end in edge_indices]
 
     def sample(self, t: float) -> TaskState:
-        local_t = max(t, 0.0) / self.segment_duration
-        segment = int(local_t) % len(self._segments)
-        alpha = local_t - int(local_t)
+        local_t = np.clip(max(t, 0.0) / self.segment_duration, 0.0, float(len(self._segments)))
+        segment = min(int(local_t), len(self._segments) - 1)
+        alpha = min(local_t - segment, 1.0)
         smooth = alpha * alpha * (3.0 - 2.0 * alpha)
         start, end = self._segments[segment]
         state = (1.0 - smooth) * start + smooth * end
         return self.bounds.clip(state)
 
 
-def make_task_policy(mode: str, bounds: TaskBounds) -> RandomSplinePolicy | WorkspaceEdgeSamplePolicy:
-    if mode == RANDOM_SPLINE_MODE:
+def make_task_policy(mode: str, bounds: TaskBounds) -> RandomWaypointPolicy | RandomSplinePolicy | WorkspaceEdgeSamplePolicy:
+    if mode == RANDOM_CUBIC_SPLINE_MODE:
         return RandomSplinePolicy(bounds)
+    if mode == RANDOM_WAYPOINT_MODE:
+        return RandomWaypointPolicy(bounds)
     if mode == WS_EDGE_SAMPLE_MODE:
         return WorkspaceEdgeSamplePolicy(bounds)
     raise ValueError(f"Unsupported task policy mode: {mode}")
@@ -577,7 +619,7 @@ def make_task_policy(mode: str, bounds: TaskBounds) -> RandomSplinePolicy | Work
 def run_demo(
     output_path: Path,
     *,
-    mode: str = RANDOM_SPLINE_MODE,
+    mode: str = RANDOM_CUBIC_SPLINE_MODE,
     width: int = DEFAULT_RENDER_WIDTH,
     height: int = DEFAULT_RENDER_HEIGHT,
     fps: int = DEFAULT_RENDER_FPS,
@@ -627,7 +669,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         type=str,
         default=MODE,
-        choices=[RANDOM_SPLINE_MODE, WS_EDGE_SAMPLE_MODE],
+        choices=[RANDOM_CUBIC_SPLINE_MODE, RANDOM_WAYPOINT_MODE, WS_EDGE_SAMPLE_MODE],
         help="Task generator mode.",
     )
     parser.add_argument("--width", type=int, default=DEFAULT_RENDER_WIDTH, help="Output video width in pixels.")
