@@ -20,6 +20,7 @@ except ModuleNotFoundError:
     hdf5plugin = None
 
 from pusht.plan.random_spline_plan import RandomSplineController
+from pusht.plan.random_spline_plan import DEFAULT_NUM_CHAINED_SPLINES
 from pusht.plan.random_spline_plan import DEFAULT_SPLINE_SAMPLING_ATTEMPTS
 from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env
 from pusht.shared.utils import env_action_from_policy_action, load_expert_policy_bundle
@@ -28,7 +29,7 @@ DEFAULT_MODEL_DIR = Path("pusht/models")
 DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_train.h5")
 ROLLOUT_MODES = ("expert", "expert_plus_noise", "random_spline")
 RATIOS = (0.4, 0.2, 0.4)  # expert, expert_plus_noise, random_spline
-DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500, 250)
+DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500, 500)
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SPLINE_SAMPLING_ATTEMPTS,
         help="How many times to resample random-spline geometry before giving up.",
+    )
+    parser.add_argument(
+        "--num-chained-splines",
+        type=int,
+        default=DEFAULT_NUM_CHAINED_SPLINES,
+        help="How many spline segments to chain together within a random-spline rollout.",
     )
     parser.add_argument("--waypoint-tol", type=float, default=18.0)
     parser.add_argument("--kp", type=float, default=1.0)
@@ -292,6 +299,7 @@ def _make_random_spline_controller(
         kd=args.kd,
         max_action_delta=args.max_action_delta,
         spline_sampling_attempts=args.spline_sampling_attempts,
+        num_chained_splines=args.num_chained_splines,
     )
 
 
@@ -573,6 +581,8 @@ def main() -> None:
         raise ValueError("--expert-noise-std must be >= 0.")
     if args.spline_sampling_attempts < 1:
         raise ValueError("--spline-sampling-attempts must be >= 1.")
+    if args.num_chained_splines < 1:
+        raise ValueError("--num-chained-splines must be >= 1.")
     if args.out.exists():
         raise FileExistsError(f"Output already exists: {args.out}")
 

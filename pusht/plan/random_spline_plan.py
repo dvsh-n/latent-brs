@@ -25,8 +25,9 @@ DEFAULT_OUT_DIR = Path("pusht/plan/random_spline_plan")
 ARENA_MIN = 32.0
 ARENA_MAX = 480.0
 ENV_ACTION_SCALE = 100.0
-DEFAULT_MAX_STEPS = 250
-DEFAULT_SPLINE_SAMPLING_ATTEMPTS = 8
+DEFAULT_MAX_STEPS = 500
+DEFAULT_SPLINE_SAMPLING_ATTEMPTS = 500
+DEFAULT_NUM_CHAINED_SPLINES = 10
 TEE_SCALE = 30.0
 TEE_LENGTH = 4.0
 TEE_BAR_X_MIN = -TEE_LENGTH * TEE_SCALE / 2.0
@@ -64,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SPLINE_SAMPLING_ATTEMPTS,
         help="How many times to resample contact/circle geometry before giving up.",
+    )
+    parser.add_argument(
+        "--num-chained-splines",
+        type=int,
+        default=DEFAULT_NUM_CHAINED_SPLINES,
+        help="How many spline segments to chain together before the rollout stops.",
     )
     parser.add_argument("--contact-tol", type=float, default=14.0)
     parser.add_argument("--waypoint-tol", type=float, default=18.0)
@@ -409,6 +416,15 @@ def _observation_goal_pose(observation: dict[str, Any]) -> np.ndarray:
 @dataclass
 class RandomSplineController:
     spline_xy: np.ndarray
+    spline_meta: dict[str, Any]
+    rng: np.random.Generator
+    num_points: int
+    circle_min_radius: float
+    circle_max_radius: float
+    min_angle_separation_deg: float
+    angle_jitter_deg: float
+    spline_sampling_attempts: int
+    num_chained_splines: int
     waypoint_tol: float
     kp: float
     kd: float
@@ -417,6 +433,8 @@ class RandomSplineController:
     action_high: np.ndarray
     prev_error: np.ndarray
     waypoint_idx: int = 0
+    completed_splines: int = 0
+    spline_history: list[dict[str, Any]] | None = None
 
     @classmethod
     def from_observation(
@@ -434,10 +452,13 @@ class RandomSplineController:
         kd: float,
         max_action_delta: float,
         spline_sampling_attempts: int = DEFAULT_SPLINE_SAMPLING_ATTEMPTS,
+        num_chained_splines: int = DEFAULT_NUM_CHAINED_SPLINES,
         action_low: np.ndarray | None = None,
         action_high: np.ndarray | None = None,
     ) -> "RandomSplineController":
-        spline_xy, _ = _make_spline_with_retries(
+        if num_chained_splines < 1:
+            raise ValueError("--num-chained-splines must be >= 1.")
+        spline_xy, spline_meta = _make_spline_with_retries(
             _observation_agent_xy(observation),
             _observation_block_pose(observation),
             _observation_goal_pose(observation),
@@ -451,6 +472,15 @@ class RandomSplineController:
         )
         return cls(
             spline_xy=spline_xy,
+            spline_meta=spline_meta,
+            rng=rng,
+            num_points=int(num_points),
+            circle_min_radius=float(circle_min_radius),
+            circle_max_radius=float(circle_max_radius),
+            min_angle_separation_deg=float(min_angle_separation_deg),
+            angle_jitter_deg=float(angle_jitter_deg),
+            spline_sampling_attempts=int(spline_sampling_attempts),
+            num_chained_splines=int(num_chained_splines),
             waypoint_tol=float(waypoint_tol),
             kp=float(kp),
             kd=float(kd),
@@ -458,9 +488,47 @@ class RandomSplineController:
             action_low=np.asarray(action_low if action_low is not None else [-1.0, -1.0], dtype=np.float32),
             action_high=np.asarray(action_high if action_high is not None else [1.0, 1.0], dtype=np.float32),
             prev_error=np.zeros(2, dtype=np.float32),
+            spline_history=[dict(spline_meta)],
         )
 
+    def _current_spline_reached(self, observation: dict[str, Any]) -> bool:
+        agent_xy = _observation_agent_xy(observation)
+        return bool(
+            self.waypoint_idx == len(self.spline_xy) - 1
+            and np.linalg.norm(agent_xy - self.spline_xy[-1]) <= self.waypoint_tol
+        )
+
+    def _start_next_spline(self, observation: dict[str, Any]) -> None:
+        spline_xy, spline_meta = _make_spline_with_retries(
+            _observation_agent_xy(observation),
+            _observation_block_pose(observation),
+            _observation_goal_pose(observation),
+            self.rng,
+            circle_min_radius=self.circle_min_radius,
+            circle_max_radius=self.circle_max_radius,
+            min_angle_separation_deg=self.min_angle_separation_deg,
+            angle_jitter_deg=self.angle_jitter_deg,
+            num_points=self.num_points,
+            max_attempts=self.spline_sampling_attempts,
+        )
+        self.spline_xy = spline_xy
+        self.spline_meta = spline_meta
+        self.waypoint_idx = 0
+        self.prev_error = np.zeros(2, dtype=np.float32)
+        if self.spline_history is None:
+            self.spline_history = []
+        self.spline_history.append(dict(spline_meta))
+
+    def _advance_chain_if_needed(self, observation: dict[str, Any]) -> bool:
+        while self._current_spline_reached(observation):
+            self.completed_splines += 1
+            if self.completed_splines >= self.num_chained_splines:
+                return True
+            self._start_next_spline(observation)
+        return False
+
     def select_action(self, observation: dict[str, Any]) -> np.ndarray:
+        self._advance_chain_if_needed(observation)
         agent_xy = _observation_agent_xy(observation)
         while self.waypoint_idx < len(self.spline_xy) - 1 and np.linalg.norm(agent_xy - self.spline_xy[self.waypoint_idx]) <= self.waypoint_tol:
             self.waypoint_idx += 1
@@ -482,11 +550,7 @@ class RandomSplineController:
         )
 
     def reached_goal(self, observation: dict[str, Any]) -> bool:
-        agent_xy = _observation_agent_xy(observation)
-        return bool(
-            self.waypoint_idx == len(self.spline_xy) - 1
-            and np.linalg.norm(agent_xy - self.spline_xy[-1]) <= self.waypoint_tol
-        )
+        return self._advance_chain_if_needed(observation)
 
 
 def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any]:
@@ -494,6 +558,8 @@ def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any
         raise ValueError("--control-interval must be >= 1.")
     if args.spline_sampling_attempts < 1:
         raise ValueError("--spline-sampling-attempts must be >= 1.")
+    if args.num_chained_splines < 1:
+        raise ValueError("--num-chained-splines must be >= 1.")
 
     episode_seed = None if args.seed is None else args.seed + episode_idx
     rng = np.random.default_rng(episode_seed)
@@ -515,21 +581,25 @@ def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any
         waypoint_errors: list[float] = []
         rewards: list[float] = []
 
-        spline_xy, spline_meta = _make_spline_with_retries(
-            get_pusht_agent_pos(env),
-            get_pusht_block_pose(env),
-            goal_pose,
-            rng,
+        controller = RandomSplineController.from_observation(
+            {
+                "agent_pos": get_pusht_agent_pos(env),
+                "block_pose": get_pusht_block_pose(env),
+                "goal_pose": goal_pose,
+            },
+            rng=rng,
+            num_points=args.num_spline_points,
             circle_min_radius=args.circle_min_radius,
             circle_max_radius=args.circle_max_radius,
             min_angle_separation_deg=args.min_angle_separation_deg,
             angle_jitter_deg=args.angle_jitter_deg,
-            num_points=args.num_spline_points,
-            max_attempts=args.spline_sampling_attempts,
+            waypoint_tol=args.waypoint_tol,
+            kp=args.kp,
+            kd=args.kd,
+            max_action_delta=args.max_action_delta,
+            spline_sampling_attempts=args.spline_sampling_attempts,
+            num_chained_splines=args.num_chained_splines,
         )
-
-        prev_error = np.zeros(2, dtype=np.float32)
-        waypoint_idx = 0
         contacted_block = False
         success = False
         terminated = False
@@ -537,6 +607,7 @@ def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any
         reached_pusher_goal = False
         action = None
         control_updates = 0
+        steps_taken = 0
 
         for step_idx in range(args.max_steps):
             agent_xy = get_pusht_agent_pos(env)
@@ -545,31 +616,32 @@ def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any
                 contacted_block = True
 
             if action is None or step_idx % args.control_interval == 0:
-                while waypoint_idx < len(spline_xy) - 1 and np.linalg.norm(agent_xy - spline_xy[waypoint_idx]) <= args.waypoint_tol:
-                    waypoint_idx += 1
-
-                waypoint_xy = spline_xy[waypoint_idx]
-                target_xy, prev_error = _pd_target(
-                    agent_xy,
-                    waypoint_xy,
-                    prev_error,
-                    kp=args.kp,
-                    kd=args.kd,
-                    max_action_delta=args.max_action_delta,
-                )
-                action = _target_xy_to_env_action(env, agent_xy, _clip_xy(target_xy))
+                observation = {
+                    "agent_pos": agent_xy,
+                    "block_pose": block_pose_now,
+                    "goal_pose": goal_pose,
+                }
+                relative_action = controller.select_action(observation)
+                action = _target_xy_to_env_action(env, agent_xy, agent_xy + relative_action * ENV_ACTION_SCALE)
                 control_updates += 1
             _, reward, terminated, truncated, info = env.step(action)
+            steps_taken = step_idx + 1
             success = _extract_success(terminated, float(reward), info)
 
             if (step_idx + 1) % args.control_interval == 0 or terminated or truncated:
                 frames.append(render_frame(env))
                 agent_positions.append(get_pusht_agent_pos(env).tolist())
                 block_poses.append(get_pusht_block_pose(env).tolist())
-                waypoint_errors.append(float(np.linalg.norm(prev_error)))
+                waypoint_errors.append(float(np.linalg.norm(controller.prev_error)))
                 rewards.append(float(reward))
 
-            if waypoint_idx == len(spline_xy) - 1 and np.linalg.norm(get_pusht_agent_pos(env) - spline_xy[-1]) <= args.waypoint_tol:
+            if controller.reached_goal(
+                {
+                    "agent_pos": get_pusht_agent_pos(env),
+                    "block_pose": get_pusht_block_pose(env),
+                    "goal_pose": goal_pose,
+                }
+            ):
                 reached_pusher_goal = True
                 break
 
@@ -603,13 +675,15 @@ def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any
             "success": success,
             "terminated": bool(terminated),
             "truncated": bool(truncated),
-            "env_steps": step_idx + 1 if (terminated or truncated) else args.max_steps,
+            "env_steps": steps_taken,
             "stored_steps": len(frames),
             "control_updates": control_updates,
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "final_waypoint_error": waypoint_errors[-1] if waypoint_errors else 0.0,
             "block_goal_distance": block_goal_distance,
-            "spline": spline_meta,
+            "num_chained_splines": args.num_chained_splines,
+            "completed_splines": controller.completed_splines,
+            "splines": controller.spline_history or [],
             "video_path": str(video_path),
         }
     finally:
