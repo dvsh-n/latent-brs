@@ -25,12 +25,12 @@ from reacher.train.reacher_policy_train_random import RandomGoalDmControlGymEnv
 
 DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac-random-goal/best_model/best_model.zip"
 DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac-random-goal/vecnormalize.pkl"
-DEFAULT_OUTDIR = "reacher/data/expert_data_random_50hz"
+DEFAULT_OUTDIR = "reacher/data/expert_data_50hz"
 DEFAULT_OUTPUT_NAME = "reacher_random_expert.h5"
 
 PHYSICS_FREQ_HZ = 50.0
 CONTROL_FREQ_HZ = 50.0
-STATE_DIM = 6
+STATE_DIM = 8
 QPOS_DIM = 2
 QVEL_DIM = 2
 ACTION_DIM = 2
@@ -47,13 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=500_000,
+        default=None,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=10_000,
+        default=15_000,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -132,11 +132,7 @@ def get_current_observation(env: RandomGoalDmControlGymEnv) -> np.ndarray:
 
 
 def get_dataset_observation(env: RandomGoalDmControlGymEnv) -> np.ndarray:
-    policy_obs = get_current_observation(env)
-    qpos = policy_obs[:QPOS_DIM]
-    qvel = policy_obs[QPOS_DIM : QPOS_DIM + QVEL_DIM]
-    goal_delta = policy_obs[QPOS_DIM + QVEL_DIM + QPOS_DIM :]
-    return np.concatenate((qpos, goal_delta, qvel), axis=0).astype(np.float32)
+    return get_current_observation(env)
 
 
 def hide_target(render_env: RandomGoalDmControlGymEnv) -> None:
@@ -343,7 +339,7 @@ def main() -> None:
     with h5py.File(output_path, "w") as h5:
         h5.attrs["format"] = "stable_worldmodel_hdf5"
         h5.attrs["source"] = "data/reacher_data_gen_random.py"
-        h5.attrs["state_keys"] = json.dumps(["position(2)", "goal_delta(2)", "velocity(2)"])
+        h5.attrs["state_keys"] = json.dumps(["position(2)", "velocity(2)", "goal_qpos(2)", "goal_delta(2)"])
         h5.attrs["task"] = args.task
         h5.attrs["deterministic"] = args.deterministic
         h5.attrs["seed"] = args.seed

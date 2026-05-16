@@ -25,9 +25,9 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
-DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_lewm_dataset"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn_lewm_dataset_ft"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
+DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_lewm_dataset_ft"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset"
 FIXED_FRAMESKIP = 1
 
 
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-scale", default="tiny")
     parser.add_argument("--embed-dim", type=int, default=48)
     parser.add_argument("--markov-deriv", type=int, default=2)
-    parser.add_argument("--num-preds", type=int, default=20, help="Autoregressive rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--freeze-encoder-epochs", type=int, default=25)
+    parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
     parser.add_argument(
         "--load-projector",

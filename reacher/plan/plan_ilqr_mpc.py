@@ -24,11 +24,11 @@ from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/expert_data_random_50hz/reacher_random_expert.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_2"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
-DEVICE = "auto"
+DEVICE = "cpu"
 HORIZON = 20
 MAX_MPC_STEPS = 120
 Q_TERMINAL = 5.0
@@ -152,7 +152,14 @@ def preprocess_pixels(
             mode="bilinear",
             align_corners=False,
         )
+    tensor = tensor.to(device=pixel_mean.device)
     return (tensor - pixel_mean) / pixel_std
+
+
+def imagenet_pixel_stats(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    return pixel_mean, pixel_std
 
 
 @torch.no_grad()
@@ -265,7 +272,34 @@ def reset_env_to_state(
     return physics.render(height=height, width=width, camera_id=0)
 
 
+def build_observation_from_env(
+    env: DmControlGymEnv,
+    *,
+    obs_dim: int,
+    goal_obs: np.ndarray | None = None,
+) -> np.ndarray:
+    if obs_dim == 6:
+        return flatten_observation(env._env.task.get_observation(env._env.physics)).astype(np.float32)
+    if obs_dim == 8:
+        if goal_obs is None or goal_obs.shape[0] != 8:
+            raise ValueError("Need an 8D goal observation to reconstruct random-goal planner observations.")
+        physics = env._env.physics
+        qpos = np.asarray(physics.data.qpos[:2], dtype=np.float32).copy()
+        qvel = np.asarray(physics.data.qvel[:2], dtype=np.float32).copy()
+        goal_qpos = np.asarray(goal_obs[4:6], dtype=np.float32).copy()
+        goal_delta = goal_qpos - qpos
+        return np.concatenate((qpos, qvel, goal_qpos, goal_delta), axis=0).astype(np.float32)
+    raise ValueError(f"Unsupported observation dimension: {obs_dim}")
+
+
 def goal_reached(current_obs: np.ndarray, goal_obs: np.ndarray, threshold: float = 0.05) -> tuple[bool, float]:
+    if current_obs.shape != goal_obs.shape:
+        raise ValueError(f"Observation shape mismatch: {current_obs.shape} vs {goal_obs.shape}")
+    if current_obs.shape[0] == 8:
+        qpos = current_obs[:2]
+        goal_qpos = current_obs[4:6]
+        goal_distance = float(np.linalg.norm(qpos - goal_qpos))
+        return goal_distance <= threshold, goal_distance
     obs_err = float(np.linalg.norm(current_obs - goal_obs))
     return obs_err <= threshold, obs_err
 
@@ -511,8 +545,7 @@ def main() -> None:
         img_size=img_size,
         action_dim=action_dim,
     )
-    pixel_mean = train_stats_dataset.pixel_mean
-    pixel_std = train_stats_dataset.pixel_std
+    pixel_mean, pixel_std = imagenet_pixel_stats(device)
     action_mean = train_stats_dataset.action_mean.astype(np.float32)
     action_std = train_stats_dataset.action_std.astype(np.float32)
 
@@ -609,7 +642,8 @@ def main() -> None:
     current_state = make_markov_state(current_emb)
     goal_state_np = goal_state.detach().cpu().numpy().astype(np.float64)
     goal_obs = obs_np[-1].astype(np.float32)
-    current_obs = flatten_observation(env._env.task.get_observation(env._env.physics)).astype(np.float32)
+    obs_dim = int(goal_obs.shape[0])
+    current_obs = build_observation_from_env(env, obs_dim=obs_dim, goal_obs=goal_obs)
 
     rollout_frames = [current_frame.copy()]
     executed_actions_raw: list[np.ndarray] = []
@@ -635,8 +669,8 @@ def main() -> None:
         executed_actions_norm.append(u0_norm.copy())
         executed_actions_raw.append(u0_raw.copy())
 
-        obs, _, terminated, truncated, _ = env.step(u0_raw)
-        current_obs = np.asarray(obs, dtype=np.float32)
+        _, _, terminated, truncated, _ = env.step(u0_raw)
+        current_obs = build_observation_from_env(env, obs_dim=obs_dim, goal_obs=goal_obs)
         current_frame = env._env.physics.render(height=height, width=width, camera_id=0)
         next_emb = encode_single_frame(
             model,
@@ -674,7 +708,7 @@ def main() -> None:
 
     final_qpos = np.asarray(env._env.physics.data.qpos[: qpos_np.shape[1]], dtype=np.float32)
     final_qvel = np.asarray(env._env.physics.data.qvel[: qvel_np.shape[1]], dtype=np.float32)
-    final_obs = flatten_observation(env._env.task.get_observation(env._env.physics)).astype(np.float32)
+    final_obs = build_observation_from_env(env, obs_dim=obs_dim, goal_obs=goal_obs)
     video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
     env.close()
 
