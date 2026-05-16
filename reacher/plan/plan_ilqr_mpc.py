@@ -28,14 +28,14 @@ DEFAULT_TEST_DATASET_PATH = "reacher/data/expert_data_random_50hz/reacher_random
 DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_2"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
-DEVICE = "cpu"
-HORIZON = 20
+DEVICE = "cuda"
+HORIZON = 50
 MAX_MPC_STEPS = 120
-Q_TERMINAL = 5.0
+Q_TERMINAL = 10.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 60
-EPISODE_IDX = None
+EPISODE_IDX = 14637
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-terminal", type=float, default=Q_TERMINAL)
     parser.add_argument("--q-stage", type=float, default=Q_STAGE)
     parser.add_argument("--r-control", type=float, default=R_CONTROL)
-    parser.add_argument("--ilqr-max-iters", type=int, default=15)
+    parser.add_argument("--ilqr-max-iters", type=int, default=35)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=None)

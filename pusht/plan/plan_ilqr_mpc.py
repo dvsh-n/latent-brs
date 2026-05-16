@@ -28,18 +28,18 @@ from pusht.shared.pusht_env import (
 )
 from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, required_markov_history
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
-DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_lewm_dataset_ft"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
+DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_diffusion_dataset"
 DEFAULT_OUT_DIR = "pusht/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
 HORIZON = 15
-MAX_MPC_STEPS = 100
+MAX_MPC_STEPS = 150
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 10
-EPISODE_IDX = None # 480, 12148
+EPISODE_IDX = 8257 # 480, 12148
 ENV_ACTION_SCALE = 100.0
 PUSHT_WALL_MIN = 5.0
 PUSHT_WALL_MAX = 506.0
@@ -260,6 +260,58 @@ def load_dataset_episode(
         }
 
 
+def infer_dataset_state_format(state: np.ndarray) -> str:
+    state = np.asarray(state, dtype=np.float32).reshape(-1)
+    if state.size < 7:
+        raise ValueError(f"Expected dataset state vectors with at least 7 entries, got shape {state.shape}.")
+    if np.all(np.abs(state[2:4]) <= 1.05):
+        return "privileged_goal_state"
+    return "env_state"
+
+
+def dataset_row_to_env_state(state_row: np.ndarray, proprio_row: np.ndarray, state_format: str) -> np.ndarray:
+    state_row = np.asarray(state_row, dtype=np.float32).reshape(-1)
+    proprio_row = np.asarray(proprio_row, dtype=np.float32).reshape(-1)
+
+    if state_format == "env_state":
+        return state_row[:7].astype(np.float64, copy=True)
+    if state_format != "privileged_goal_state":
+        raise ValueError(f"Unsupported dataset state format: {state_format}")
+    if proprio_row.size < 2:
+        raise ValueError("Privileged goal-state dataset requires proprio to contain agent xy in the first two entries.")
+
+    theta = float(np.arctan2(state_row[3], state_row[2]))
+    return np.asarray(
+        [
+            proprio_row[0],
+            proprio_row[1],
+            state_row[0],
+            state_row[1],
+            theta,
+            0.0,
+            0.0,
+        ],
+        dtype=np.float64,
+    )
+
+
+def dataset_row_to_block_pose(state_row: np.ndarray, env_state_row: np.ndarray, state_format: str) -> np.ndarray:
+    if state_format == "env_state":
+        return np.asarray(env_state_row[2:5], dtype=np.float32)
+    if state_format == "privileged_goal_state":
+        state_row = np.asarray(state_row, dtype=np.float32).reshape(-1)
+        theta = float(np.arctan2(state_row[3], state_row[2]))
+        return np.asarray([state_row[0], state_row[1], theta], dtype=np.float32)
+    raise ValueError(f"Unsupported dataset state format: {state_format}")
+
+
+def dataset_row_to_goal_pose(state_row: np.ndarray, state_format: str) -> np.ndarray | None:
+    if state_format != "privileged_goal_state":
+        return None
+    state_row = np.asarray(state_row, dtype=np.float32).reshape(-1)
+    return np.asarray(state_row[4:7], dtype=np.float32)
+
+
 def make_planning_env(*, width: int, height: int) -> Any:
     return make_no_target_env(height=height, width=width)
 
@@ -287,6 +339,14 @@ def current_block_pose(env: Any) -> np.ndarray:
 
 def current_agent_pos(env: Any) -> np.ndarray:
     return get_pusht_agent_pos(env)
+
+
+def set_goal_pose(env: Any, goal_pose: np.ndarray | None) -> None:
+    if goal_pose is None:
+        return
+    base_env = getattr(env, "unwrapped", env)
+    if hasattr(base_env, "goal_pose"):
+        base_env.goal_pose = np.asarray(goal_pose, dtype=np.float32).copy()
 
 
 def extract_full_state(env: Any) -> np.ndarray:
@@ -587,6 +647,12 @@ def main() -> None:
     proprio_np = np.asarray(episode["proprio"])
     height = int(episode["height"])
     width = int(episode["width"])
+    state_format = infer_dataset_state_format(state_np[0])
+    env_state_np = np.stack(
+        [dataset_row_to_env_state(state_row, proprio_row, state_format) for state_row, proprio_row in zip(state_np, proprio_np)],
+        axis=0,
+    )
+    goal_pose = dataset_row_to_goal_pose(state_np[-1], state_format)
 
     run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
     out_dir = out_root / run_name
@@ -624,9 +690,9 @@ def main() -> None:
     ilqr_costs: list[float] = []
     stop_reason = "max_mpc_steps"
     video_path: str | None = None
-    final_block = state_np[0, 2:5].astype(np.float32)
-    final_agent = state_np[0, :2].astype(np.float32)
-    goal_block = state_np[-1, 2:5].astype(np.float32)
+    final_block = dataset_row_to_block_pose(state_np[0], env_state_np[0], state_format)
+    final_agent = env_state_np[0, :2].astype(np.float32)
+    goal_block = dataset_row_to_block_pose(state_np[-1], env_state_np[-1], state_format)
     rollout_frames: list[np.ndarray] = []
     latent_goal_distances: list[float] = []
     block_goal_distances: list[float] = []
@@ -635,9 +701,11 @@ def main() -> None:
     plan_env = make_planning_env(width=width, height=height)
     viz_env = make_visualization_env(width=width, height=height)
     try:
+        set_goal_pose(plan_env, goal_pose)
+        set_goal_pose(viz_env, goal_pose)
         action_low, action_high = pusht_agent_action_bounds()
-        hidden_start = reset_env_to_state(plan_env, state_np[0])
-        visible_start = reset_env_to_state(viz_env.unwrapped, state_np[0])
+        hidden_start = reset_env_to_state(plan_env, env_state_np[0])
+        visible_start = reset_env_to_state(viz_env.unwrapped, env_state_np[0])
         dynamics = MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
         mpc_solver = ILQRMPCSolver(
             dynamics,
@@ -749,6 +817,7 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "config_path": str(model_dir / "config.json"),
         "dataset_path": str(dataset_path),
+        "dataset_state_format": state_format,
         "markov_deriv": markov_deriv,
         "action_history_size": 1,
         "state_space": "latent_plus_finite_differences",
@@ -763,8 +832,9 @@ def main() -> None:
         "action_target_low": action_low.tolist(),
         "action_target_high": action_high.tolist(),
         "num_action_clips": num_action_clips,
-        "start_agent_pos": state_np[0, :2].tolist(),
+        "start_agent_pos": env_state_np[0, :2].tolist(),
         "goal_block_pose": goal_block.tolist(),
+        "goal_pose": goal_pose.tolist() if goal_pose is not None else None,
         "final_agent_pos": final_agent.tolist(),
         "final_block_pose": final_block.tolist(),
         "goal_proprio": proprio_np[-1].tolist(),
