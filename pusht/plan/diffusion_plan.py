@@ -28,10 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--video-name", default="diffusion_plan.mp4")
+    parser.add_argument("--fps", type=int, default=10, help="Output video frame rate.")
     parser.add_argument("--action-mode", default="auto", choices=["auto", "absolute", "relative"])
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--control-noise", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--control-noise-std", type=float, default=0.2)
+    parser.add_argument("--control-noise-std", type=float, default=8.5)
     parser.add_argument(
         "--control-interval",
         type=int,
@@ -65,18 +66,6 @@ def save_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(path, frames, fps=fps)
-
-
-def _get_video_fps(env: Any, control_interval: int) -> int:
-    metadata = getattr(env, "metadata", None) or getattr(getattr(env, "unwrapped", None), "metadata", None) or {}
-    base_fps = metadata.get("render_fps")
-    if base_fps is None:
-        dt = getattr(getattr(env, "unwrapped", None), "dt", None)
-        if dt is not None and dt > 1e-6:
-            base_fps = float(round(1.0 / dt))
-    if base_fps is None:
-        base_fps = 10.0
-    return max(1, int(round(float(base_fps) / float(control_interval))))
 
 
 def _policy_view_frame(bundle, observation: dict[str, Any], env: Any) -> np.ndarray:
@@ -156,7 +145,6 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     final_block_pose = get_pusht_block_pose(env).tolist()
     final_agent_pos = get_pusht_agent_pos(env).tolist()
     goal_pose = extract_goal_pose(env)
-    video_fps = _get_video_fps(env, args.control_interval)
     env.close()
     stored_steps = len(frames)
 
@@ -164,7 +152,7 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     if not args.no_video:
         suffix = "" if args.episodes == 1 else f"_episode_{episode_idx:03d}"
         video_path = args.out_dir / f"{Path(args.video_name).stem}{suffix}{Path(args.video_name).suffix}"
-        save_video(video_path, frames, video_fps)
+        save_video(video_path, frames, max(1, int(args.fps)))
 
     return {
         "episode": episode_idx,

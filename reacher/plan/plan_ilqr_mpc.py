@@ -29,7 +29,7 @@ DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-HORIZON = 35
+HORIZON = 20
 MAX_MPC_STEPS = 120
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005

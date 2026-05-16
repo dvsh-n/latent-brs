@@ -24,10 +24,12 @@ from pusht.shared.utils import render_frame
 DEFAULT_OUT_DIR = Path("pusht/plan/random_spline_plan")
 ARENA_MIN = 32.0
 ARENA_MAX = 480.0
+ARENA_CENTER = np.asarray([(ARENA_MIN + ARENA_MAX) / 2.0, (ARENA_MIN + ARENA_MAX) / 2.0], dtype=np.float32)
 ENV_ACTION_SCALE = 100.0
 DEFAULT_MAX_STEPS = 500
 DEFAULT_SPLINE_SAMPLING_ATTEMPTS = 500
 DEFAULT_NUM_CHAINED_SPLINES = 10
+DEFAULT_BLOCK_CENTER_JITTER = 48.0
 TEE_SCALE = 30.0
 TEE_LENGTH = 4.0
 TEE_BAR_X_MIN = -TEE_LENGTH * TEE_SCALE / 2.0
@@ -49,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--video-name", default="random_spline_plan.mp4")
+    parser.add_argument("--fps", type=int, default=10, help="Output video frame rate.")
     parser.add_argument(
         "--control-interval",
         type=int,
@@ -58,8 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-spline-points", type=int, default=80)
     parser.add_argument("--circle-min-radius", type=float, default=65.0)
     parser.add_argument("--circle-max-radius", type=float, default=95.0)
-    parser.add_argument("--min-angle-separation-deg", type=float, default=45.0)
-    parser.add_argument("--angle-jitter-deg", type=float, default=120.0)
+    parser.add_argument("--min-angle-separation-deg", type=float, default=20.0)
+    parser.add_argument("--angle-jitter-deg", type=float, default=160.0)
     parser.add_argument(
         "--spline-sampling-attempts",
         type=int,
@@ -76,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--waypoint-tol", type=float, default=18.0)
     parser.add_argument("--kp", type=float, default=1.0)
     parser.add_argument("--kd", type=float, default=0.18)
-    parser.add_argument("--max-action-delta", type=float, default=80.0)
+    parser.add_argument("--max-action-delta", type=float, default=50.0)
     return parser.parse_args()
 
 
@@ -88,10 +91,16 @@ def _sample_xy(rng: np.random.Generator, *, margin: float = 48.0) -> np.ndarray:
     return rng.uniform(ARENA_MIN + margin, ARENA_MAX - margin, size=(2,)).astype(np.float32)
 
 
+def _sample_centered_xy(rng: np.random.Generator, *, jitter: float = DEFAULT_BLOCK_CENTER_JITTER) -> np.ndarray:
+    low = np.maximum(ARENA_CENTER - jitter, ARENA_MIN)
+    high = np.minimum(ARENA_CENTER + jitter, ARENA_MAX)
+    return rng.uniform(low, high).astype(np.float32)
+
+
 def _sample_state(rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
     for _ in range(1024):
         agent_xy = _sample_xy(rng, margin=56.0)
-        block_xy = _sample_xy(rng, margin=96.0)
+        block_xy = _sample_centered_xy(rng)
         if np.linalg.norm(agent_xy - block_xy) >= 90.0:
             theta = float(rng.uniform(-np.pi, np.pi))
             state = np.asarray(
@@ -178,7 +187,11 @@ def _sample_point_on_t(block_pose: np.ndarray, rng: np.random.Generator) -> tupl
         )
         region = "stem"
     world_xy = (_rotation_matrix(float(block_pose[2])) @ local_xy) + block_pose[:2]
-    return world_xy.astype(np.float32), {"region": region, "local_x": float(local_xy[0]), "local_y": float(local_xy[1])}
+    return world_xy.astype(np.float32), {
+        "region": region,
+        "local_x": float(local_xy[0]),
+        "local_y": float(local_xy[1]),
+    }
 
 
 def _in_bounds(xy: np.ndarray) -> bool:
@@ -340,18 +353,6 @@ def _make_spline_with_retries(
         f"Failed to sample a valid random spline after {max_attempts} attempts. "
         "Try reducing circle radii, reducing min angle separation, or increasing angle jitter."
     ) from last_error
-
-
-def _get_video_fps(env: Any, control_interval: int) -> int:
-    metadata = getattr(env, "metadata", None) or getattr(getattr(env, "unwrapped", None), "metadata", None) or {}
-    base_fps = metadata.get("render_fps")
-    if base_fps is None:
-        dt = getattr(getattr(env, "unwrapped", None), "dt", None)
-        if dt is not None and dt > 1e-6:
-            base_fps = float(round(1.0 / dt))
-    if base_fps is None:
-        base_fps = 10.0
-    return max(1, int(round(float(base_fps) / float(control_interval))))
 
 
 def _target_xy_to_env_action(env: Any, agent_xy: np.ndarray, target_xy: np.ndarray) -> np.ndarray:
@@ -654,7 +655,7 @@ def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any
         imageio.mimwrite(
             video_path,
             frames,
-            fps=_get_video_fps(env, args.control_interval),
+            fps=max(1, int(args.fps)),
             quality=8,
             macro_block_size=1,
         )

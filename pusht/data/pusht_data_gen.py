@@ -19,17 +19,14 @@ try:
 except ModuleNotFoundError:
     hdf5plugin = None
 
-from pusht.plan.random_spline_plan import RandomSplineController
-from pusht.plan.random_spline_plan import DEFAULT_NUM_CHAINED_SPLINES
-from pusht.plan.random_spline_plan import DEFAULT_SPLINE_SAMPLING_ATTEMPTS
 from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env
 from pusht.shared.utils import env_action_from_policy_action, load_expert_policy_bundle
 
 DEFAULT_MODEL_DIR = Path("pusht/models")
-DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_train.h5")
-ROLLOUT_MODES = ("expert", "expert_plus_noise", "random_spline")
-RATIOS = (0.4, 0.2, 0.4)  # expert, expert_plus_noise, random_spline
-DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500, 500)
+DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_diffusion_train.h5")
+ROLLOUT_MODES = ("expert", "expert_plus_noise")
+RATIOS = (0.67, 0.33)  # expert, expert_plus_noise
+DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500)
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,12 +49,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_ENV_STEPS_BY_MODE[1],
         help="Max env steps for expert_plus_noise rollouts.",
     )
-    parser.add_argument(
-        "--max-steps-random-spline",
-        type=int,
-        default=DEFAULT_MAX_ENV_STEPS_BY_MODE[2],
-        help="Max env steps for random_spline rollouts.",
-    )
     parser.add_argument("--image-height", type=int, default=224)
     parser.add_argument("--image-width", type=int, default=224)
     parser.add_argument(
@@ -70,28 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--async-envs", action="store_true", default=True)
     parser.add_argument("--keep-failures", action="store_true", default=True)
     parser.add_argument("--hide-target", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--expert-noise-std", type=float, default=0.2)
-    parser.add_argument("--num-spline-points", type=int, default=80)
-    parser.add_argument("--circle-min-radius", type=float, default=45.0)
-    parser.add_argument("--circle-max-radius", type=float, default=85.0)
-    parser.add_argument("--min-angle-separation-deg", type=float, default=30.0)
-    parser.add_argument("--angle-jitter-deg", type=float, default=60.0)
-    parser.add_argument(
-        "--spline-sampling-attempts",
-        type=int,
-        default=DEFAULT_SPLINE_SAMPLING_ATTEMPTS,
-        help="How many times to resample random-spline geometry before giving up.",
-    )
-    parser.add_argument(
-        "--num-chained-splines",
-        type=int,
-        default=DEFAULT_NUM_CHAINED_SPLINES,
-        help="How many spline segments to chain together within a random-spline rollout.",
-    )
-    parser.add_argument("--waypoint-tol", type=float, default=18.0)
-    parser.add_argument("--kp", type=float, default=1.0)
-    parser.add_argument("--kd", type=float, default=0.18)
-    parser.add_argument("--max-action-delta", type=float, default=80.0)
+    parser.add_argument("--expert-noise-std", type=float, default=8.5)
     parser.add_argument(
         "--pixel-compression",
         choices=("blosc", "lzf", "gzip", "none"),
@@ -219,7 +189,7 @@ def _policy_action_to_relative_action(policy_action: np.ndarray, agent_pos: np.n
     return np.clip((policy_action - agent_pos) / 100.0, -1.0, 1.0).astype(np.float32)
 
 
-def _rollout_probabilities(args: argparse.Namespace) -> np.ndarray:
+def _rollout_probabilities() -> np.ndarray:
     ratios = np.asarray(RATIOS, dtype=np.float64)
     if ratios.shape != (len(ROLLOUT_MODES),):
         raise ValueError(f"RATIOS must have length {len(ROLLOUT_MODES)}.")
@@ -232,14 +202,13 @@ def _rollout_probabilities(args: argparse.Namespace) -> np.ndarray:
 
 
 def _sample_rollout_modes(args: argparse.Namespace, rng: np.random.Generator, count: int) -> list[str]:
-    return [str(mode) for mode in rng.choice(ROLLOUT_MODES, size=count, p=_rollout_probabilities(args))]
+    return [str(mode) for mode in rng.choice(ROLLOUT_MODES, size=count, p=_rollout_probabilities())]
 
 
 def _mode_max_steps(args: argparse.Namespace, mode: str) -> int:
     mapping = {
         "expert": args.max_steps_expert,
         "expert_plus_noise": args.max_steps_expert_noisy,
-        "random_spline": args.max_steps_random_spline,
     }
     return int(mapping[mode])
 
@@ -279,43 +248,6 @@ def _apply_expert_noise(
         np.asarray(agent_pos, dtype=np.float32),
     )
     return noisy_env_action, noisy_logged_action
-
-
-def _make_random_spline_controller(
-    args: argparse.Namespace,
-    raw_observation: dict[str, Any],
-    rng: np.random.Generator,
-) -> RandomSplineController:
-    return RandomSplineController.from_observation(
-        raw_observation,
-        rng=rng,
-        num_points=args.num_spline_points,
-        circle_min_radius=args.circle_min_radius,
-        circle_max_radius=args.circle_max_radius,
-        min_angle_separation_deg=args.min_angle_separation_deg,
-        angle_jitter_deg=args.angle_jitter_deg,
-        waypoint_tol=args.waypoint_tol,
-        kp=args.kp,
-        kd=args.kd,
-        max_action_delta=args.max_action_delta,
-        spline_sampling_attempts=args.spline_sampling_attempts,
-        num_chained_splines=args.num_chained_splines,
-    )
-
-
-def _relative_action_to_env_action(
-    relative_action: np.ndarray,
-    agent_pos: np.ndarray,
-    action_space: gym.Space | None,
-) -> np.ndarray:
-    env_action = np.asarray(agent_pos, dtype=np.float32) + 100.0 * np.asarray(relative_action, dtype=np.float32)
-    if action_space is None:
-        return env_action.astype(np.float32)
-    high = np.asarray(getattr(action_space, "high", None))
-    low = np.asarray(getattr(action_space, "low", None))
-    if high.shape != env_action.shape or low.shape != env_action.shape:
-        return env_action.astype(np.float32)
-    return np.clip(env_action, low, high).astype(np.float32)
 
 
 class H5EpisodeWriter:
@@ -575,22 +507,12 @@ def main() -> None:
         raise ValueError("--max-steps-expert must be >= 1.")
     if args.max_steps_expert_noisy < 1:
         raise ValueError("--max-steps-expert-noisy must be >= 1.")
-    if args.max_steps_random_spline < 1:
-        raise ValueError("--max-steps-random-spline must be >= 1.")
     if args.expert_noise_std < 0.0:
         raise ValueError("--expert-noise-std must be >= 0.")
-    if args.spline_sampling_attempts < 1:
-        raise ValueError("--spline-sampling-attempts must be >= 1.")
-    if args.num_chained_splines < 1:
-        raise ValueError("--num-chained-splines must be >= 1.")
     if args.out.exists():
         raise FileExistsError(f"Output already exists: {args.out}")
 
-    bundle = (
-        load_expert_policy_bundle(args.model_dir, device=args.device)
-        if RATIOS[0] + RATIOS[1] > 0.0
-        else None
-    )
+    bundle = load_expert_policy_bundle(args.model_dir, device=args.device)
     writer = H5EpisodeWriter(
         args.out,
         pixel_compression=args.pixel_compression,
@@ -607,8 +529,7 @@ def main() -> None:
             while saved < args.num_episodes:
                 reset_seeds = [args.start_seed + attempts + env_idx for env_idx in range(args.num_envs)]
                 attempts += args.num_envs
-                if bundle is not None:
-                    bundle.policy.reset()
+                bundle.policy.reset()
                 raw_observations, _ = env.reset(seed=reset_seeds)
                 previous_actions = np.zeros((args.num_envs, 2), dtype=np.float32)
                 active = np.ones(args.num_envs, dtype=bool)
@@ -617,15 +538,6 @@ def main() -> None:
                 rollout_modes = _sample_rollout_modes(args, mode_rng, args.num_envs)
                 max_steps_by_env = np.asarray([_mode_max_steps(args, mode) for mode in rollout_modes], dtype=np.int32)
                 episode_rngs = [np.random.default_rng(reset_seeds[env_idx]) for env_idx in range(args.num_envs)]
-                controllers: list[RandomSplineController | None] = [None] * args.num_envs
-                for env_idx, rollout_mode in enumerate(rollout_modes):
-                    if rollout_mode != "random_spline":
-                        continue
-                    controllers[env_idx] = _make_random_spline_controller(
-                        args,
-                        _slice_observation(raw_observations, env_idx),
-                        episode_rngs[env_idx],
-                    )
                 batch_pixels: list[list[np.ndarray]] = [[] for _ in range(args.num_envs)]
                 batch_actions: list[list[np.ndarray]] = [[] for _ in range(args.num_envs)]
                 batch_states: list[list[np.ndarray]] = [[] for _ in range(args.num_envs)]
@@ -641,50 +553,32 @@ def main() -> None:
                     if step_idx % args.control_interval == 0:
                         env_actions.fill(0.0)
                         logged_actions.fill(0.0)
-                        if "expert" in rollout_modes or "expert_plus_noise" in rollout_modes:
-                            if bundle is None:
-                                raise RuntimeError("Sampled expert rollout but no expert policy bundle was loaded.")
-                            expert_env_actions, expert_logged_actions = _select_expert_actions(
-                                bundle,
-                                raw_observations,
+                        expert_env_actions, expert_logged_actions = _select_expert_actions(
+                            bundle,
+                            raw_observations,
+                            action_space,
+                        )
+                        expert_mask = np.asarray(
+                            [active[idx] and rollout_modes[idx] == "expert" for idx in range(args.num_envs)],
+                            dtype=bool,
+                        )
+                        env_actions[expert_mask] = expert_env_actions[expert_mask]
+                        logged_actions[expert_mask] = expert_logged_actions[expert_mask]
+                        noisy_mask = np.asarray(
+                            [active[idx] and rollout_modes[idx] == "expert_plus_noise" for idx in range(args.num_envs)],
+                            dtype=bool,
+                        )
+                        noisy_indices = np.flatnonzero(noisy_mask)
+                        for env_idx in noisy_indices:
+                            noisy_env_action, noisy_logged_action = _apply_expert_noise(
+                                expert_env_actions[env_idx],
+                                np.asarray(raw_observations["agent_pos"][env_idx], dtype=np.float32),
                                 action_space,
+                                episode_rngs[env_idx],
+                                args.expert_noise_std,
                             )
-                            expert_mask = np.asarray(
-                                [active[idx] and rollout_modes[idx] == "expert" for idx in range(args.num_envs)],
-                                dtype=bool,
-                            )
-                            env_actions[expert_mask] = expert_env_actions[expert_mask]
-                            logged_actions[expert_mask] = expert_logged_actions[expert_mask]
-                            noisy_mask = np.asarray(
-                                [active[idx] and rollout_modes[idx] == "expert_plus_noise" for idx in range(args.num_envs)],
-                                dtype=bool,
-                            )
-                            noisy_indices = np.flatnonzero(noisy_mask)
-                            for env_idx in noisy_indices:
-                                noisy_env_action, noisy_logged_action = _apply_expert_noise(
-                                    expert_env_actions[env_idx],
-                                    np.asarray(raw_observations["agent_pos"][env_idx], dtype=np.float32),
-                                    action_space,
-                                    episode_rngs[env_idx],
-                                    args.expert_noise_std,
-                                )
-                                env_actions[env_idx] = noisy_env_action
-                                logged_actions[env_idx] = noisy_logged_action
-                        for env_idx in range(args.num_envs):
-                            if not active[env_idx] or rollout_modes[env_idx] != "random_spline":
-                                continue
-                            controller = controllers[env_idx]
-                            if controller is None:
-                                raise RuntimeError(f"Missing random spline controller for env {env_idx}.")
-                            raw_observation = _slice_observation(raw_observations, env_idx)
-                            action = controller.select_action(raw_observation)
-                            agent_pos = np.asarray(raw_observation["agent_pos"], dtype=np.float32).reshape(-1)[:2]
-                            env_actions[env_idx] = _relative_action_to_env_action(
-                                action,
-                                agent_pos,
-                                action_space,
-                            )
-                            logged_actions[env_idx] = action
+                            env_actions[env_idx] = noisy_env_action
+                            logged_actions[env_idx] = noisy_logged_action
 
                     for env_idx in range(args.num_envs):
                         if not active[env_idx]:
@@ -710,15 +604,6 @@ def main() -> None:
                         )
                         if terminated[env_idx] or truncated[env_idx]:
                             active[env_idx] = False
-                            continue
-                        if rollout_modes[env_idx] == "random_spline":
-                            controller = controllers[env_idx]
-                            if controller is None:
-                                raise RuntimeError(f"Missing random spline controller for env {env_idx}.")
-                            raw_observation = _slice_observation(raw_observations, env_idx)
-                            if controller.reached_goal(raw_observation):
-                                active[env_idx] = False
-                                continue
                     if step_idx % args.control_interval == 0:
                         previous_actions = logged_actions.copy()
                     if not active.any():
