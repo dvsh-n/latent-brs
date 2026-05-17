@@ -38,7 +38,7 @@ HORIZON = 15
 MAX_MPC_STEPS = 250
 Q_TERMINAL = 10.0
 Q_STAGE = 0.005
-R_CONTROL = 0.01
+R_CONTROL = 0.001
 VIDEO_FPS = 10
 EPISODE_IDX = None # 480, 12148
 CONTROL_MIN_NORM = -1.5
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q-terminal", type=float, default=Q_TERMINAL)
     parser.add_argument("--q-stage", type=float, default=Q_STAGE)
     parser.add_argument("--r-control", type=float, default=R_CONTROL)
-    parser.add_argument("--ilqr-max-iters", type=int, default=35)
+    parser.add_argument("--ilqr-max-iters", type=int, default=50)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=None)

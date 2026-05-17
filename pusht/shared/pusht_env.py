@@ -140,13 +140,16 @@ def make_no_target_env(*, height: int, width: int, max_episode_steps: int = 300)
 
 
 def set_pusht_state(env: Any, state: np.ndarray) -> None:
-    # Use the environment's legacy setter because the block has a non-default
-    # center of gravity. Direct assignment to block.position does not reproduce
-    # the rendered pose from the original PushT dataset.
     env.agent.velocity = [0.0, 0.0]
     env.block.velocity = [0.0, 0.0]
     env.block.angular_velocity = 0.0
-    env._set_state(np.asarray(state[:5], dtype=np.float64))
+    state = np.asarray(state, dtype=np.float64)
+    env.agent.position = list(state[:2])
+    # The T body has an offset center of gravity, so setting position and then
+    # angle shifts the rendered pose. Apply angle first, then place the body.
+    env.block.angle = float(state[4])
+    env.block.position = list(state[2:4])
+    env.space.step(env.dt)
     env.agent.velocity = [float(state[5]), float(state[6])] if state.shape[0] >= 7 else [0.0, 0.0]
     env.block.velocity = [0.0, 0.0]
     env.block.angular_velocity = 0.0
