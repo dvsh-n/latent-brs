@@ -29,7 +29,7 @@ DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
 DEFAULT_OUT_DIR = "reacher/plan/conformal_obstacle_analysis"
 DEFAULT_EPISODE_IDX = 829
 DEFAULT_HORIZON = 20
-DEFAULT_OBSTACLE_STEP = 30
+DEFAULT_OBSTACLE_STEP = -1
 DEFAULT_MAX_MPC_STEPS = 100
 DEFAULT_Q_TERMINAL = 10.0
 DEFAULT_Q_STAGE = 0.005
@@ -67,8 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--joint1-range", type=float, default=0.08)
-    parser.add_argument("--joint2-range", type=float, default=0.08)
+    parser.add_argument("--joint1-range", type=float, default=0.25)
+    parser.add_argument("--joint2-range", type=float, default=0.12)
     parser.add_argument("--set-pca-count", type=int, default=192)
     parser.add_argument("--set-norm-count", type=int, default=192)
     parser.add_argument("--set-cal-count", type=int, default=192)
@@ -938,7 +938,7 @@ def make_zonotope_coords_plot(
 def main() -> None:
     args = parse_args()
     log_progress(
-        f"Starting analysis for episode {args.episode_idx}, obstacle step {args.obstacle_step}."
+        f"Starting analysis for episode {args.episode_idx}, requested obstacle step {args.obstacle_step}."
     )
     rng = np.random.default_rng(args.seed)
     planner, dataset_cls = load_runtime_dependencies()
@@ -961,9 +961,6 @@ def main() -> None:
         if args.background_dataset_path is not None
         else Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
     )
-
-    episode_dir = out_root / f"episode_{args.episode_idx:05d}" / f"step_{args.obstacle_step:04d}"
-    episode_dir.mkdir(parents=True, exist_ok=True)
 
     rollout_cache_path = infer_rollout_cache_path(out_root, checkpoint_path, args.episode_idx, args)
     rollout = run_or_load_rollout(
@@ -997,10 +994,16 @@ def main() -> None:
     else:
         rollout_frames = reconstruct_rollout_frames(planner, rollout=rollout)
 
-    if args.obstacle_step < 0 or args.obstacle_step >= rollout_qpos.shape[0]:
+    obstacle_step = int(args.obstacle_step)
+    if obstacle_step == -1:
+        obstacle_step = int(rollout_qpos.shape[0] - 1)
+        log_progress(f"Resolved obstacle step -1 to final rollout step {obstacle_step}.")
+    if obstacle_step < 0 or obstacle_step >= rollout_qpos.shape[0]:
         raise ValueError(
             f"--obstacle-step must be in [0, {rollout_qpos.shape[0] - 1}], got {args.obstacle_step}."
         )
+    episode_dir = out_root / f"episode_{args.episode_idx:05d}" / f"step_{obstacle_step:04d}"
+    episode_dir.mkdir(parents=True, exist_ok=True)
 
     img_size = int(config.get("img_size", 224))
     embed_dim = int(config.get("embed_dim", 24))
@@ -1015,7 +1018,7 @@ def main() -> None:
     )
     lower, upper = joint_limits_from_env(env)
 
-    center_qpos = rollout_qpos[args.obstacle_step]
+    center_qpos = rollout_qpos[obstacle_step]
     joint_ranges = np.array([args.joint1_range, args.joint2_range], dtype=np.float64)
     total_obstacle = args.set_pca_count + args.set_norm_count + args.set_cal_count + args.set_test_count
     log_progress(
@@ -1075,7 +1078,7 @@ def main() -> None:
         eigval_floor=args.eigval_floor,
     )
 
-    nominal_position = rollout_emb[args.obstacle_step, :embed_dim]
+    nominal_position = rollout_emb[obstacle_step, :embed_dim]
     heldout_inside = zonotope_contains(test_samples, zonotope, tol=args.membership_tol)
     empirical_coverage = float(np.mean(heldout_inside))
     log_progress(
@@ -1150,7 +1153,7 @@ def main() -> None:
 
     make_plot(
         episode_dir / "pca_global.png",
-        title=f"Global PCA trajectory/object view | episode {args.episode_idx} step {args.obstacle_step}",
+        title=f"Global PCA trajectory/object view | episode {args.episode_idx} step {obstacle_step}",
         background=project_points(background_pos, global_pca),
         focus_background=None,
         construction_samples=project_points(all_obstacle_samples, global_pca),
@@ -1169,7 +1172,7 @@ def main() -> None:
     )
     make_plot(
         episode_dir / "pca_local.png",
-        title=f"Local PCA obstacle view | episode {args.episode_idx} step {args.obstacle_step}",
+        title=f"Local PCA obstacle view | episode {args.episode_idx} step {obstacle_step}",
         background=project_points(background_pos, local_pca),
         focus_background=None,
         construction_samples=project_points(construction_samples_global, local_pca),
@@ -1203,7 +1206,7 @@ def main() -> None:
             "sampled_qpos": sampled_qpos.astype(np.float64),
             "obstacle_position_samples": all_obstacle_samples.astype(np.float64),
             "obstacle_nominal_qpos": center_qpos.astype(np.float64),
-            "obstacle_nominal_qvel": rollout_qvel[args.obstacle_step].astype(np.float64),
+            "obstacle_nominal_qvel": rollout_qvel[obstacle_step].astype(np.float64),
             "obstacle_nominal_position": nominal_position.astype(np.float64),
             "zonotope": zonotope,
             "global_pca": global_pca,
@@ -1217,14 +1220,14 @@ def main() -> None:
         episode_dir / "summary.json",
         {
             "episode_idx": int(args.episode_idx),
-            "obstacle_step": int(args.obstacle_step),
+            "obstacle_step": int(obstacle_step),
             "rollout_cache_path": str(rollout_cache_path),
             "background_dataset_path": str(background_dataset_path),
             "test_dataset_path": str(dataset_path),
             "checkpoint_path": str(checkpoint_path),
             "joint_range": joint_ranges.tolist(),
             "obstacle_center_qpos": center_qpos.tolist(),
-            "obstacle_center_qvel": rollout_qvel[args.obstacle_step].tolist(),
+            "obstacle_center_qvel": rollout_qvel[obstacle_step].tolist(),
             "obstacle_center_latent_norm": float(np.linalg.norm(nominal_position)),
             "sample_counts": {
                 "pca": int(args.set_pca_count),

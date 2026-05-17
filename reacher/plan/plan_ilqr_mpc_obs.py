@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+"""Plan in Reacher latent space with a locally constrained obstacle-aware MPC variant."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from tqdm.auto import tqdm
+
+from reacher.plan import analyze_conformal_obstacle as obstacle_analysis
+from reacher.plan import plan_ilqr_mpc as planner
+from reacher.train.mlpdyn_train import LeWMReacherDataset
+
+DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
+DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_obs"
+DEFAULT_EPISODE_IDX = 829
+DEFAULT_HORIZON = 20
+DEFAULT_UNCONSTRAINED_MAX_MPC_STEPS = 100
+DEFAULT_CONSTRAINED_MAX_MPC_STEPS = 150
+DEFAULT_OBSTACLE_STEP = -1
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-dir", type=Path, default=Path(DEFAULT_MODEL_DIR))
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
+    parser.add_argument("--background-dataset-path", type=Path, default=None)
+    parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--episode-idx", type=int, default=DEFAULT_EPISODE_IDX)
+    parser.add_argument("--obstacle-step", type=int, default=DEFAULT_OBSTACLE_STEP)
+    parser.add_argument("--horizon", type=int, default=DEFAULT_HORIZON)
+    parser.add_argument("--max-mpc-steps", type=int, default=None)
+    parser.add_argument("--unconstrained-max-mpc-steps", type=int, default=DEFAULT_UNCONSTRAINED_MAX_MPC_STEPS)
+    parser.add_argument("--constrained-max-mpc-steps", type=int, default=DEFAULT_CONSTRAINED_MAX_MPC_STEPS)
+    parser.add_argument("--frame-batch-size", type=int, default=32)
+    parser.add_argument("--video-fps", type=int, default=60)
+    parser.add_argument("--q-terminal", type=float, default=10.0)
+    parser.add_argument("--q-stage", type=float, default=0.005)
+    parser.add_argument("--r-control", type=float, default=0.1)
+    parser.add_argument("--ilqr-max-iters", type=int, default=35)
+    parser.add_argument("--ilqr-tol", type=float, default=1e-4)
+    parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
+    parser.add_argument("--joint1-range", type=float, default=0.25)
+    parser.add_argument("--joint2-range", type=float, default=0.12)
+    parser.add_argument("--set-pca-count", type=int, default=192)
+    parser.add_argument("--set-norm-count", type=int, default=192)
+    parser.add_argument("--set-cal-count", type=int, default=192)
+    parser.add_argument("--set-test-count", type=int, default=512)
+    parser.add_argument("--background-samples", type=int, default=4000)
+    parser.add_argument("--context-background-count", type=int, default=512)
+    parser.add_argument("--delta", type=float, default=0.05)
+    parser.add_argument("--conformal-eps", type=float, default=1e-12)
+    parser.add_argument("--eigval-floor", type=float, default=1e-10)
+    parser.add_argument("--membership-tol", type=float, default=1e-8)
+    parser.add_argument("--overlay-sample-count", type=int, default=96)
+    parser.add_argument("--overlay-perturb-alpha", type=float, default=0.05)
+    parser.add_argument("--constraint-margin", type=float, default=0.08)
+    parser.add_argument("--constraint-activation", type=float, default=1.35)
+    parser.add_argument("--obstacle-penalty", type=float, default=25.0)
+    parser.add_argument("--constraint-rho", type=float, default=1.0)
+    parser.add_argument("--constraint-admm-iters", type=int, default=60)
+    parser.add_argument("--constraint-admm-tol", type=float, default=1e-4)
+    parser.add_argument("--qp-regularization", type=float, default=1e-5)
+    parser.add_argument("--force-rerun-rollout", action="store_true", default=False)
+    parser.add_argument("--force-rerun-constrained", action="store_true", default=False)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    if args.max_mpc_steps is not None:
+        args.unconstrained_max_mpc_steps = int(args.max_mpc_steps)
+        args.constrained_max_mpc_steps = int(args.max_mpc_steps)
+    return args
+
+
+def log_progress(message: str) -> None:
+    print(f"[plan_ilqr_mpc_obs] {message}", flush=True)
+
+
+def save_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def infer_constrained_cache_path(
+    out_dir: Path,
+    checkpoint_path: Path,
+    episode_idx: int,
+    obstacle_step: int,
+    args: argparse.Namespace,
+) -> Path:
+    stem = checkpoint_path.stem
+    name = (
+        f"episode_{episode_idx:05d}_{stem}_obs{obstacle_step:04d}_h{args.horizon}_"
+        f"mpc{args.constrained_max_mpc_steps}_cm{args.constraint_margin:g}_ca{args.constraint_activation:g}_"
+        f"op{args.obstacle_penalty:g}_rho{args.constraint_rho:g}.pt"
+    )
+    return out_dir / "constrained_rollout_cache" / name
+
+
+class LinearConstraintADMMQP:
+    def __init__(self, *, rho: float, max_iters: int, tol: float, regularization: float) -> None:
+        self.rho = float(rho)
+        self.max_iters = int(max_iters)
+        self.tol = float(tol)
+        self.regularization = float(regularization)
+
+    def solve(
+        self,
+        hess: np.ndarray,
+        grad: np.ndarray,
+        g_mat: np.ndarray,
+        h_vec: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        dim = int(grad.shape[0])
+        if g_mat.shape[0] == 0:
+            system = 0.5 * (hess + hess.T) + self.regularization * np.eye(dim, dtype=np.float64)
+            return -np.linalg.solve(system, grad), {"iters": 1.0, "primal_residual": 0.0, "dual_residual": 0.0}
+
+        system = 0.5 * (hess + hess.T) + self.rho * (g_mat.T @ g_mat)
+        system = system + self.regularization * np.eye(dim, dtype=np.float64)
+
+        du = np.zeros(dim, dtype=np.float64)
+        z = np.minimum(g_mat @ du, h_vec)
+        y = np.zeros_like(h_vec)
+        z_prev = z.copy()
+
+        for admm_iter in range(self.max_iters):
+            rhs = -grad + self.rho * g_mat.T @ (z - y)
+            du = np.linalg.solve(system, rhs)
+            gdu = g_mat @ du
+            z = np.minimum(gdu + y, h_vec)
+            y = y + gdu - z
+
+            primal = float(np.linalg.norm(gdu - z, ord=np.inf))
+            dual = float(self.rho * np.linalg.norm(g_mat.T @ (z - z_prev), ord=np.inf))
+            if primal <= self.tol and dual <= self.tol:
+                return du, {"iters": float(admm_iter + 1), "primal_residual": primal, "dual_residual": dual}
+            z_prev = z.copy()
+
+        return du, {"iters": float(self.max_iters), "primal_residual": primal, "dual_residual": dual}
+
+
+class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
+    def __init__(
+        self,
+        dynamics: planner.MarkovDynamicsTorch,
+        *,
+        embed_dim: int,
+        obstacle_center: np.ndarray,
+        obstacle_right_pinv: np.ndarray,
+        obstacle_margin: float,
+        obstacle_activation: float,
+        obstacle_penalty: float,
+        constraint_rho: float,
+        constraint_admm_iters: int,
+        constraint_admm_tol: float,
+        qp_regularization: float,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(dynamics, **kwargs)
+        self.embed_dim = int(embed_dim)
+        self.obstacle_center = np.asarray(obstacle_center, dtype=np.float64).copy()
+        self.obstacle_right_pinv = np.asarray(obstacle_right_pinv, dtype=np.float64).copy()
+        self.obstacle_margin = float(obstacle_margin)
+        self.obstacle_activation = float(obstacle_activation)
+        self.obstacle_penalty = float(obstacle_penalty)
+        self.qp_solver = LinearConstraintADMMQP(
+            rho=constraint_rho,
+            max_iters=constraint_admm_iters,
+            tol=constraint_admm_tol,
+            regularization=qp_regularization,
+        )
+        self.last_solve_stats: dict[str, float] = {}
+
+    def _embedding_coords(self, embedding: np.ndarray) -> np.ndarray:
+        return (embedding - self.obstacle_center) @ self.obstacle_right_pinv
+
+    def _obstacle_violation(self, x_traj: torch.Tensor) -> torch.Tensor:
+        emb = x_traj[1:, : self.embed_dim]
+        center = torch.tensor(self.obstacle_center, dtype=emb.dtype, device=emb.device)
+        right_pinv = torch.tensor(self.obstacle_right_pinv, dtype=emb.dtype, device=emb.device)
+        coords = (emb - center) @ right_pinv
+        max_abs = torch.max(torch.abs(coords), dim=1).values
+        margin = (1.0 + self.obstacle_margin) - max_abs
+        hinge = torch.clamp(margin, min=0.0)
+        return self.obstacle_penalty * torch.sum(hinge * hinge)
+
+    def _trajectory_merit(self, x_traj: torch.Tensor, u_seq: torch.Tensor, x_goal: torch.Tensor) -> torch.Tensor:
+        return self._trajectory_cost(x_traj, u_seq, x_goal) + self._obstacle_violation(x_traj)
+
+    def _select_constraint_rows(self, x_traj: np.ndarray) -> list[tuple[int, np.ndarray, float]]:
+        rows: list[tuple[int, np.ndarray, float]] = []
+        for step in range(1, x_traj.shape[0]):
+            embedding = x_traj[step, : self.embed_dim]
+            coords = self._embedding_coords(embedding)
+            max_abs = float(np.max(np.abs(coords)))
+            if max_abs >= self.obstacle_activation:
+                continue
+            face_idx = int(np.argmax(np.abs(coords)))
+            face_sign = 1.0 if coords[face_idx] >= 0.0 else -1.0
+            if abs(coords[face_idx]) <= 1e-8:
+                face_sign = 1.0
+            normal = face_sign * self.obstacle_right_pinv[:, face_idx]
+            rhs = 1.0 + self.obstacle_margin + float(normal @ self.obstacle_center)
+            rows.append((step, normal.astype(np.float64), rhs))
+        return rows
+
+    def _build_state_sensitivity(self, a_seq: np.ndarray, b_seq: np.ndarray) -> list[np.ndarray]:
+        total_u = self.horizon * self.action_dim
+        sens = [np.zeros((self.state_dim, total_u), dtype=np.float64) for _ in range(self.horizon + 1)]
+        for step in range(self.horizon):
+            next_sens = a_seq[step] @ sens[step]
+            col0 = step * self.action_dim
+            col1 = col0 + self.action_dim
+            next_sens[:, col0:col1] += b_seq[step]
+            sens[step + 1] = next_sens
+        return sens
+
+    def _build_local_qp(
+        self,
+        x_traj: np.ndarray,
+        u_seq: np.ndarray,
+        x_goal: np.ndarray,
+        a_seq: np.ndarray,
+        b_seq: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+        total_u = self.horizon * self.action_dim
+        sens = self._build_state_sensitivity(a_seq, b_seq)
+        hess = np.zeros((total_u, total_u), dtype=np.float64)
+        grad = np.zeros(total_u, dtype=np.float64)
+        q_stage = 2.0 * self.q_stage
+        q_terminal = 2.0 * self.q_terminal
+        r_control = 2.0 * self.r_control
+
+        for step in range(self.horizon):
+            state_err = x_traj[step] - x_goal
+            s_mat = sens[step]
+            hess += q_stage * (s_mat.T @ s_mat)
+            grad += q_stage * (s_mat.T @ state_err)
+            block = slice(step * self.action_dim, (step + 1) * self.action_dim)
+            hess[block, block] += r_control * np.eye(self.action_dim, dtype=np.float64)
+            grad[block] += r_control * u_seq[step]
+
+        terminal_err = x_traj[self.horizon] - x_goal
+        terminal_s = sens[self.horizon]
+        hess += q_terminal * (terminal_s.T @ terminal_s)
+        grad += q_terminal * (terminal_s.T @ terminal_err)
+        hess = 0.5 * (hess + hess.T)
+
+        rows = self._select_constraint_rows(x_traj)
+        if not rows:
+            return hess, grad, np.zeros((0, total_u), dtype=np.float64), np.zeros(0, dtype=np.float64), 0
+
+        g_rows: list[np.ndarray] = []
+        h_rows: list[float] = []
+        for step, normal, rhs in rows:
+            s_embed = sens[step][: self.embed_dim]
+            g_rows.append(-(normal @ s_embed))
+            h_rows.append(float(normal @ x_traj[step, : self.embed_dim] - rhs))
+
+        return hess, grad, np.stack(g_rows, axis=0), np.asarray(h_rows, dtype=np.float64), len(rows)
+
+    def solve(self, x0_np: np.ndarray, x_goal_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, int, float]:
+        x0 = torch.tensor(x0_np, dtype=torch.float32, device=self.device)
+        x_goal = torch.tensor(x_goal_np, dtype=torch.float32, device=self.device)
+        u_seq = self._make_initial_action_guess()
+
+        planner.maybe_cuda_synchronize(self.device)
+        t0 = time.perf_counter()
+
+        x_traj = self._rollout(x0, u_seq)
+        current_merit = float(self._trajectory_merit(x_traj, u_seq, x_goal).item())
+        iterations = 0
+        accepted_constraints = 0
+        admm_iters = 0.0
+        admm_primal = 0.0
+        admm_dual = 0.0
+
+        for iteration in range(self.max_iters):
+            iterations = iteration + 1
+            a_t, b_t = self._linearize_dynamics(x_traj, u_seq)
+            x_np = x_traj.detach().cpu().numpy().astype(np.float64)
+            u_np = u_seq.detach().cpu().numpy().astype(np.float64)
+            a_np = a_t.detach().cpu().numpy().astype(np.float64)
+            b_np = b_t.detach().cpu().numpy().astype(np.float64)
+            hess, grad, g_mat, h_vec, n_constraints = self._build_local_qp(
+                x_np,
+                u_np,
+                x_goal_np,
+                a_np,
+                b_np,
+            )
+            du_flat, qp_stats = self.qp_solver.solve(hess, grad, g_mat, h_vec)
+            du_seq = torch.tensor(
+                du_flat.reshape(self.horizon, self.action_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+            accepted = False
+            best_candidate: tuple[torch.Tensor, torch.Tensor, float, float] | None = None
+            for alpha in self.line_search_alphas:
+                u_new = u_seq + alpha * du_seq
+                x_new = self._rollout(x0, u_new)
+                new_merit = float(self._trajectory_merit(x_new, u_new, x_goal).item())
+                if np.isfinite(new_merit) and new_merit < current_merit:
+                    best_candidate = (x_new, u_new, new_merit, alpha)
+                    accepted = True
+                    break
+
+            if not accepted:
+                break
+
+            x_traj, u_seq, current_merit, alpha = best_candidate
+            accepted_constraints = n_constraints
+            admm_iters = qp_stats["iters"]
+            admm_primal = qp_stats["primal_residual"]
+            admm_dual = qp_stats["dual_residual"]
+            max_du = float(torch.max(torch.abs(alpha * du_seq)).item())
+            if max_du <= self.tol:
+                break
+
+        self.prev_u_guess = u_seq.detach().clone()
+        planner.maybe_cuda_synchronize(self.device)
+        solve_time = time.perf_counter() - t0
+        final_cost = float(self._trajectory_cost(x_traj, u_seq, x_goal).item())
+        self.last_solve_stats = {
+            "merit": float(current_merit),
+            "obstacle_penalty": float(self._obstacle_violation(x_traj).item()),
+            "active_constraints": float(accepted_constraints),
+            "admm_iters": float(admm_iters),
+            "admm_primal_residual": float(admm_primal),
+            "admm_dual_residual": float(admm_dual),
+        }
+        return (
+            x_traj.detach().cpu().numpy().astype(np.float64),
+            u_seq.detach().cpu().numpy().astype(np.float64),
+            solve_time,
+            iterations,
+            final_cost,
+        )
+
+
+def run_constrained_rollout(
+    *,
+    model: torch.nn.Module,
+    config: dict[str, Any],
+    rollout: dict[str, Any],
+    zonotope: dict[str, np.ndarray | float],
+    device: torch.device,
+    frame_batch_size: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    img_size = int(config.get("img_size", 224))
+    action_dim = int(config.get("action_dim", 2))
+    embed_dim = int(config.get("embed_dim", 24))
+    markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
+    history_size = int(config.get("history_size", 1))
+    if history_size != 1:
+        raise ValueError(f"Expected history_size=1 for this planner, got {history_size}.")
+
+    train_dataset_path = Path(str(config.get("dataset_path", args.dataset_path))).expanduser().resolve()
+    train_stats_dataset = LeWMReacherDataset(
+        train_dataset_path,
+        history_size=history_size,
+        num_preds=1,
+        frameskip=int(config.get("frameskip", 1)),
+        img_size=img_size,
+        action_dim=action_dim,
+    )
+    action_mean = train_stats_dataset.action_mean.astype(np.float32)
+    action_std = train_stats_dataset.action_std.astype(np.float32)
+
+    goal_obs = np.asarray(rollout["goal_obs"], dtype=np.float32)
+    obs_dim = int(goal_obs.shape[0])
+    width = int(rollout["width"])
+    height = int(rollout["height"])
+    episode_seed = int(rollout["episode_seed"])
+    time_limit = float(rollout["time_limit"])
+    physics_freq_hz = float(rollout["physics_freq_hz"])
+    qpos0 = np.asarray(rollout["dataset_qpos"][0], dtype=np.float32)
+    qvel0 = np.asarray(rollout["dataset_qvel"][0], dtype=np.float32)
+    goal_embedding = np.asarray(rollout["dataset_emb"][-1], dtype=np.float32)
+    goal_state_np = np.concatenate(
+        (goal_embedding, np.zeros_like(goal_embedding)),
+        axis=0,
+    ).astype(np.float64)
+    goal_state_t = torch.tensor(goal_state_np, dtype=torch.float32, device=device)
+
+    pixel_mean, pixel_std = planner.imagenet_pixel_stats(device)
+    env = planner.make_render_env(
+        seed=episode_seed,
+        time_limit=time_limit,
+        width=width,
+        height=height,
+        physics_freq_hz=physics_freq_hz,
+    )
+    current_frame = planner.reset_env_to_state(
+        env,
+        seed=episode_seed,
+        qpos=qpos0,
+        qvel=qvel0,
+        height=height,
+        width=width,
+    )
+    dynamics = planner.MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
+    mpc_solver = ObstacleConstrainedILQRMPCSolver(
+        dynamics,
+        horizon=args.horizon,
+        q_terminal=args.q_terminal,
+        q_stage=args.q_stage,
+        r_control=args.r_control,
+        max_iters=args.ilqr_max_iters,
+        tol=args.ilqr_tol,
+        regularization=args.ilqr_regularization,
+        device=device,
+        embed_dim=embed_dim,
+        obstacle_center=np.asarray(zonotope["center"], dtype=np.float64),
+        obstacle_right_pinv=np.asarray(zonotope["right_pinv"], dtype=np.float64),
+        obstacle_margin=args.constraint_margin,
+        obstacle_activation=args.constraint_activation,
+        obstacle_penalty=args.obstacle_penalty,
+        constraint_rho=args.constraint_rho,
+        constraint_admm_iters=args.constraint_admm_iters,
+        constraint_admm_tol=args.constraint_admm_tol,
+        qp_regularization=args.qp_regularization,
+    )
+
+    current_emb = planner.encode_single_frame(
+        model,
+        current_frame,
+        device=device,
+        img_size=img_size,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+    )
+    current_state = planner.make_markov_state(current_emb)
+    current_obs = planner.build_observation_from_env(env, obs_dim=obs_dim, goal_obs=goal_obs)
+
+    rollout_frames = [current_frame.copy()]
+    rollout_qpos = [np.asarray(env._env.physics.data.qpos[:2], dtype=np.float32).copy()]
+    rollout_qvel = [np.asarray(env._env.physics.data.qvel[:2], dtype=np.float32).copy()]
+    rollout_emb = [current_emb.detach().cpu().numpy().astype(np.float32)]
+    rollout_markov = [current_state.detach().cpu().numpy().astype(np.float32)]
+    executed_actions_raw: list[np.ndarray] = []
+    executed_actions_norm: list[np.ndarray] = []
+    observation_goal_distances = [planner.compute_observation_goal_distance(current_obs, goal_obs)]
+    latent_goal_distances = [float(torch.linalg.vector_norm(current_state - goal_state_t).item())]
+    solve_times_ms: list[float] = []
+    ilqr_iterations: list[int] = []
+    plan_costs: list[float] = []
+    plan_merits: list[float] = []
+    obstacle_penalties: list[float] = []
+    active_constraints: list[float] = []
+    admm_iterations: list[float] = []
+    stop_reason = "max_mpc_steps"
+
+    for _ in tqdm(range(args.constrained_max_mpc_steps), desc="Obstacle-aware MPC rollout"):
+        current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
+        _, u_plan, solve_time, n_iters, plan_cost = mpc_solver.solve(current_state_np, goal_state_np)
+        solve_times_ms.append(solve_time * 1000.0)
+        ilqr_iterations.append(int(n_iters))
+        plan_costs.append(float(plan_cost))
+        plan_merits.append(float(mpc_solver.last_solve_stats.get("merit", plan_cost)))
+        obstacle_penalties.append(float(mpc_solver.last_solve_stats.get("obstacle_penalty", 0.0)))
+        active_constraints.append(float(mpc_solver.last_solve_stats.get("active_constraints", 0.0)))
+        admm_iterations.append(float(mpc_solver.last_solve_stats.get("admm_iters", 0.0)))
+
+        u0_norm = u_plan[0].astype(np.float32)
+        u0_raw = planner.normalized_to_raw_action(u0_norm, action_mean, action_std)
+        executed_actions_norm.append(u0_norm.copy())
+        executed_actions_raw.append(u0_raw.copy())
+
+        _, _, terminated, truncated, _ = env.step(u0_raw)
+        current_obs = planner.build_observation_from_env(env, obs_dim=obs_dim, goal_obs=goal_obs)
+        current_frame = env._env.physics.render(height=height, width=width, camera_id=0)
+        next_emb = planner.encode_single_frame(
+            model,
+            current_frame,
+            device=device,
+            img_size=img_size,
+            pixel_mean=pixel_mean,
+            pixel_std=pixel_std,
+        )
+        current_state = planner.make_markov_state(next_emb, current_emb)
+        current_emb = next_emb
+
+        rollout_frames.append(current_frame.copy())
+        rollout_qpos.append(np.asarray(env._env.physics.data.qpos[:2], dtype=np.float32).copy())
+        rollout_qvel.append(np.asarray(env._env.physics.data.qvel[:2], dtype=np.float32).copy())
+        rollout_emb.append(current_emb.detach().cpu().numpy().astype(np.float32))
+        rollout_markov.append(current_state.detach().cpu().numpy().astype(np.float32))
+        observation_goal_distances.append(planner.compute_observation_goal_distance(current_obs, goal_obs))
+        latent_goal_distances.append(float(torch.linalg.vector_norm(current_state - goal_state_t).item()))
+
+        reached_goal, _ = planner.goal_reached(current_obs, goal_obs)
+        if reached_goal:
+            stop_reason = "goal_reached"
+            break
+        if terminated or truncated:
+            stop_reason = "terminated" if terminated else "truncated"
+            break
+
+    env.close()
+    return {
+        "rollout_frames": np.asarray(rollout_frames, dtype=np.uint8),
+        "rollout_qpos": np.asarray(rollout_qpos, dtype=np.float32),
+        "rollout_qvel": np.asarray(rollout_qvel, dtype=np.float32),
+        "rollout_emb": np.asarray(rollout_emb, dtype=np.float32),
+        "rollout_markov": np.asarray(rollout_markov, dtype=np.float32),
+        "executed_actions_raw": np.asarray(executed_actions_raw, dtype=np.float32),
+        "executed_actions_norm": np.asarray(executed_actions_norm, dtype=np.float32),
+        "observation_goal_distances": np.asarray(observation_goal_distances, dtype=np.float32),
+        "latent_goal_distances": np.asarray(latent_goal_distances, dtype=np.float32),
+        "solve_times_ms": np.asarray(solve_times_ms, dtype=np.float32),
+        "ilqr_iterations": np.asarray(ilqr_iterations, dtype=np.int32),
+        "plan_costs": np.asarray(plan_costs, dtype=np.float32),
+        "plan_merits": np.asarray(plan_merits, dtype=np.float32),
+        "obstacle_penalties": np.asarray(obstacle_penalties, dtype=np.float32),
+        "active_constraints": np.asarray(active_constraints, dtype=np.float32),
+        "admm_iterations": np.asarray(admm_iterations, dtype=np.float32),
+        "stop_reason": stop_reason,
+    }
+
+
+def make_comparison_plot(
+    out_path: Path,
+    *,
+    title: str,
+    background: np.ndarray,
+    construction_samples: np.ndarray,
+    test_inside_samples: np.ndarray,
+    test_outside_samples: np.ndarray,
+    dataset_traj: np.ndarray,
+    nominal_traj: np.ndarray,
+    constrained_traj: np.ndarray,
+    start_point: np.ndarray,
+    dataset_goal_point: np.ndarray,
+    nominal_goal_point: np.ndarray,
+    constrained_goal_point: np.ndarray,
+    nominal_point: np.ndarray,
+    zonotope_boundary: np.ndarray,
+    explained_ratio: np.ndarray,
+    focus_main_view: bool,
+) -> None:
+    fig, ax = plt.subplots(figsize=(9.5, 8))
+    ax.scatter(background[:, 0], background[:, 1], s=3, alpha=0.18, color="0.5", label="background", zorder=1)
+    if construction_samples.shape[0] > 0:
+        ax.scatter(construction_samples[:, 0], construction_samples[:, 1], s=10, alpha=0.3, color="tab:red", label="obstacle samples", zorder=2)
+    if test_inside_samples.shape[0] > 0:
+        ax.scatter(test_inside_samples[:, 0], test_inside_samples[:, 1], s=16, alpha=0.65, color="tab:orange", label="held-out inside", zorder=3)
+    if test_outside_samples.shape[0] > 0:
+        ax.scatter(test_outside_samples[:, 0], test_outside_samples[:, 1], s=24, alpha=0.95, marker="x", linewidths=1.2, color="black", label="held-out outside", zorder=4)
+    if zonotope_boundary.shape[0] >= 2:
+        ax.plot(zonotope_boundary[:, 0], zonotope_boundary[:, 1], color="tab:orange", linewidth=2.0, label="zonotope boundary", zorder=8)
+    ax.plot(dataset_traj[:, 0], dataset_traj[:, 1], color="tab:blue", linewidth=1.5, label="dataset trajectory", zorder=5)
+    ax.plot(nominal_traj[:, 0], nominal_traj[:, 1], color="tab:green", linewidth=1.7, label="executed MPC rollout", zorder=6)
+    ax.plot(constrained_traj[:, 0], constrained_traj[:, 1], color="tab:purple", linewidth=1.8, linestyle="--", label="constrained MPC rollout", zorder=7)
+    ax.scatter(start_point[0], start_point[1], s=90, marker="o", color="black", label="start", zorder=9)
+    ax.scatter(dataset_goal_point[0], dataset_goal_point[1], s=115, marker="*", color="gold", edgecolor="black", linewidth=0.8, label="dataset goal", zorder=9)
+    ax.scatter(nominal_goal_point[0], nominal_goal_point[1], s=90, marker="P", color="limegreen", edgecolor="black", linewidth=0.8, label="nominal goal", zorder=9)
+    ax.scatter(constrained_goal_point[0], constrained_goal_point[1], s=90, marker="D", color="tab:purple", edgecolor="black", linewidth=0.8, label="constrained goal", zorder=9)
+    ax.scatter(nominal_point[0], nominal_point[1], s=80, marker="X", color="tab:red", edgecolor="black", linewidth=0.8, label="obstacle center", zorder=9)
+    ax.set_title(title)
+    ax.set_xlabel(f"PC1 ({100.0 * explained_ratio[0]:.1f}%)")
+    ax.set_ylabel(f"PC2 ({100.0 * explained_ratio[1]:.1f}%)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+
+    if focus_main_view:
+        focus_stack = np.concatenate(
+            [
+                construction_samples,
+                test_inside_samples,
+                test_outside_samples,
+                dataset_traj,
+                nominal_traj,
+                constrained_traj,
+                start_point[None, :],
+                dataset_goal_point[None, :],
+                nominal_goal_point[None, :],
+                constrained_goal_point[None, :],
+                nominal_point[None, :],
+            ]
+            + ([zonotope_boundary] if zonotope_boundary.shape[0] >= 2 else []),
+            axis=0,
+        )
+        mins = focus_stack.min(axis=0)
+        maxs = focus_stack.max(axis=0)
+        spans = np.maximum(maxs - mins, 1e-6)
+        pad = 0.4 * spans
+        ax.set_xlim(mins[0] - pad[0], maxs[0] + pad[0])
+        ax.set_ylim(mins[1] - pad[1], maxs[1] + pad[1])
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def main() -> None:
+    args = parse_args()
+    log_progress(f"Starting obstacle-aware planning for episode {args.episode_idx}, requested obstacle step {args.obstacle_step}.")
+    rng = np.random.default_rng(args.seed)
+    device = planner.require_device(args.device)
+    model_dir = args.model_dir.expanduser().resolve()
+    dataset_path = args.dataset_path.expanduser().resolve()
+    out_root = args.out_dir.expanduser().resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    config = planner.load_config(model_dir)
+    checkpoint_path = (
+        args.checkpoint.expanduser().resolve()
+        if args.checkpoint is not None
+        else planner.latest_object_checkpoint(model_dir).resolve()
+    )
+    model = planner.load_model(checkpoint_path, device)
+    background_dataset_path = (
+        args.background_dataset_path.expanduser().resolve()
+        if args.background_dataset_path is not None
+        else Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
+    )
+
+    nominal_cache_path = obstacle_analysis.infer_rollout_cache_path(out_root, checkpoint_path, args.episode_idx, args)
+    nominal_args = argparse.Namespace(**vars(args))
+    nominal_args.max_mpc_steps = int(args.unconstrained_max_mpc_steps)
+    nominal = obstacle_analysis.run_or_load_rollout(
+        planner=planner,
+        dataset_cls=LeWMReacherDataset,
+        cache_path=nominal_cache_path,
+        force_rerun=args.force_rerun_rollout,
+        model=model,
+        config=config,
+        dataset_path=dataset_path,
+        episode_idx=args.episode_idx,
+        device=device,
+        frame_batch_size=args.frame_batch_size,
+        args=nominal_args,
+    )
+    nominal_qpos = np.asarray(nominal["rollout_qpos"], dtype=np.float64)
+    nominal_emb = np.asarray(nominal["rollout_emb"], dtype=np.float64)
+    dataset_emb = np.asarray(nominal["dataset_emb"], dtype=np.float64)
+    obstacle_step = int(args.obstacle_step)
+    if obstacle_step == -1:
+        obstacle_step = int(nominal_qpos.shape[0] - 1)
+    if obstacle_step < 0 or obstacle_step >= nominal_qpos.shape[0]:
+        raise ValueError(f"--obstacle-step must be in [0, {nominal_qpos.shape[0] - 1}], got {args.obstacle_step}.")
+
+    episode_dir = out_root / f"episode_{args.episode_idx:05d}" / f"step_{obstacle_step:04d}"
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    log_progress("Loaded nominal rollout cache.")
+
+    img_size = int(config.get("img_size", 224))
+    embed_dim = int(config.get("embed_dim", 24))
+    pixel_mean, pixel_std = planner.imagenet_pixel_stats(device)
+
+    env = planner.make_render_env(
+        seed=int(nominal["episode_seed"]),
+        time_limit=float(nominal["time_limit"]),
+        width=int(nominal["width"]),
+        height=int(nominal["height"]),
+        physics_freq_hz=float(nominal["physics_freq_hz"]),
+    )
+    lower, upper = obstacle_analysis.joint_limits_from_env(env)
+    center_qpos = nominal_qpos[obstacle_step]
+    joint_ranges = np.array([args.joint1_range, args.joint2_range], dtype=np.float64)
+    total_obstacle = args.set_pca_count + args.set_norm_count + args.set_cal_count + args.set_test_count
+    sampled_qpos = obstacle_analysis.sample_local_perturbations(
+        center_qpos,
+        lower,
+        upper,
+        rng,
+        joint_ranges=joint_ranges,
+        count=total_obstacle,
+    )
+    perturb_frames = obstacle_analysis.render_qpos_batch(
+        planner,
+        env,
+        int(nominal["episode_seed"]),
+        sampled_qpos,
+        height=int(nominal["height"]),
+        width=int(nominal["width"]),
+    )
+    env.close()
+
+    perturb_pixels = planner.preprocess_pixels(
+        perturb_frames,
+        img_size=img_size,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+    )
+    perturb_emb = planner.encode_frames(
+        model,
+        perturb_pixels,
+        device=device,
+        frame_batch_size=args.frame_batch_size,
+    ).detach().cpu().numpy().astype(np.float64)
+    position_samples = perturb_emb[:, :embed_dim]
+    permutation = rng.permutation(total_obstacle)
+    position_samples = position_samples[permutation]
+    sampled_qpos = sampled_qpos[permutation]
+
+    pca_end = args.set_pca_count
+    norm_end = pca_end + args.set_norm_count
+    cal_end = norm_end + args.set_cal_count
+    pca_samples = position_samples[:pca_end]
+    norm_samples = position_samples[pca_end:norm_end]
+    cal_samples = position_samples[norm_end:cal_end]
+    test_samples = position_samples[cal_end:]
+    zonotope = obstacle_analysis.build_conformal_zonotope(
+        pca_samples,
+        norm_samples,
+        cal_samples,
+        delta=args.delta,
+        eps=args.conformal_eps,
+        eigval_floor=args.eigval_floor,
+    )
+    nominal_position = nominal_emb[obstacle_step, :embed_dim]
+    heldout_inside = obstacle_analysis.zonotope_contains(test_samples, zonotope, tol=args.membership_tol)
+    empirical_coverage = float(np.mean(heldout_inside))
+    log_progress(f"Built obstacle zonotope with held-out coverage {empirical_coverage:.4f}.")
+
+    constrained_cache_path = infer_constrained_cache_path(out_root, checkpoint_path, args.episode_idx, obstacle_step, args)
+    if constrained_cache_path.is_file() and not args.force_rerun_constrained:
+        constrained = torch.load(constrained_cache_path, map_location="cpu", weights_only=False)
+    else:
+        log_progress("Running constrained rollout.")
+        constrained = run_constrained_rollout(
+            model=model,
+            config=config,
+            rollout=nominal,
+            zonotope=zonotope,
+            device=device,
+            frame_batch_size=args.frame_batch_size,
+            args=args,
+        )
+        constrained_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(constrained, constrained_cache_path)
+
+    log_progress("Preparing overlays, videos, and comparison plots.")
+    nominal_frames = np.asarray(nominal["rollout_frames"], dtype=np.uint8)
+    constrained_frames = np.asarray(constrained["rollout_frames"], dtype=np.uint8)
+    nominal_video_dir = episode_dir / "nominal_rollout"
+    constrained_video_dir = episode_dir / "constrained_rollout"
+    nominal_video_dir.mkdir(parents=True, exist_ok=True)
+    constrained_video_dir.mkdir(parents=True, exist_ok=True)
+    planner.save_rollout_video([frame.copy() for frame in nominal_frames], nominal_video_dir, fps=args.video_fps)
+    planner.save_rollout_video([frame.copy() for frame in constrained_frames], constrained_video_dir, fps=args.video_fps)
+    planner.save_rgb_image(episode_dir / "nominal_goal_image.png", nominal_frames[-1])
+    planner.save_rgb_image(episode_dir / "constrained_goal_image.png", constrained_frames[-1])
+
+    overlay_count = min(int(args.overlay_sample_count), int(sampled_qpos.shape[0]))
+    overlay_indices = np.linspace(0, sampled_qpos.shape[0] - 1, num=overlay_count, dtype=np.int64)
+    overlay_qpos_batch = np.concatenate((center_qpos[None, :], sampled_qpos[overlay_indices]), axis=0)
+    overlay_env = planner.make_render_env(
+        seed=int(nominal["episode_seed"]),
+        time_limit=float(nominal["time_limit"]),
+        width=int(nominal["width"]),
+        height=int(nominal["height"]),
+        physics_freq_hz=float(nominal["physics_freq_hz"]),
+    )
+    overlay_frames, overlay_masks = obstacle_analysis.render_masked_qpos_batch(
+        overlay_env,
+        int(nominal["episode_seed"]),
+        overlay_qpos_batch,
+        height=int(nominal["height"]),
+        width=int(nominal["width"]),
+    )
+    overlay_env.close()
+    obstacle_overlay = obstacle_analysis.make_obstacle_overlay_image(
+        nominal_frame=overlay_frames[0],
+        nominal_mask=overlay_masks[0],
+        perturb_frames=overlay_frames[1:],
+        perturb_masks=overlay_masks[1:],
+        perturb_alpha=float(args.overlay_perturb_alpha),
+    )
+    planner.save_rgb_image(episode_dir / "obstacle_overlay_all.png", obstacle_overlay)
+
+    background_rows = obstacle_analysis.sample_background_rows(background_dataset_path, rng, args.background_samples)
+    background_emb = obstacle_analysis.encode_dataset_rows(
+        planner,
+        model,
+        background_dataset_path,
+        background_rows,
+        device=device,
+        img_size=img_size,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+        frame_batch_size=args.frame_batch_size,
+    )
+    background_pos = background_emb[:, :embed_dim]
+    dataset_pos = dataset_emb[:, :embed_dim]
+    nominal_pos = nominal_emb[:, :embed_dim]
+    constrained_pos = np.asarray(constrained["rollout_emb"], dtype=np.float64)[:, :embed_dim]
+    global_pca = obstacle_analysis.fit_pca_2d(background_pos)
+    local_pca = obstacle_analysis.fit_pca_2d(position_samples)
+    local_boundary = obstacle_analysis.zonotope_boundary_2d(*obstacle_analysis.project_zonotope(zonotope, local_pca))
+    heldout_inside_samples = test_samples[heldout_inside]
+    heldout_outside_samples = test_samples[~heldout_inside]
+
+    make_comparison_plot(
+        episode_dir / "pca_global.png",
+        title=f"Global PCA comparison | episode {args.episode_idx} step {obstacle_step}",
+        background=obstacle_analysis.project_points(background_pos, global_pca),
+        construction_samples=obstacle_analysis.project_points(position_samples, global_pca),
+        test_inside_samples=np.zeros((0, 2), dtype=np.float64),
+        test_outside_samples=np.zeros((0, 2), dtype=np.float64),
+        dataset_traj=obstacle_analysis.project_points(dataset_pos, global_pca),
+        nominal_traj=obstacle_analysis.project_points(nominal_pos, global_pca),
+        constrained_traj=obstacle_analysis.project_points(constrained_pos, global_pca),
+        start_point=obstacle_analysis.project_points(dataset_pos[[0]], global_pca)[0],
+        dataset_goal_point=obstacle_analysis.project_points(dataset_pos[[-1]], global_pca)[0],
+        nominal_goal_point=obstacle_analysis.project_points(nominal_pos[[-1]], global_pca)[0],
+        constrained_goal_point=obstacle_analysis.project_points(constrained_pos[[-1]], global_pca)[0],
+        nominal_point=obstacle_analysis.project_points(nominal_position[None, :], global_pca)[0],
+        zonotope_boundary=np.zeros((0, 2), dtype=np.float64),
+        explained_ratio=np.asarray(global_pca["explained_variance_ratio"], dtype=np.float64),
+        focus_main_view=True,
+    )
+    make_comparison_plot(
+        episode_dir / "pca_local.png",
+        title=f"Local PCA comparison | episode {args.episode_idx} step {obstacle_step}",
+        background=obstacle_analysis.project_points(background_pos, local_pca),
+        construction_samples=obstacle_analysis.project_points(position_samples[:cal_end], local_pca),
+        test_inside_samples=obstacle_analysis.project_points(heldout_inside_samples, local_pca),
+        test_outside_samples=obstacle_analysis.project_points(heldout_outside_samples, local_pca),
+        dataset_traj=obstacle_analysis.project_points(dataset_pos, local_pca),
+        nominal_traj=obstacle_analysis.project_points(nominal_pos, local_pca),
+        constrained_traj=obstacle_analysis.project_points(constrained_pos, local_pca),
+        start_point=obstacle_analysis.project_points(dataset_pos[[0]], local_pca)[0],
+        dataset_goal_point=obstacle_analysis.project_points(dataset_pos[[-1]], local_pca)[0],
+        nominal_goal_point=obstacle_analysis.project_points(nominal_pos[[-1]], local_pca)[0],
+        constrained_goal_point=obstacle_analysis.project_points(constrained_pos[[-1]], local_pca)[0],
+        nominal_point=obstacle_analysis.project_points(nominal_position[None, :], local_pca)[0],
+        zonotope_boundary=local_boundary,
+        explained_ratio=np.asarray(local_pca["explained_variance_ratio"], dtype=np.float64),
+        focus_main_view=False,
+    )
+
+    obstacle_coords = obstacle_analysis.zonotope_coords(position_samples, zonotope)
+    obstacle_analysis.make_zonotope_coords_plot(
+        episode_dir / "zonotope_coords.png",
+        construction_coords=obstacle_coords[:cal_end, :2],
+        test_coords=obstacle_coords[cal_end:, :2],
+        test_inside_mask=heldout_inside,
+        nominal_coords=obstacle_analysis.zonotope_coords(nominal_position[None, :], zonotope)[0, :2],
+    )
+
+    torch.save(
+        {
+            "zonotope": zonotope,
+            "global_pca": global_pca,
+            "local_pca": local_pca,
+            "nominal_rollout_cache_path": str(nominal_cache_path),
+            "constrained_rollout_cache_path": str(constrained_cache_path),
+            "background_rows": background_rows.astype(np.int64),
+            "sampled_qpos": sampled_qpos.astype(np.float64),
+            "obstacle_position_samples": position_samples.astype(np.float64),
+            "nominal_rollout_emb": nominal_pos.astype(np.float64),
+            "constrained_rollout_emb": constrained_pos.astype(np.float64),
+            "empirical_coverage_mask": heldout_inside.astype(bool),
+        },
+        episode_dir / "analysis.pt",
+    )
+    save_json(
+        episode_dir / "summary.json",
+        {
+            "episode_idx": int(args.episode_idx),
+            "obstacle_step": int(obstacle_step),
+            "nominal_rollout_cache_path": str(nominal_cache_path),
+            "constrained_rollout_cache_path": str(constrained_cache_path),
+            "checkpoint_path": str(checkpoint_path),
+            "background_dataset_path": str(background_dataset_path),
+            "constraint_margin": float(args.constraint_margin),
+            "constraint_activation": float(args.constraint_activation),
+            "obstacle_penalty": float(args.obstacle_penalty),
+            "unconstrained_max_mpc_steps": int(args.unconstrained_max_mpc_steps),
+            "constrained_max_mpc_steps": int(args.constrained_max_mpc_steps),
+            "empirical_coverage": empirical_coverage,
+            "nominal_stop_reason": str(nominal["stop_reason"]),
+            "constrained_stop_reason": str(constrained["stop_reason"]),
+            "nominal_final_obs_goal_distance": float(np.asarray(nominal["observation_goal_distances"], dtype=np.float64)[-1]),
+            "constrained_final_obs_goal_distance": float(np.asarray(constrained["observation_goal_distances"], dtype=np.float64)[-1]),
+            "constrained_mean_active_constraints": float(np.mean(np.asarray(constrained["active_constraints"], dtype=np.float64))) if np.asarray(constrained["active_constraints"]).size > 0 else 0.0,
+            "constrained_mean_obstacle_penalty": float(np.mean(np.asarray(constrained["obstacle_penalties"], dtype=np.float64))) if np.asarray(constrained["obstacle_penalties"]).size > 0 else 0.0,
+        },
+    )
+
+    log_progress("Obstacle-aware planning complete.")
+    print(f"Output dir: {episode_dir}")
+    print(f"Constrained rollout cache: {constrained_cache_path}")
+
+
+if __name__ == "__main__":
+    main()
