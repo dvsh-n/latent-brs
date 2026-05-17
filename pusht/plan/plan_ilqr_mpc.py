@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -28,18 +29,20 @@ from pusht.shared.pusht_env import (
 )
 from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, required_markov_history
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
-DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_diffusion_dataset"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_eval.h5"
+DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft"
 DEFAULT_OUT_DIR = "pusht/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
 HORIZON = 15
-MAX_MPC_STEPS = 150
-Q_TERMINAL = 5.0
+MAX_MPC_STEPS = 250
+Q_TERMINAL = 10.0
 Q_STAGE = 0.005
-R_CONTROL = 0.1
+R_CONTROL = 0.01
 VIDEO_FPS = 10
-EPISODE_IDX = 8257 # 480, 12148
+EPISODE_IDX = None # 480, 12148
+CONTROL_MIN_NORM = -1.5
+CONTROL_MAX_NORM = 1.5
 ENV_ACTION_SCALE = 100.0
 PUSHT_WALL_MIN = 5.0
 PUSHT_WALL_MAX = 506.0
@@ -414,6 +417,8 @@ class ILQRMPCSolver:
         max_iters: int,
         tol: float,
         regularization: float,
+        control_min: float,
+        control_max: float,
         device: torch.device,
     ) -> None:
         self.dynamics = dynamics
@@ -427,25 +432,32 @@ class ILQRMPCSolver:
         self.tol = float(tol)
         self.regularization = float(regularization)
         self.device = device
-        self.prev_u_guess = torch.zeros((self.horizon, self.action_dim), dtype=torch.float32, device=device)
         self.eye_x = torch.eye(self.state_dim, dtype=torch.float32, device=device)
         self.eye_u = torch.eye(self.action_dim, dtype=torch.float32, device=device)
+        self.u_min = torch.full((self.action_dim,), float(control_min), dtype=torch.float32, device=device)
+        self.u_max = torch.full((self.action_dim,), float(control_max), dtype=torch.float32, device=device)
+        self.prev_u_guess = torch.zeros((self.horizon, self.action_dim), dtype=torch.float32, device=device)
+        self.prev_u_guess = self._project_control(self.prev_u_guess)
         self.line_search_alphas = (1.0, 0.5, 0.25, 0.1, 0.05, 0.01)
+
+    def _project_control(self, u: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(u, min=self.u_min, max=self.u_max)
 
     def _make_initial_action_guess(self) -> torch.Tensor:
         if self.horizon <= 1:
-            return self.prev_u_guess.clone()
+            return self._project_control(self.prev_u_guess.clone())
         guess = torch.empty_like(self.prev_u_guess)
         guess[:-1] = self.prev_u_guess[1:]
         guess[-1] = self.prev_u_guess[-1]
-        return guess
+        return self._project_control(guess)
 
     def _rollout(self, x0: torch.Tensor, u_seq: torch.Tensor) -> torch.Tensor:
         x_traj = torch.empty((self.horizon + 1, self.state_dim), dtype=x0.dtype, device=self.device)
         x_traj[0] = x0
         x_curr = x0
         for step in range(self.horizon):
-            x_curr = self.dynamics.step(x_curr, u_seq[step])
+            u_step = self._project_control(u_seq[step])
+            x_curr = self.dynamics.step(x_curr, u_step)
             x_traj[step + 1] = x_curr
         return x_traj
 
@@ -475,6 +487,76 @@ class ILQRMPCSolver:
             b_list.append(jac[:, self.state_dim :].detach())
 
         return torch.stack(a_list, dim=0), torch.stack(b_list, dim=0)
+
+    def _solve_box_qp(
+        self,
+        q_uu: torch.Tensor,
+        q_u: torch.Tensor,
+        q_ux: torch.Tensor,
+        u: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        delta_low = self.u_min - u
+        delta_high = self.u_max - u
+        best_obj: float | None = None
+        best_k: torch.Tensor | None = None
+        best_kk: torch.Tensor | None = None
+        grad_tol = 1e-5
+        bound_tol = 1e-6
+
+        for status in itertools.product((-1, 0, 1), repeat=self.action_dim):
+            k = torch.zeros((self.action_dim,), dtype=torch.float32, device=self.device)
+            kk = torch.zeros((self.action_dim, self.state_dim), dtype=torch.float32, device=self.device)
+            free_idx = [idx for idx, tag in enumerate(status) if tag == 0]
+            clamped_idx = [idx for idx, tag in enumerate(status) if tag != 0]
+
+            for idx in clamped_idx:
+                k[idx] = delta_low[idx] if status[idx] < 0 else delta_high[idx]
+
+            if free_idx:
+                free = torch.tensor(free_idx, dtype=torch.long, device=self.device)
+                q_ff = q_uu.index_select(0, free).index_select(1, free)
+                rhs_k = q_u.index_select(0, free)
+                if clamped_idx:
+                    clamped = torch.tensor(clamped_idx, dtype=torch.long, device=self.device)
+                    q_fc = q_uu.index_select(0, free).index_select(1, clamped)
+                    rhs_k = rhs_k + q_fc @ k.index_select(0, clamped)
+                try:
+                    k_free = -torch.linalg.solve(q_ff, rhs_k.unsqueeze(1)).squeeze(1)
+                    kk_free = -torch.linalg.solve(q_ff, q_ux.index_select(0, free))
+                except RuntimeError:
+                    continue
+                k[free] = k_free
+                kk[free] = kk_free
+
+            feasible = bool(torch.all(k >= delta_low - bound_tol) and torch.all(k <= delta_high + bound_tol))
+            if not feasible:
+                continue
+
+            grad = q_u + q_uu @ k
+            kkt_ok = True
+            for idx, tag in enumerate(status):
+                grad_i = float(grad[idx].item())
+                if tag == 0 and abs(grad_i) > grad_tol:
+                    kkt_ok = False
+                    break
+                if tag < 0 and grad_i < -grad_tol:
+                    kkt_ok = False
+                    break
+                if tag > 0 and grad_i > grad_tol:
+                    kkt_ok = False
+                    break
+            if not kkt_ok:
+                continue
+
+            obj = float((0.5 * torch.dot(k, q_uu @ k) + torch.dot(q_u, k)).item())
+            if best_obj is None or obj < best_obj:
+                best_obj = obj
+                best_k = k
+                best_kk = kk
+
+        if best_k is None or best_kk is None:
+            raise RuntimeError("Box-constrained control subproblem failed.")
+        return best_k, best_kk
 
     def solve(self, x0_np: np.ndarray, x_goal_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, int, float]:
         x0 = torch.tensor(x0_np, dtype=torch.float32, device=self.device)
@@ -519,13 +601,11 @@ class ILQRMPCSolver:
                 q_uu = 0.5 * (q_uu + q_uu.T)
 
                 try:
-                    q_uu_inv = torch.linalg.inv(q_uu)
+                    k, kk = self._solve_box_qp(q_uu, q_u, q_ux, u)
                 except RuntimeError:
                     backward_ok = False
                     break
 
-                k = -q_uu_inv @ q_u
-                kk = -q_uu_inv @ q_ux
                 k_seq[step] = k
                 kk_seq[step] = kk
 
@@ -545,11 +625,12 @@ class ILQRMPCSolver:
                 x_new[0] = x0
                 for step in range(self.horizon):
                     dx = x_new[step] - x_traj[step]
-                    u_new[step] = u_seq[step] + alpha * k_seq[step] + kk_seq[step] @ dx
+                    u_candidate = u_seq[step] + alpha * k_seq[step] + kk_seq[step] @ dx
+                    u_new[step] = self._project_control(u_candidate)
                     x_new[step + 1] = self.dynamics.step(x_new[step], u_new[step])
                 new_cost = float(self._trajectory_cost(x_new, u_new, x_goal).item())
                 if np.isfinite(new_cost) and new_cost < current_cost:
-                    candidate_best = (x_new, u_new, new_cost, alpha)
+                    candidate_best = (x_new, u_new, new_cost)
                     accepted = True
                     break
 
@@ -559,8 +640,9 @@ class ILQRMPCSolver:
                     break
                 continue
 
-            x_traj, u_seq, new_cost, alpha = candidate_best
-            max_du = float(torch.max(torch.abs(alpha * k_seq)).item())
+            prev_u_seq = u_seq
+            x_traj, u_seq, new_cost = candidate_best
+            max_du = float(torch.max(torch.abs(u_seq - prev_u_seq)).item())
             cost_improvement = current_cost - new_cost
             current_cost = new_cost
             reg = max(self.regularization, reg * 0.5)
@@ -716,6 +798,8 @@ def main() -> None:
             max_iters=args.ilqr_max_iters,
             tol=args.ilqr_tol,
             regularization=args.ilqr_regularization,
+            control_min=CONTROL_MIN_NORM,
+            control_max=CONTROL_MAX_NORM,
             device=device,
         )
 
@@ -828,6 +912,8 @@ def main() -> None:
         "stop_reason": stop_reason,
         "num_mpc_steps": len(executed_actions_norm),
         "action_space": "normalized_dataset_action_then_raw_then_absolute_env_target",
+        "control_bound_low_norm": CONTROL_MIN_NORM,
+        "control_bound_high_norm": CONTROL_MAX_NORM,
         "env_action_scale": ENV_ACTION_SCALE,
         "action_target_low": action_low.tolist(),
         "action_target_high": action_high.tolist(),

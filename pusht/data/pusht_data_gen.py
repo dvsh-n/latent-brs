@@ -23,9 +23,9 @@ from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env
 from pusht.shared.utils import env_action_from_policy_action, load_expert_policy_bundle
 
 DEFAULT_MODEL_DIR = Path("pusht/models")
-DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_diffusion_train.h5")
+DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_diffusion_eval.h5")
 ROLLOUT_MODES = ("expert", "expert_plus_noise")
-RATIOS = (0.67, 0.33)  # expert, expert_plus_noise
+RATIOS = (1.0, 0.0)  # expert, expert_plus_noise
 DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500)
 
 
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--env-id", default=DEFAULT_PUSHT_ENV_ID)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    parser.add_argument("--num-episodes", type=int, default=20_000)
+    parser.add_argument("--num-episodes", type=int, default=1_000)
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument(
         "--max-steps-expert",
