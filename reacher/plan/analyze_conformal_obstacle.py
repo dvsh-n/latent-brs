@@ -27,14 +27,16 @@ from tqdm.auto import tqdm
 DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
 DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
 DEFAULT_OUT_DIR = "reacher/plan/conformal_obstacle_analysis"
-DEFAULT_EPISODE_IDX = 791
+DEFAULT_EPISODE_IDX = 829
 DEFAULT_HORIZON = 20
-DEFAULT_OBSTACLE_STEP = 50
-DEFAULT_MAX_MPC_STEPS = 150
+DEFAULT_OBSTACLE_STEP = 30
+DEFAULT_MAX_MPC_STEPS = 100
 DEFAULT_Q_TERMINAL = 10.0
 DEFAULT_Q_STAGE = 0.005
 DEFAULT_R_CONTROL = 0.1
 DEFAULT_VIDEO_FPS = 60
+DEFAULT_OVERLAY_SAMPLE_COUNT = 96
+DEFAULT_OVERLAY_PERTURB_ALPHA = 0.05
 
 
 def load_runtime_dependencies():
@@ -77,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conformal-eps", type=float, default=1e-12)
     parser.add_argument("--eigval-floor", type=float, default=1e-10)
     parser.add_argument("--membership-tol", type=float, default=1e-8)
+    parser.add_argument("--overlay-sample-count", type=int, default=DEFAULT_OVERLAY_SAMPLE_COUNT)
+    parser.add_argument("--overlay-perturb-alpha", type=float, default=DEFAULT_OVERLAY_PERTURB_ALPHA)
     parser.add_argument("--force-rerun-rollout", action="store_true", default=False)
     return parser.parse_args()
 
@@ -85,6 +89,10 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+
+
+def log_progress(message: str) -> None:
+    print(f"[analyze_conformal_obstacle] {message}", flush=True)
 
 
 def infer_rollout_cache_path(
@@ -417,6 +425,106 @@ def render_qpos_batch(
     return np.stack(frames, axis=0)
 
 
+def get_arm_geom_ids(model) -> np.ndarray:
+    arm_body_names = ("arm", "hand", "finger")
+    arm_body_ids = {int(model.name2id(name, "body")) for name in arm_body_names}
+    arm_geom_ids: list[int] = []
+    for geom_id in range(int(model.ngeom)):
+        geom_name = model.id2name(geom_id, "geom")
+        geom_body_id = int(model.geom_bodyid[geom_id])
+        if geom_name == "root" or geom_body_id in arm_body_ids:
+            arm_geom_ids.append(geom_id)
+    if not arm_geom_ids:
+        raise ValueError("Failed to identify arm geoms for segmentation.")
+    return np.asarray(sorted(set(arm_geom_ids)), dtype=np.int32)
+
+
+def build_arm_mask(segmentation: np.ndarray, arm_geom_ids: np.ndarray) -> np.ndarray:
+    mask = np.zeros(segmentation.shape[:2], dtype=bool)
+    for geom_id in arm_geom_ids:
+        mask |= segmentation[..., 0] == geom_id
+    return mask
+
+
+def make_segmentation_scene_option(model):
+    from dm_control.mujoco.wrapper import core as dm_core
+
+    target_geom_id = int(model.name2id("target", "geom"))
+    original_group = int(model.geom_group[target_geom_id])
+    model.geom_group[target_geom_id] = 3
+    scene_option = dm_core.MjvOption()
+    scene_option.geomgroup[:] = 1
+    scene_option.geomgroup[3] = 0
+    return scene_option, target_geom_id, original_group
+
+
+def render_masked_qpos_batch(
+    env,
+    seed: int,
+    qpos_batch: np.ndarray,
+    *,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    env.reset(seed=seed)
+    physics = env._env.physics
+    model = physics.model
+    qvel = np.zeros(qpos_batch.shape[1], dtype=np.float32)
+    arm_geom_ids = get_arm_geom_ids(model)
+    scene_option, target_geom_id, original_group = make_segmentation_scene_option(model)
+    frames: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    try:
+        for qpos in tqdm(qpos_batch, desc="Render obstacle masks"):
+            with physics.reset_context():
+                physics.data.qpos[: qpos.shape[0]] = np.asarray(qpos, dtype=np.float32)
+                physics.data.qvel[: qvel.shape[0]] = qvel
+            frame = physics.render(height=height, width=width, camera_id=0)
+            segmentation = physics.render(
+                height=height,
+                width=width,
+                camera_id=0,
+                segmentation=True,
+                scene_option=scene_option,
+            )
+            frames.append(frame.copy())
+            masks.append(build_arm_mask(segmentation, arm_geom_ids))
+    finally:
+        model.geom_group[target_geom_id] = original_group
+    return np.stack(frames, axis=0), np.stack(masks, axis=0)
+
+
+def alpha_composite_masked(
+    canvas: np.ndarray,
+    frame: np.ndarray,
+    mask: np.ndarray,
+    *,
+    alpha: float,
+) -> np.ndarray:
+    out = canvas.copy()
+    if not np.any(mask):
+        return out
+    base = out[mask].astype(np.float32)
+    src = frame[mask].astype(np.float32)
+    out[mask] = np.clip((1.0 - alpha) * base + alpha * src, 0.0, 255.0).astype(np.uint8)
+    return out
+
+
+def make_obstacle_overlay_image(
+    nominal_frame: np.ndarray,
+    nominal_mask: np.ndarray,
+    perturb_frames: np.ndarray,
+    perturb_masks: np.ndarray,
+    *,
+    perturb_alpha: float,
+) -> np.ndarray:
+    canvas = np.full_like(nominal_frame, 255, dtype=np.uint8)
+    for frame, mask in zip(perturb_frames, perturb_masks, strict=True):
+        canvas = alpha_composite_masked(canvas, frame, mask, alpha=perturb_alpha)
+    canvas = alpha_composite_masked(canvas, nominal_frame, nominal_mask, alpha=1.0)
+    return canvas
+
+
 def fit_pca_2d(points: np.ndarray) -> dict[str, np.ndarray]:
     if points.ndim != 2 or points.shape[0] < 2:
         raise ValueError(f"Need at least 2 samples for PCA, got shape {points.shape}.")
@@ -594,7 +702,7 @@ def make_plot(
     else:
         fig, ax = plt.subplots(figsize=(9, 8))
         zoom_ax = None
-    ax.scatter(background[:, 0], background[:, 1], s=3, alpha=0.09, color="0.68", label="background", zorder=1)
+    ax.scatter(background[:, 0], background[:, 1], s=3, alpha=0.18, color="0.5", label="background", zorder=1)
     if focus_background is not None and focus_background.shape[0] > 0:
         ax.scatter(
             focus_background[:, 0],
@@ -612,7 +720,7 @@ def make_plot(
             s=10,
             alpha=0.35,
             color="tab:red",
-            label="construction samples",
+            label="obstacle samples",
             zorder=3,
         )
     if test_inside_samples.shape[0] > 0:
@@ -713,7 +821,7 @@ def make_plot(
         x0, y0 = mins - pad
         x1, y1 = maxs + pad
 
-        zoom_ax.scatter(background[:, 0], background[:, 1], s=2, alpha=0.06, color="0.74", zorder=1)
+        zoom_ax.scatter(background[:, 0], background[:, 1], s=2, alpha=0.14, color="0.56", zorder=1)
         if focus_background is not None and focus_background.shape[0] > 0:
             zoom_ax.scatter(focus_background[:, 0], focus_background[:, 1], s=5, alpha=0.18, color="0.5", zorder=2)
         if construction_samples.shape[0] > 0:
@@ -785,7 +893,7 @@ def make_zonotope_coords_plot(
             s=12,
             alpha=0.35,
             color="tab:red",
-            label="construction samples",
+            label="obstacle samples",
             zorder=1,
         )
     inside_coords = test_coords[test_inside_mask]
@@ -829,6 +937,9 @@ def make_zonotope_coords_plot(
 
 def main() -> None:
     args = parse_args()
+    log_progress(
+        f"Starting analysis for episode {args.episode_idx}, obstacle step {args.obstacle_step}."
+    )
     rng = np.random.default_rng(args.seed)
     planner, dataset_cls = load_runtime_dependencies()
     device = planner.require_device(args.device)
@@ -868,6 +979,7 @@ def main() -> None:
         frame_batch_size=args.frame_batch_size,
         args=args,
     )
+    log_progress("Loaded rollout cache and model outputs.")
 
     rollout_qpos = np.asarray(rollout["rollout_qpos"], dtype=np.float64)
     rollout_qvel = np.asarray(rollout["rollout_qvel"], dtype=np.float64)
@@ -906,6 +1018,9 @@ def main() -> None:
     center_qpos = rollout_qpos[args.obstacle_step]
     joint_ranges = np.array([args.joint1_range, args.joint2_range], dtype=np.float64)
     total_obstacle = args.set_pca_count + args.set_norm_count + args.set_cal_count + args.set_test_count
+    log_progress(
+        f"Sampling {total_obstacle} local perturbations and rendering obstacle frames."
+    )
     sampled_qpos = sample_local_perturbations(
         center_qpos,
         lower,
@@ -936,6 +1051,7 @@ def main() -> None:
         device=device,
         frame_batch_size=args.frame_batch_size,
     ).detach().cpu().numpy().astype(np.float64)
+    log_progress("Encoded perturbation frames into latent positions.")
 
     position_samples = perturb_emb[:, :embed_dim]
     permutation = rng.permutation(total_obstacle)
@@ -962,7 +1078,13 @@ def main() -> None:
     nominal_position = rollout_emb[args.obstacle_step, :embed_dim]
     heldout_inside = zonotope_contains(test_samples, zonotope, tol=args.membership_tol)
     empirical_coverage = float(np.mean(heldout_inside))
+    log_progress(
+        f"Built conformal zonotope and evaluated held-out coverage: {empirical_coverage:.4f}."
+    )
 
+    log_progress(
+        f"Sampling {args.background_samples} background latents for global/context PCA."
+    )
     background_rows = sample_background_rows(background_dataset_path, rng, args.background_samples)
     background_emb = encode_dataset_rows(
         planner,
@@ -986,11 +1108,7 @@ def main() -> None:
 
     global_pca = fit_pca_2d(background_pos)
     local_pca = fit_pca_2d(all_obstacle_samples)
-    context_background = select_nearest_points(background_pos, nominal_position, args.context_background_count)
-    context_points = np.concatenate((all_obstacle_samples, context_background), axis=0)
-    context_pca = fit_pca_2d(context_points)
 
-    global_boundary = zonotope_boundary_2d(*project_zonotope(zonotope, context_pca))
     local_boundary = zonotope_boundary_2d(*project_zonotope(zonotope, local_pca))
 
     rollout_goal_pixel = np.asarray(rollout_frames[-1], dtype=np.uint8)
@@ -999,24 +1117,54 @@ def main() -> None:
     planner.save_rgb_image(episode_dir / "goal_image_target.png", goal_pixel)
     planner.save_rgb_image(episode_dir / "goal_image_rollout.png", rollout_goal_pixel)
     planner.save_rollout_video(rollout_frames, episode_dir, fps=args.video_fps)
+    overlay_count = min(int(args.overlay_sample_count), int(sampled_qpos.shape[0]))
+    log_progress(
+        f"Rendering obstacle overlay image using {overlay_count} perturbation masks."
+    )
+    overlay_indices = np.linspace(0, sampled_qpos.shape[0] - 1, num=overlay_count, dtype=np.int64)
+    overlay_qpos_batch = np.concatenate((center_qpos[None, :], sampled_qpos[overlay_indices]), axis=0)
+    overlay_env = planner.make_render_env(
+        seed=int(rollout["episode_seed"]),
+        time_limit=float(rollout["time_limit"]),
+        width=int(rollout["width"]),
+        height=int(rollout["height"]),
+        physics_freq_hz=float(rollout["physics_freq_hz"]),
+    )
+    overlay_frames, overlay_masks = render_masked_qpos_batch(
+        overlay_env,
+        int(rollout["episode_seed"]),
+        overlay_qpos_batch,
+        height=int(rollout["height"]),
+        width=int(rollout["width"]),
+    )
+    overlay_env.close()
+    obstacle_overlay = make_obstacle_overlay_image(
+        nominal_frame=overlay_frames[0],
+        nominal_mask=overlay_masks[0],
+        perturb_frames=overlay_frames[1:],
+        perturb_masks=overlay_masks[1:],
+        perturb_alpha=float(args.overlay_perturb_alpha),
+    )
+    planner.save_rgb_image(episode_dir / "obstacle_overlay_all.png", obstacle_overlay)
+    log_progress("Saved obstacle overlay image and summary plots.")
 
     make_plot(
         episode_dir / "pca_global.png",
-        title=f"Global view with context PCA | episode {args.episode_idx} step {args.obstacle_step}",
-        background=project_points(background_pos, context_pca),
-        focus_background=project_points(context_background, context_pca),
-        construction_samples=project_points(construction_samples_global, context_pca),
-        test_inside_samples=project_points(heldout_inside_samples, context_pca),
-        test_outside_samples=project_points(heldout_outside_samples, context_pca),
-        dataset_traj=project_points(dataset_pos, context_pca),
-        rollout_traj=project_points(rollout_pos, context_pca),
-        start_point=project_points(dataset_pos[[0]], context_pca)[0],
-        dataset_goal_point=project_points(dataset_pos[[-1]], context_pca)[0],
-        rollout_goal_point=project_points(rollout_pos[[-1]], context_pca)[0],
-        nominal_point=project_points(nominal_position[None, :], context_pca)[0],
-        zonotope_boundary=global_boundary,
-        explained_ratio=np.asarray(context_pca["explained_variance_ratio"], dtype=np.float64),
-        add_zoom_inset=True,
+        title=f"Global PCA trajectory/object view | episode {args.episode_idx} step {args.obstacle_step}",
+        background=project_points(background_pos, global_pca),
+        focus_background=None,
+        construction_samples=project_points(all_obstacle_samples, global_pca),
+        test_inside_samples=np.zeros((0, 2), dtype=np.float64),
+        test_outside_samples=np.zeros((0, 2), dtype=np.float64),
+        dataset_traj=project_points(dataset_pos, global_pca),
+        rollout_traj=project_points(rollout_pos, global_pca),
+        start_point=project_points(dataset_pos[[0]], global_pca)[0],
+        dataset_goal_point=project_points(dataset_pos[[-1]], global_pca)[0],
+        rollout_goal_point=project_points(rollout_pos[[-1]], global_pca)[0],
+        nominal_point=project_points(nominal_position[None, :], global_pca)[0],
+        zonotope_boundary=np.zeros((0, 2), dtype=np.float64),
+        explained_ratio=np.asarray(global_pca["explained_variance_ratio"], dtype=np.float64),
+        add_zoom_inset=False,
         focus_main_view=True,
     )
     make_plot(
@@ -1060,8 +1208,6 @@ def main() -> None:
             "zonotope": zonotope,
             "global_pca": global_pca,
             "local_pca": local_pca,
-            "context_pca": context_pca,
-            "context_background": context_background.astype(np.float64),
             "empirical_coverage_mask": heldout_inside.astype(bool),
             "empirical_coverage": empirical_coverage,
         },
@@ -1086,7 +1232,7 @@ def main() -> None:
                 "cal": int(args.set_cal_count),
                 "test": int(args.set_test_count),
                 "background": int(args.background_samples),
-                "context_background": int(context_background.shape[0]),
+                "overlay": int(overlay_count),
             },
             "delta": float(args.delta),
             "empirical_coverage": empirical_coverage,
@@ -1100,11 +1246,12 @@ def main() -> None:
                 local_pca["explained_variance_ratio"], dtype=np.float64
             ).tolist(),
             "global_plot_explained_variance_ratio": np.asarray(
-                context_pca["explained_variance_ratio"], dtype=np.float64
+                global_pca["explained_variance_ratio"], dtype=np.float64
             ).tolist(),
         },
     )
 
+    log_progress("Analysis complete.")
     print(f"Analysis dir:  {episode_dir}")
     print(f"Empirical Coverage:      {empirical_coverage:.4f} ({int(np.count_nonzero(heldout_inside))}/{heldout_inside.shape[0]})")
 
