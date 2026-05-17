@@ -24,18 +24,18 @@ from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/expert_data_random_50hz/reacher_random_expert.h5"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
 DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_2"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "cuda"
-HORIZON = 50
-MAX_MPC_STEPS = 120
+HORIZON = 20
+MAX_MPC_STEPS = 150
 Q_TERMINAL = 10.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 60
-EPISODE_IDX = 14637
+EPISODE_IDX = 791
 
 
 def parse_args() -> argparse.Namespace:
@@ -302,6 +302,16 @@ def goal_reached(current_obs: np.ndarray, goal_obs: np.ndarray, threshold: float
         return goal_distance <= threshold, goal_distance
     obs_err = float(np.linalg.norm(current_obs - goal_obs))
     return obs_err <= threshold, obs_err
+
+
+def compute_observation_goal_distance(current_obs: np.ndarray, goal_obs: np.ndarray) -> float:
+    if current_obs.shape != goal_obs.shape:
+        raise ValueError(f"Observation shape mismatch: {current_obs.shape} vs {goal_obs.shape}")
+    if current_obs.shape[0] == 8:
+        qpos = current_obs[:2]
+        goal_qpos = current_obs[4:6]
+        return float(np.linalg.norm(qpos - goal_qpos))
+    return float(np.linalg.norm(current_obs - goal_obs))
 
 
 class MarkovDynamicsTorch:
@@ -650,7 +660,7 @@ def main() -> None:
     executed_actions_norm: list[np.ndarray] = []
     latent_goal_distances = [float(torch.linalg.vector_norm(current_state - goal_state).item())]
     embedding_goal_distances = [float(torch.linalg.vector_norm(current_emb - goal_emb).item())]
-    observation_goal_distances = [float(np.linalg.norm(current_obs - goal_obs))]
+    observation_goal_distances = [compute_observation_goal_distance(current_obs, goal_obs)]
     solve_times_ms: list[float] = []
     ilqr_iterations: list[int] = []
     ilqr_costs: list[float] = []
@@ -686,16 +696,16 @@ def main() -> None:
         rollout_frames.append(current_frame.copy())
         latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
         embedding_goal_distance = float(torch.linalg.vector_norm(current_emb - goal_emb).item())
-        observation_goal_distance = float(np.linalg.norm(current_obs - goal_obs))
+        obs_goal_distance = compute_observation_goal_distance(current_obs, goal_obs)
         latent_goal_distances.append(latent_goal_distance)
         embedding_goal_distances.append(embedding_goal_distance)
-        observation_goal_distances.append(observation_goal_distance)
+        observation_goal_distances.append(obs_goal_distance)
 
         pbar.set_postfix(
             solve_ms=f"{solve_times_ms[-1]:.1f}",
             iters=f"{ilqr_iterations[-1]}",
             latent_goal=f"{latent_goal_distance:.3f}",
-            obs_goal=f"{observation_goal_distance:.3f}",
+            obs_goal=f"{obs_goal_distance:.3f}",
         )
 
         reached_goal, _ = goal_reached(current_obs, goal_obs)

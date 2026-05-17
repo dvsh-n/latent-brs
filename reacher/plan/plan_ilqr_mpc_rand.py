@@ -23,7 +23,7 @@ from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_2"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn_rand"
 
 DEVICE = "auto"

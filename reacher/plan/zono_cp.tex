@@ -1,0 +1,38 @@
+\subsection{Conformal Zonotope Construction}
+\subsubsection*{1. Base Zonotope Construction (PCA)}
+Let $\mathcal{D}_{pca}$ be the dataset used for principal component alignment, with $M = |\mathcal{D}_{pca}|$.
+\begin{align*}
+z_0^{(k)} &= E(x_0^{(k)}), \quad \forall k \in \mathcal{D}_{pca} \\
+c_0 &= \frac{1}{M} \sum_{k \in \mathcal{D}_{pca}} z_0^{(k)} \\
+\hat{\Sigma}_0 &= \frac{1}{M-1} \sum_{k \in \mathcal{D}_{pca}} (z_0^{(k)} - c_0)(z_0^{(k)} - c_0)^T \\
+\hat{\Sigma}_0 &= U_0 \Lambda_0 U_0^T \\
+\hat{G}_0 &= U_0 \Lambda_0^{1/2}
+\end{align*}
+
+\subsubsection*{2. Normalization Coefficients}
+Let $\mathcal{D}_{norm}$ be a disjoint dataset used to compute dimension-wise scaling factors. Let $\hat{G}_0^\dagger = \Lambda_0^{-1/2} U_0^T$ denote the pseudo-inverse.
+\begin{align*}
+z_0^{(k)} &= E(x_0^{(k)}), \quad \forall k \in \mathcal{D}_{norm} \\
+p_0^{(k)} &= \hat{G}_0^\dagger (z_0^{(k)} - c_0) \\
+v_{0,j}^{(k)} &= \max\left(0, \left|p_{0,j}^{(k)}\right| - 1\right) \\
+v_{0,j}^{\max} &= \max_{k \in \mathcal{D}_{norm}} v_{0,j}^{(k)} \\
+\lambda_j &= \frac{1}{v_{0,j}^{\max} + \epsilon}
+\end{align*}
+
+\subsubsection*{3. Conformal Calibration}
+Let $\mathcal{D}_{cal}$ be a disjoint dataset for conformal calibration.
+\begin{align*}
+z_0^{(k)} &= E(x_0^{(k)}), \quad \forall k \in \mathcal{D}_{cal} \\
+p_0^{(k)} &= \hat{G}_0^\dagger (z_0^{(k)} - c_0) \\
+v_{0,j}^{(k)} &= \max\left(0, \left|p_{0,j}^{(k)}\right| - 1\right) \\
+R^{(k)} &= \max_j \left( \lambda_j \cdot v_{0,j}^{(k)} \right) \\
+C &= \text{Quantile}_{1-\delta} \left( \{R^{(k)}\}_{k \in \mathcal{D}_{cal}} \cup \{\infty\} \right)
+\end{align*}
+
+\subsubsection*{4. Conformalized Initial Zonotope}
+\begin{align*}
+\bar{v}_{0,j} &= \frac{C}{\lambda_j} \\
+\bar{V} &= \text{diag}\left(1 + \bar{v}_{0,1}, \dots, 1 + \bar{v}_{0,n}\right) \\
+\bar{G}_0 &= \hat{G}_0 \bar{V} \\
+\mathcal{Z}_0^{1-\delta} &= \langle c_0, \bar{G}_0 \rangle
+\end{align*}
