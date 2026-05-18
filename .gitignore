@@ -22,3 +22,6 @@ reacher/models/lewm_reacher*/
 **/runs/
 **/__pycache__/
 reacher/models/sam3
+error_model/error_model.egg-info
+error_model/lightning_logs
+reacher/plan/sls_mpc_conformal

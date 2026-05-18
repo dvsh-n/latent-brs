@@ -361,122 +361,56 @@ def sanitize_hparams(args: argparse.Namespace) -> dict[str, object]:
     return hparams
 
 
-def main() -> None:
-    args = parse_args()
-    pl.seed_everything(args.seed, workers=True)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
+    parser.add_argument("--out-file", type=Path, default="lewm_one_step_error_data_ogbench.pt")
+    parser.add_argument("--frame-batch-size", type=int, default=128)
+    args = parser.parse_args()
 
-    dataset_path = args.dataset_path.expanduser().resolve()
-    run_dir = args.run_dir.expanduser().resolve()
-    finetune_dir = args.finetune_dir.expanduser().resolve() if args.finetune_dir is not None else None
-    if finetune_dir is None:
-        output_run_dir = run_dir
-        ckpt_path = output_run_dir / "last.ckpt"
-        if output_run_dir.exists() and not ckpt_path.is_file():
-            raise FileExistsError(
-                f"Run dir already exists but does not contain a resumable checkpoint: {output_run_dir}"
-            )
-    else:
-        ckpt_path = run_dir / "last.ckpt"
-        if not ckpt_path.is_file():
-            raise FileNotFoundError(f"Finetune source checkpoint not found: {ckpt_path}")
-        output_run_dir = finetune_dir
-        if output_run_dir.exists():
-            raise FileExistsError(f"Finetune output dir already exists: {output_run_dir}")
-
-    spt.set(cache_dir=str(output_run_dir))
-    if not dataset_path.is_file():
-        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
-
-    dataset = LeWMOGBenchCubeDataset(
-        dataset_path,
-        markov_deriv=args.markov_deriv,
-        num_preds=args.num_preds,
-        frameskip=args.frameskip,
-        img_size=args.img_size,
-        action_dim=args.action_dim,
-    )
-    if len(dataset) < 2:
-        raise ValueError(f"Need at least 2 valid training windows for train/val splitting, got {len(dataset)}.")
-    train_len = int(len(dataset) * args.train_split)
-    val_len = len(dataset) - train_len
-    if train_len < 1:
-        train_len = 1
-        val_len = len(dataset) - train_len
-    generator = torch.Generator().manual_seed(args.seed)
-    train_set, val_set = random_split(dataset, [train_len, val_len], generator=generator)
-
-    train_loader = make_loader(
-        train_set,
-        args,
-        shuffle=True,
-        drop_last=True,
-        persistent_workers=args.persistent_workers,
-    )
-    val_loader = (
-        make_loader(
-            val_set,
-            args,
-            shuffle=False,
-            drop_last=False,
-            persistent_workers=False,
-        )
-        if val_len
-        else None
-    )
-
-    world_model = build_model(args)
-    optimizers = {
-        "model_opt": {
-            "modules": "model",
-            "optimizer": {"type": "AdamW", "lr": args.lr, "weight_decay": args.weight_decay},
-            "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
-            "interval": "epoch",
-        },
+    with open(args.model_dir / "config.json") as f:
+        config = json.load(f)
+    
+    # --- FIXED: Config injection with fallback defaults ---
+    defaults = {
+        "markov_deriv": 1,
+        "num_preds": 1,
+        "frameskip": 1,
+        "img_size": 224,
+        "action_dim": 5,
     }
-    module = spt.Module(
-        model=world_model,
-        sigreg=SIGReg(knots=args.sigreg_knots, num_proj=args.sigreg_num_proj),
-        forward=partial(lewm_forward, args=args),
-        optim=optimizers,
-        hparams=sanitize_hparams(args),
-    )
+    for k, fallback in defaults.items():
+        val = config.get(k)
+        setattr(args, k, val if val is not None else fallback)
+    # ------------------------------------------------------
 
-    output_run_dir.mkdir(parents=True, exist_ok=True)
-    config = vars(args).copy()
-    config["run_dir"] = str(run_dir)
-    config["finetune_dir"] = str(finetune_dir) if finetune_dir is not None else None
-    config["output_run_dir"] = str(output_run_dir)
-    config["resume_checkpoint"] = str(ckpt_path) if ckpt_path.is_file() else None
-    with (output_run_dir / "config.json").open("w") as f:
-        json.dump(config, f, indent=2, default=str)
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
-    callbacks: list[Callback] = [
-        ModelCheckpoint(
-            dirpath=output_run_dir,
-            filename=f"{args.output_model_name}" + "_{epoch:03d}",
-            save_last=True,
-            save_top_k=-1,
-            every_n_epochs=1,
-        ),
-        ModelObjectCallback(output_run_dir, args.output_model_name, epoch_interval=args.save_object_every),
-    ]
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        accelerator=args.accelerator,
-        devices=args.devices,
-        precision=args.precision,
-        gradient_clip_val=args.gradient_clip_val,
-        callbacks=callbacks,
-        default_root_dir=output_run_dir,
-        logger=False,
-        num_sanity_val_steps=1 if val_loader is not None else 0,
-        enable_checkpointing=True,
-    )
-    data_module = spt.data.DataModule(train=train_loader, val=val_loader)
-    if hasattr(torch.serialization, "add_safe_globals"):
-        torch.serialization.add_safe_globals([PosixPath])
-    trainer.fit(module, datamodule=data_module, ckpt_path=str(ckpt_path) if ckpt_path.is_file() else None)
+    model = torch.load(latest_object_checkpoint(args.model_dir), map_location=device, weights_only=False).eval()
+    
+    with h5py.File(args.dataset_path, "r") as h5:
+        ep_len = h5["ep_len"][:]
+        
+    history_len = required_markov_history(args.markov_deriv)
+    valid_indices = np.flatnonzero(ep_len - 1 - (history_len - 1 + args.num_preds) * args.frameskip >= 0)
 
+    all_x, all_a, all_e = [], [], []
+    for idx in tqdm(valid_indices, desc="Generating Errors"):
+        px, act = load_episode_standalone(args.dataset_path, idx, args)
+        data = extract_errors(model, px, act, args, device)
+        if data is not None:
+            all_x.append(data["x_t"])
+            all_a.append(data["a_t"])
+            all_e.append(data["error"])
+
+    torch.save({"x_t": torch.cat(all_x), "a_t": torch.cat(all_a), "error": torch.cat(all_e)}, args.out_file)
+    print(f"Saved {len(torch.cat(all_x))} transitions to {args.out_file}")
 
 if __name__ == "__main__":
     main()

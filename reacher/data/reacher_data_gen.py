@@ -6,9 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
-os.environ.setdefault("MUJOCO_GL", "egl")
+# os.environ.setdefault("MUJOCO_GL", "egl")
+# If macOS, use glfw, otherwise default to egl (Linux/headless)
+if sys.platform == "darwin":
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+else:
+    os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -48,13 +54,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=None,
+        default=200_000,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=1_000,
+        default=10_000,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -69,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=224)
     parser.add_argument("--quality", type=int, default=8)
     parser.add_argument("--compression", choices=("none", "lzf", "gzip"), default="lzf")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="mps")
     parser.add_argument(
         "--deterministic",
         action="store_true",
