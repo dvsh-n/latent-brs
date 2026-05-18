@@ -29,13 +29,13 @@ DEFAULT_MODEL_DIR = "rope/models/mlpdyn"
 DEFAULT_OUT_DIR = "rope/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-HORIZON = 15
+HORIZON = 25
 MAX_MPC_STEPS = 120
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005
-R_CONTROL = 0.1
+R_CONTROL = 0.001
 VIDEO_FPS = 20
-EPISODE_IDX = None
+EPISODE_IDX = 1194
 
 
 def parse_args() -> argparse.Namespace:

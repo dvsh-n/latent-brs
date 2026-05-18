@@ -99,47 +99,155 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, handle, indent=2)
 
 
-class LinearConstraintADMMQP:
+class StagewiseConstraintADMM:
     def __init__(self, *, rho: float, max_iters: int, tol: float, regularization: float) -> None:
         self.rho = float(rho)
         self.max_iters = int(max_iters)
         self.tol = float(tol)
         self.regularization = float(regularization)
 
+    def _solve_unconstrained_lqr(
+        self,
+        q_xx: np.ndarray,
+        q_x: np.ndarray,
+        r_uu: np.ndarray,
+        r_u: np.ndarray,
+        m_xu: np.ndarray,
+        a_seq: np.ndarray,
+        b_seq: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        horizon = int(a_seq.shape[0])
+        state_dim = int(a_seq.shape[1])
+        action_dim = int(b_seq.shape[2])
+        dx = np.zeros((horizon + 1, state_dim), dtype=np.float64)
+        du = np.zeros((horizon, action_dim), dtype=np.float64)
+        k_seq = np.zeros((horizon, action_dim), dtype=np.float64)
+        kk_seq = np.zeros((horizon, action_dim, state_dim), dtype=np.float64)
+
+        v_x = q_x[horizon].copy()
+        v_xx = 0.5 * (q_xx[horizon] + q_xx[horizon].T)
+        reg_eye = self.regularization * np.eye(action_dim, dtype=np.float64)
+
+        for step in range(horizon - 1, -1, -1):
+            a = a_seq[step]
+            b = b_seq[step]
+            qx = q_x[step]
+            qu = r_u[step]
+            qxx = 0.5 * (q_xx[step] + q_xx[step].T)
+            quu = 0.5 * (r_uu[step] + r_uu[step].T)
+            qxu = m_xu[step]
+            qux = qxu.T
+
+            local_qx = qx + a.T @ v_x
+            local_qu = qu + b.T @ v_x
+            local_qxx = qxx + a.T @ v_xx @ a
+            local_quu = quu + b.T @ v_xx @ b + reg_eye
+            local_qxu = qxu + a.T @ v_xx @ b
+            local_qux = qux + b.T @ v_xx @ a
+            local_quu = 0.5 * (local_quu + local_quu.T)
+
+            try:
+                k = -np.linalg.solve(local_quu, local_qu)
+                kk = -np.linalg.solve(local_quu, local_qux)
+            except np.linalg.LinAlgError:
+                return dx, du, False
+
+            k_seq[step] = k
+            kk_seq[step] = kk
+            v_x = local_qx + local_qxu @ k + kk.T @ local_qu + kk.T @ local_quu @ k
+            v_xx = local_qxx + local_qxu @ kk + kk.T @ local_qux + kk.T @ local_quu @ kk
+            v_xx = 0.5 * (v_xx + v_xx.T)
+
+        for step in range(horizon):
+            du[step] = k_seq[step] + kk_seq[step] @ dx[step]
+            dx[step + 1] = a_seq[step] @ dx[step] + b_seq[step] @ du[step]
+
+        return dx, du, True
+
     def solve(
         self,
-        hess: np.ndarray,
-        grad: np.ndarray,
-        g_mat: np.ndarray,
-        h_vec: np.ndarray,
-    ) -> tuple[np.ndarray, dict[str, float]]:
-        dim = int(grad.shape[0])
-        if g_mat.shape[0] == 0:
-            system = 0.5 * (hess + hess.T) + self.regularization * np.eye(dim, dtype=np.float64)
-            return -np.linalg.solve(system, grad), {"iters": 1.0, "primal_residual": 0.0, "dual_residual": 0.0}
+        q_xx: np.ndarray,
+        q_x: np.ndarray,
+        r_uu: np.ndarray,
+        r_u: np.ndarray,
+        m_xu: np.ndarray,
+        a_seq: np.ndarray,
+        b_seq: np.ndarray,
+        c_mat: np.ndarray,
+        d_mat: np.ndarray,
+        f_vec: np.ndarray,
+        z_init: np.ndarray | None = None,
+        y_init: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+        horizon = int(a_seq.shape[0])
+        n_stages = horizon + 1
+        n_constraints = int(c_mat.shape[1])
+        z = np.zeros((n_stages, n_constraints), dtype=np.float64) if z_init is None else z_init.copy()
+        y = np.zeros_like(z) if y_init is None else y_init.copy()
+        z = np.minimum(z, f_vec)
 
-        system = 0.5 * (hess + hess.T) + self.rho * (g_mat.T @ g_mat)
-        system = system + self.regularization * np.eye(dim, dtype=np.float64)
-
-        du = np.zeros(dim, dtype=np.float64)
-        z = np.minimum(g_mat @ du, h_vec)
-        y = np.zeros_like(h_vec)
-        z_prev = z.copy()
+        dx = np.zeros((n_stages, q_x.shape[1]), dtype=np.float64)
+        du = np.zeros((horizon, r_u.shape[1]), dtype=np.float64)
+        primal = 0.0
+        dual = 0.0
+        converged = False
+        backward_ok = True
 
         for admm_iter in range(self.max_iters):
-            rhs = -grad + self.rho * g_mat.T @ (z - y)
-            du = np.linalg.solve(system, rhs)
-            gdu = g_mat @ du
-            z = np.minimum(gdu + y, h_vec)
-            y = y + gdu - z
+            aug_q_xx = q_xx.copy()
+            aug_q_x = q_x.copy()
+            aug_r_uu = r_uu.copy()
+            aug_r_u = r_u.copy()
+            aug_m_xu = m_xu.copy()
 
-            primal = float(np.linalg.norm(gdu - z, ord=np.inf))
-            dual = float(self.rho * np.linalg.norm(g_mat.T @ (z - z_prev), ord=np.inf))
-            if primal <= self.tol and dual <= self.tol:
-                return du, {"iters": float(admm_iter + 1), "primal_residual": primal, "dual_residual": dual}
+            for step in range(n_stages):
+                c_step = c_mat[step]
+                d_step = d_mat[step]
+                shift = self.rho * (y[step] - z[step])
+                aug_q_xx[step] += self.rho * (c_step.T @ c_step)
+                aug_q_x[step] += c_step.T @ shift
+                if step < horizon:
+                    aug_r_uu[step] += self.rho * (d_step.T @ d_step)
+                    aug_r_u[step] += d_step.T @ shift
+                    aug_m_xu[step] += self.rho * (c_step.T @ d_step)
+
+            dx, du, backward_ok = self._solve_unconstrained_lqr(
+                aug_q_xx,
+                aug_q_x,
+                aug_r_uu,
+                aug_r_u,
+                aug_m_xu,
+                a_seq,
+                b_seq,
+            )
+            if not backward_ok:
+                break
+
+            z_bar = np.einsum("kcx,kx->kc", c_mat, dx)
+            z_bar[:-1] += np.einsum("kcu,ku->kc", d_mat[:-1], du)
             z_prev = z.copy()
+            z = np.minimum(z_bar + y, f_vec)
+            y = y + z_bar - z
 
-        return du, {"iters": float(self.max_iters), "primal_residual": primal, "dual_residual": dual}
+            primal = float(np.linalg.norm(z_bar - z, ord=np.inf))
+            dual = float(self.rho * np.linalg.norm(z - z_prev, ord=np.inf))
+            if primal <= self.tol and dual <= self.tol:
+                converged = True
+                return dx, du, z, y, {
+                    "iters": float(admm_iter + 1),
+                    "primal_residual": primal,
+                    "dual_residual": dual,
+                    "converged": 1.0,
+                    "backward_ok": 1.0,
+                }
+
+        return dx, du, z, y, {
+            "iters": float(self.max_iters if backward_ok else 0.0),
+            "primal_residual": primal,
+            "dual_residual": dual,
+            "converged": float(1.0 if converged else 0.0),
+            "backward_ok": float(1.0 if backward_ok else 0.0),
+        }
 
 
 class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
@@ -164,13 +272,15 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
         self.obstacle_right_pinv = np.asarray(obstacle_right_pinv, dtype=np.float64).copy()
         self.obstacle_margin = float(obstacle_margin)
         self.obstacle_activation = float(obstacle_activation)
-        self.qp_solver = LinearConstraintADMMQP(
+        self.subproblem_solver = StagewiseConstraintADMM(
             rho=constraint_rho,
             max_iters=constraint_admm_iters,
             tol=constraint_admm_tol,
             regularization=qp_regularization,
         )
         self.last_solve_stats: dict[str, float] = {}
+        self.prev_constraint_z = np.zeros((self.horizon + 1, 1), dtype=np.float64)
+        self.prev_constraint_y = np.zeros((self.horizon + 1, 1), dtype=np.float64)
 
     def _embedding_coords(self, embedding: np.ndarray) -> np.ndarray:
         return (embedding - self.obstacle_center) @ self.obstacle_right_pinv
@@ -182,8 +292,8 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
         coords = self._embedding_coords(embedding)
         return bool(np.max(np.abs(coords)) <= (1.0 + self.obstacle_margin))
 
-    def _select_constraint_rows(self, x_traj: np.ndarray) -> list[tuple[int, np.ndarray, float]]:
-        rows: list[tuple[int, np.ndarray, float]] = []
+    def _select_constraint_rows(self, x_traj: np.ndarray) -> list[tuple[np.ndarray, float] | None]:
+        rows: list[tuple[np.ndarray, float] | None] = [None] * x_traj.shape[0]
         for step in range(1, x_traj.shape[0]):
             embedding = x_traj[step, : self.embed_dim]
             coords = self._embedding_coords(embedding)
@@ -196,75 +306,63 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
                 face_sign = 1.0
             normal = face_sign * self.obstacle_right_pinv[:, face_idx]
             rhs = 1.0 + self.obstacle_margin + float(normal @ self.obstacle_center)
-            rows.append((step, normal.astype(np.float64), rhs))
+            rows[step] = (normal.astype(np.float64), rhs)
         return rows
 
     def _constraints_satisfied(
         self,
         x_traj: np.ndarray,
-        rows: list[tuple[int, np.ndarray, float]],
+        rows: list[tuple[np.ndarray, float] | None],
         tol: float = 1e-7,
     ) -> bool:
-        for step, normal, rhs in rows:
+        for step, row in enumerate(rows):
+            if row is None:
+                continue
+            normal, rhs = row
             embedding = x_traj[step, : self.embed_dim]
             if self._constraint_value(embedding, normal, rhs) < -tol:
                 return False
         return True
 
-    def _build_state_sensitivity(self, a_seq: np.ndarray, b_seq: np.ndarray) -> list[np.ndarray]:
-        total_u = self.horizon * self.action_dim
-        sens = [np.zeros((self.state_dim, total_u), dtype=np.float64) for _ in range(self.horizon + 1)]
-        for step in range(self.horizon):
-            next_sens = a_seq[step] @ sens[step]
-            col0 = step * self.action_dim
-            col1 = col0 + self.action_dim
-            next_sens[:, col0:col1] += b_seq[step]
-            sens[step + 1] = next_sens
-        return sens
-
-    def _build_local_qp(
+    def _build_local_model(
         self,
         x_traj: np.ndarray,
         u_seq: np.ndarray,
         x_goal: np.ndarray,
-        a_seq: np.ndarray,
-        b_seq: np.ndarray,
-        rows: list[tuple[int, np.ndarray, float]],
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-        total_u = self.horizon * self.action_dim
-        sens = self._build_state_sensitivity(a_seq, b_seq)
-        hess = np.zeros((total_u, total_u), dtype=np.float64)
-        grad = np.zeros(total_u, dtype=np.float64)
+        rows: list[tuple[np.ndarray, float] | None],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        q_xx = np.zeros((self.horizon + 1, self.state_dim, self.state_dim), dtype=np.float64)
+        q_x = np.zeros((self.horizon + 1, self.state_dim), dtype=np.float64)
+        r_uu = np.zeros((self.horizon, self.action_dim, self.action_dim), dtype=np.float64)
+        r_u = np.zeros((self.horizon, self.action_dim), dtype=np.float64)
+        m_xu = np.zeros((self.horizon, self.state_dim, self.action_dim), dtype=np.float64)
+        c_mat = np.zeros((self.horizon + 1, 1, self.state_dim), dtype=np.float64)
+        d_mat = np.zeros((self.horizon + 1, 1, self.action_dim), dtype=np.float64)
+        f_vec = np.full((self.horizon + 1, 1), 1e12, dtype=np.float64)
+
         q_stage = 2.0 * self.q_stage
         q_terminal = 2.0 * self.q_terminal
         r_control = 2.0 * self.r_control
+        eye_x = np.eye(self.state_dim, dtype=np.float64)
+        eye_u = np.eye(self.action_dim, dtype=np.float64)
 
         for step in range(self.horizon):
-            state_err = x_traj[step] - x_goal
-            s_mat = sens[step]
-            hess += q_stage * (s_mat.T @ s_mat)
-            grad += q_stage * (s_mat.T @ state_err)
-            block = slice(step * self.action_dim, (step + 1) * self.action_dim)
-            hess[block, block] += r_control * np.eye(self.action_dim, dtype=np.float64)
-            grad[block] += r_control * u_seq[step]
+            q_xx[step] = q_stage * eye_x
+            q_x[step] = q_stage * (x_traj[step] - x_goal)
+            r_uu[step] = r_control * eye_u
+            r_u[step] = r_control * u_seq[step]
 
-        terminal_err = x_traj[self.horizon] - x_goal
-        terminal_s = sens[self.horizon]
-        hess += q_terminal * (terminal_s.T @ terminal_s)
-        grad += q_terminal * (terminal_s.T @ terminal_err)
-        hess = 0.5 * (hess + hess.T)
+        q_xx[self.horizon] = q_terminal * eye_x
+        q_x[self.horizon] = q_terminal * (x_traj[self.horizon] - x_goal)
 
-        if not rows:
-            return hess, grad, np.zeros((0, total_u), dtype=np.float64), np.zeros(0, dtype=np.float64), 0
+        for step, row in enumerate(rows):
+            if row is None:
+                continue
+            normal, rhs = row
+            c_mat[step, 0, : self.embed_dim] = -normal
+            f_vec[step, 0] = float(self._constraint_value(x_traj[step, : self.embed_dim], normal, rhs))
 
-        g_rows: list[np.ndarray] = []
-        h_rows: list[float] = []
-        for step, normal, rhs in rows:
-            s_embed = sens[step][: self.embed_dim]
-            g_rows.append(-(normal @ s_embed))
-            h_rows.append(float(self._constraint_value(x_traj[step, : self.embed_dim], normal, rhs)))
-
-        return hess, grad, np.stack(g_rows, axis=0), np.asarray(h_rows, dtype=np.float64), len(rows)
+        return q_xx, q_x, r_uu, r_u, m_xu, c_mat, d_mat, f_vec
 
     def solve(self, x0_np: np.ndarray, x_goal_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, int, float]:
         x0 = torch.tensor(x0_np, dtype=torch.float32, device=self.device)
@@ -282,11 +380,12 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
             x_traj.detach().cpu().numpy().astype(np.float64),
             current_rows,
         )
-        accepted_constraints = len(current_rows)
+        accepted_constraints = float(sum(row is not None for row in current_rows))
         admm_iters = 0.0
         admm_primal = 0.0
         admm_dual = 0.0
-        accepted = feasible_initial
+        admm_converged = 0.0
+        accepted = False
         stop_reason = "max_iters"
 
         for iteration in range(self.max_iters):
@@ -297,20 +396,31 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
             a_np = a_t.detach().cpu().numpy().astype(np.float64)
             b_np = b_t.detach().cpu().numpy().astype(np.float64)
             current_rows = self._select_constraint_rows(x_np)
-            hess, grad, g_mat, h_vec, n_constraints = self._build_local_qp(
+            q_xx, q_x, r_uu, r_u, m_xu, c_mat, d_mat, f_vec = self._build_local_model(
                 x_np,
                 u_np,
                 x_goal_np,
-                a_np,
-                b_np,
                 current_rows,
             )
-            du_flat, qp_stats = self.qp_solver.solve(hess, grad, g_mat, h_vec)
-            du_seq = torch.tensor(
-                du_flat.reshape(self.horizon, self.action_dim),
-                dtype=torch.float32,
-                device=self.device,
+            dx_seq, du_seq_np, z_next, y_next, qp_stats = self.subproblem_solver.solve(
+                q_xx,
+                q_x,
+                r_uu,
+                r_u,
+                m_xu,
+                a_np,
+                b_np,
+                c_mat,
+                d_mat,
+                f_vec,
+                z_init=self.prev_constraint_z,
+                y_init=self.prev_constraint_y,
             )
+            if qp_stats["backward_ok"] < 0.5:
+                stop_reason = "backward_pass_failed"
+                break
+
+            du_seq = torch.tensor(du_seq_np, dtype=torch.float32, device=self.device)
 
             best_candidate: tuple[torch.Tensor, torch.Tensor, float, float] | None = None
             for alpha in self.line_search_alphas:
@@ -330,12 +440,16 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
 
             accepted = True
             x_traj, u_seq, current_cost, alpha = best_candidate
-            accepted_constraints = n_constraints
+            self.prev_constraint_z = z_next
+            self.prev_constraint_y = y_next
+            accepted_constraints = float(sum(row is not None for row in current_rows))
             admm_iters = qp_stats["iters"]
             admm_primal = qp_stats["primal_residual"]
             admm_dual = qp_stats["dual_residual"]
-            max_du = float(torch.max(torch.abs(alpha * du_seq)).item())
-            if max_du <= self.tol:
+            admm_converged = qp_stats["converged"]
+            max_du = float(np.max(np.abs(alpha * du_seq_np)))
+            step_norm = float(np.max(np.abs(alpha * dx_seq)))
+            if max(max_du, step_norm) <= self.tol:
                 stop_reason = "converged"
                 break
 
@@ -352,6 +466,7 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
             "admm_iters": float(admm_iters),
             "admm_primal_residual": float(admm_primal),
             "admm_dual_residual": float(admm_dual),
+            "admm_converged": float(admm_converged),
             "accepted": float(1.0 if accepted else 0.0),
             "feasible_initial": float(1.0 if feasible_initial else 0.0),
             "feasible_final": float(1.0 if feasible_final else 0.0),

@@ -110,13 +110,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--width",
         type=int,
-        default=512,
+        default=224,
         help="Render width in pixels.",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=512,
+        default=224,
         help="Render height in pixels.",
     )
     parser.add_argument(
@@ -140,6 +140,18 @@ def parse_args() -> argparse.Namespace:
         "--stochastic",
         action="store_true",
         help="Sample actions instead of using deterministic policy output.",
+    )
+    parser.add_argument(
+        "--control-noise",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add Gaussian noise to policy actions before stepping the environment.",
+    )
+    parser.add_argument(
+        "--control-noise-std",
+        type=float,
+        default=2.0,
+        help="Per-dimension standard deviation for Gaussian action noise.",
     )
     return parser.parse_args()
 
@@ -236,6 +248,18 @@ def configure_offscreen_framebuffer(render_env: DmControlGymEnv, width: int, hei
     global_.offwidth = max(width, int(global_.offwidth))
 
 
+def clip_action_to_space(action: np.ndarray, vec_env: VecNormalize) -> np.ndarray:
+    action_space = getattr(vec_env, "action_space", None)
+    if action_space is None:
+        return np.asarray(action, dtype=np.float32)
+    high = np.asarray(getattr(action_space, "high", None))
+    low = np.asarray(getattr(action_space, "low", None))
+    action = np.asarray(action, dtype=np.float32)
+    if high.shape != action.shape or low.shape != action.shape:
+        return action
+    return np.clip(action, low, high).astype(np.float32)
+
+
 def render_episode_frames(
     *,
     model: SAC,
@@ -246,9 +270,12 @@ def render_episode_frames(
     max_steps: int,
     width: int,
     height: int,
+    control_noise: bool,
+    control_noise_std: float,
 ) -> tuple[np.ndarray, float, int]:
     vec_env.seed(episode_seed)
     obs = vec_env.reset()
+    rng = np.random.default_rng(episode_seed)
     configure_offscreen_framebuffer(render_env, width, height)
     frames = [render_env._env.physics.render(height=height, width=width, camera_id=0)]
 
@@ -256,6 +283,9 @@ def render_episode_frames(
     num_steps = 0
     for _ in range(max_steps):
         action, _ = model.predict(obs, deterministic=deterministic)
+        if control_noise:
+            noise = rng.normal(loc=0.0, scale=control_noise_std, size=action.shape).astype(np.float32)
+            action = clip_action_to_space(action + noise, vec_env)
         obs, rewards, dones, infos = vec_env.step(action)
         total_reward += float(rewards[0])
         num_steps += 1
@@ -300,6 +330,8 @@ def main() -> None:
         raise ValueError("--action-rate-cost-weight must be non-negative")
     if velocity_cost_weight < 0.0:
         raise ValueError("--velocity-cost-weight must be non-negative")
+    if args.control_noise_std < 0.0:
+        raise ValueError("--control-noise-std must be non-negative")
 
     vec_env = make_eval_env(
         task=args.task,
@@ -328,6 +360,8 @@ def main() -> None:
             max_steps=args.max_steps,
             width=args.width,
             height=args.height,
+            control_noise=args.control_noise,
+            control_noise_std=args.control_noise_std,
         )
         output_path = outdir / f"reacher_{episode_index:0{digits}d}.mp4"
         imageio.mimwrite(output_path, frames, fps=args.fps, quality=args.quality)
@@ -346,6 +380,8 @@ def main() -> None:
         "outdir": str(outdir),
         "device": device,
         "deterministic": not args.stochastic,
+        "control_noise": bool(args.control_noise),
+        "control_noise_std": float(args.control_noise_std),
         "action_cost_weight": action_cost_weight,
         "action_rate_cost_weight": action_rate_cost_weight,
         "velocity_cost_weight": velocity_cost_weight,

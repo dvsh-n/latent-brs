@@ -572,9 +572,15 @@ def resolve_resume_checkpoint(args: argparse.Namespace, run_dir: Path) -> Path |
 
 def load_pretrained_encoder(checkpoint_path: Path) -> torch.nn.Module:
     source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if not isinstance(source_model, JEPA):
-        raise TypeError(f"Expected JEPA object checkpoint, got {type(source_model).__name__}.")
     encoder = getattr(source_model, "encoder", None)
+    predictor = getattr(source_model, "predictor", None)
+    action_encoder = getattr(source_model, "action_encoder", None)
+    if encoder is None or predictor is None or action_encoder is None:
+        source_type = f"{type(source_model).__module__}.{type(source_model).__name__}"
+        raise TypeError(
+            "Expected a JEPA-compatible object checkpoint with "
+            f"`encoder`, `predictor`, and `action_encoder`, got {source_type}."
+        )
     if encoder is None:
         raise AttributeError("Source checkpoint does not contain model.encoder.")
     return encoder

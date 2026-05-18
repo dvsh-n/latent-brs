@@ -30,7 +30,7 @@ from rope.shared.lab_env import (
 )
 
 
-DEFAULT_OUTDIR = "rope/data/expert_data"
+DEFAULT_OUTDIR = "rope/data/test_data"
 DEFAULT_OUTPUT_NAME = "rope_random_cubic_spline.h5"
 DEFAULT_CAMERA = "video_cam"
 DEFAULT_MODE = RANDOM_CUBIC_SPLINE_MODE
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=15000,
+        default=1000,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
