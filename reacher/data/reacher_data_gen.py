@@ -33,8 +33,11 @@ from reacher.eval.reacher_policy_viz import (
 
 DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"
 DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac/vecnormalize.pkl"
-DEFAULT_OUTDIR = "reacher/data/test_data_50hz"
+DEFAULT_OUTDIR = "reacher/data/train_data_noisy"
 DEFAULT_OUTPUT_NAME = "reacher_test.h5"
+ROLLOUT_MODES = ("expert", "expert_plus_noise")
+DEFAULT_ROLLOUT_RATIOS = (0.4, 0.6)
+EXPERT_NOISE_STD = 2.0
 
 # Local timing/video knobs.
 PHYSICS_FREQ_HZ = 50.0
@@ -71,6 +74,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-threshold", type=float, default=0.03)
     parser.add_argument("--max-blank-steps", type=int, default=10)
     parser.add_argument("--min-steps", type=int, default=3)
+    parser.add_argument(
+        "--expert-ratio",
+        type=float,
+        default=DEFAULT_ROLLOUT_RATIOS[0],
+        help="Relative amount of clean expert trajectories to collect.",
+    )
+    parser.add_argument(
+        "--expert-plus-noise-ratio",
+        type=float,
+        default=DEFAULT_ROLLOUT_RATIOS[1],
+        help="Relative amount of noised expert trajectories to collect.",
+    )
     parser.add_argument("--width", type=int, default=224)
     parser.add_argument("--height", type=int, default=224)
     parser.add_argument("--quality", type=int, default=8)
@@ -122,6 +137,38 @@ def configure_dm_control_timing(
     dm_env._step_limit = float("inf") if time_limit == float("inf") else time_limit / physics_timestep
 
 
+def clip_action_to_space(action: np.ndarray, env: object) -> np.ndarray:
+    action_space = getattr(env, "action_space", None)
+    if action_space is None:
+        return np.asarray(action, dtype=np.float32)
+    high = np.asarray(getattr(action_space, "high", None))
+    low = np.asarray(getattr(action_space, "low", None))
+    action = np.asarray(action, dtype=np.float32)
+    if high.shape != action.shape[1:] or low.shape != action.shape[1:]:
+        return action
+    return np.clip(action, low, high).astype(np.float32)
+
+
+def rollout_probabilities(args: argparse.Namespace) -> np.ndarray:
+    ratios = np.asarray(
+        [args.expert_ratio, args.expert_plus_noise_ratio],
+        dtype=np.float64,
+    )
+    if ratios.shape != (len(ROLLOUT_MODES),):
+        raise ValueError(f"Expected {len(ROLLOUT_MODES)} rollout ratios.")
+    if np.any(ratios < 0.0):
+        raise ValueError("Rollout ratios cannot be negative.")
+    total = float(ratios.sum())
+    if total <= 0.0:
+        raise ValueError("At least one rollout ratio must be positive.")
+    return ratios / total
+
+
+def sample_rollout_mode(args: argparse.Namespace, rng: np.random.Generator) -> str:
+    probabilities = rollout_probabilities(args)
+    return str(rng.choice(ROLLOUT_MODES, p=probabilities))
+
+
 def collect_trajectory(
     *,
     model: SAC,
@@ -137,9 +184,11 @@ def collect_trajectory(
     time_limit: float,
     goal_threshold: float,
     max_blank_steps: int,
+    rollout_mode: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
     env.seed(trajectory_seed)
     obs = env.reset()
+    rng = np.random.default_rng(trajectory_seed)
     configure_dm_control_timing(
         render_env,
         physics_timestep=physics_timestep,
@@ -162,6 +211,9 @@ def collect_trajectory(
         was_already_at_goal = goal_seen
         if physics_step % control_substeps == 0:
             action, _ = model.predict(obs, deterministic=deterministic)
+            if rollout_mode == "expert_plus_noise":
+                noise = rng.normal(loc=0.0, scale=EXPERT_NOISE_STD, size=action.shape).astype(np.float32)
+                action = clip_action_to_space(action + noise, env)
         if action is None:
             raise RuntimeError("Policy action was not initialized.")
         obs, rewards, dones, _ = env.step(action)
@@ -249,6 +301,7 @@ def main() -> None:
         raise ValueError("--max-blank-steps cannot be negative.")
     if args.min_steps < 1:
         raise ValueError("--min-steps must be positive.")
+    rollout_mode_probs = rollout_probabilities(args)
 
     device = require_device(args.device)
     physics_timestep = 1.0 / args.physics_freq_hz
@@ -284,6 +337,8 @@ def main() -> None:
     terminated_flags: list[bool] = []
     skipped_short = 0
     seed_offset = 0
+    rollout_mode_rng = np.random.default_rng(args.seed)
+    rollout_mode_by_episode: list[str] = []
 
     with h5py.File(output_path, "w") as h5:
         h5.attrs["format"] = "stable_worldmodel_hdf5"
@@ -307,12 +362,16 @@ def main() -> None:
         h5.attrs["goal_threshold"] = args.goal_threshold
         h5.attrs["max_blank_steps"] = args.max_blank_steps
         h5.attrs["max_steps_per_episode"] = args.max_steps_per_episode
+        h5.attrs["rollout_modes"] = json.dumps(list(ROLLOUT_MODES))
+        h5.attrs["rollout_mode_probabilities"] = json.dumps(rollout_mode_probs.tolist())
+        h5.attrs["expert_noise_std"] = EXPERT_NOISE_STD
 
         ep_len_ds = create_resizable_dataset(h5, "ep_len", (), np.int64, chunks=True)
         ep_offset_ds = create_resizable_dataset(h5, "ep_offset", (), np.int64, chunks=True)
         reward_ds = create_resizable_dataset(h5, "reward", (), np.float32, chunks=True)
         seed_ds = create_resizable_dataset(h5, "episode_seed", (), np.int64, chunks=True)
         terminated_ds = create_resizable_dataset(h5, "terminated", (), np.bool_, chunks=True)
+        rollout_mode_ds = create_resizable_dataset(h5, "rollout_mode", (), np.int64, chunks=True)
         pixels_ds = create_resizable_dataset(
             h5,
             "pixels",
@@ -335,6 +394,7 @@ def main() -> None:
             while should_continue(args, len(step_counts), int(np.sum(step_counts, dtype=np.int64))):
                 trajectory_seed = args.seed + seed_offset
                 seed_offset += 1
+                rollout_mode = sample_rollout_mode(args, rollout_mode_rng)
                 states, actions, frames, total_reward, terminated = collect_trajectory(
                     model=model,
                     env=env,
@@ -349,6 +409,7 @@ def main() -> None:
                     time_limit=args.time_limit,
                     goal_threshold=args.goal_threshold,
                     max_blank_steps=args.max_blank_steps,
+                    rollout_mode=rollout_mode,
                 )
                 if actions.shape[0] < args.min_steps:
                     skipped_short += 1
@@ -375,6 +436,10 @@ def main() -> None:
                 append_rows(qvel_ds, states[:, 4:6])
                 append_rows(episode_idx_ds, np.full((states.shape[0],), episode_idx, dtype=np.int64))
                 append_rows(step_idx_ds, np.arange(states.shape[0], dtype=np.int64))
+                append_rows(
+                    rollout_mode_ds,
+                    np.full((states.shape[0],), ROLLOUT_MODES.index(rollout_mode), dtype=np.int64),
+                )
                 append_rows(ep_len_ds, np.asarray([states.shape[0]], dtype=np.int64))
                 append_rows(ep_offset_ds, np.asarray([offset], dtype=np.int64))
                 append_rows(reward_ds, np.asarray([total_reward], dtype=np.float32))
@@ -384,6 +449,7 @@ def main() -> None:
                 rewards.append(total_reward)
                 step_counts.append(int(actions.shape[0]))
                 terminated_flags.append(terminated)
+                rollout_mode_by_episode.append(rollout_mode)
                 progress.update(actions.shape[0] if args.target_transitions is not None else 1)
                 progress.set_postfix(
                     episodes=len(step_counts),
@@ -415,6 +481,9 @@ def main() -> None:
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
         "terminated_episodes": int(np.sum(terminated_flags, dtype=np.int64)),
         "skipped_short_episodes": skipped_short,
+        "expert_episodes": int(sum(mode == "expert" for mode in rollout_mode_by_episode)),
+        "expert_plus_noise_episodes": int(sum(mode == "expert_plus_noise" for mode in rollout_mode_by_episode)),
+        "expert_noise_std": EXPERT_NOISE_STD,
         "usable_train_windows_default": valid_training_windows(np.asarray(step_counts, dtype=np.int64) + 1)
         if step_counts
         else 0,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finetune a PushT latent dynamics model from a pretrained image encoder."""
+"""Finetune an LE-WM-style JEPA by reusing only a pretrained ViT encoder."""
 
 from __future__ import annotations
 
@@ -13,24 +13,20 @@ from pathlib import Path, PosixPath
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import h5py
-import hdf5plugin  # noqa: F401
 import lightning as pl
 import numpy as np
 import stable_pretraining as spt
 import torch
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 
-from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
+from rope.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATHS = [
-    Path("pusht/data/pusht_diffusion_train.h5"),
-    Path("pusht/data/pusht_diffusion_edge.h5"),
-]
-DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_2"
+DEFAULT_DATASET_PATH = "rope/data/expert_data/rope_random_cubic_spline.h5"
+DEFAULT_INIT_RUN_DIR = "rope/models/mlpdyn"
+DEFAULT_RUN_DIR = "rope/models/mlpdyn_ft"
 FIXED_FRAMESKIP = 1
 
 
@@ -44,22 +40,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
     )
-    parser.add_argument("--dataset-path", type=Path, nargs="+", default=DEFAULT_DATASET_PATHS)
+    parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--output-model-name", default="mlpdyn")
+    parser.add_argument("--output-model-name", default="lewm")
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--train-split", type=float, default=1.0)
 
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=48)
-    parser.add_argument("--markov-deriv", type=int, default=2)
-    parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
-    parser.add_argument("--action-dim", type=int, default=2)
+    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--markov-deriv", type=int, default=1)
+    parser.add_argument("--num-preds", type=int, default=20, help="Autoregressive rollout horizon.")
+    parser.add_argument("--action-dim", type=int, default=3)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
-    parser.add_argument("--predictor-depth", type=int, default=3)
+    parser.add_argument("--predictor-depth", type=int, default=2)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
     parser.add_argument("--sigreg-weight", type=float, default=0.005)
@@ -68,24 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
-    parser.add_argument("--freeze-projector-epochs", type=int, default=0)
-    parser.add_argument(
-        "--load-projector",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Load projector weights from the init checkpoint.",
-    )
-    parser.add_argument(
-        "--load-mlpdyn",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Load MLP dynamics weights from the init checkpoint.",
-    )
-    parser.add_argument("--batch-size", type=int, default=110)
-    parser.add_argument("--num-workers", type=int, default=24)
-    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--freeze-encoder-epochs", type=int, default=10)
+    parser.add_argument("--freeze-projector-epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--num-workers", type=int, default=10)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
     parser.add_argument(
         "--persistent-workers",
         action="store_true",
@@ -109,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-class LeWMPushTDataset(Dataset):
+class LeWMOGBenchCubeDataset(Dataset):
     def __init__(
         self,
         dataset_path: Path,
@@ -277,15 +261,10 @@ def build_markov_state(history_emb: torch.Tensor, markov_deriv: int) -> torch.Te
         history_emb = history_emb.unsqueeze(0)
         squeeze = True
     context_len = required_markov_history(markov_deriv)
-    if history_emb.ndim != 3:
+    if history_emb.ndim != 3 or history_emb.shape[1] < context_len:
         raise ValueError(
-            f"Expected history_emb with shape [batch, time, dim], got {tuple(history_emb.shape)}."
+            f"Expected history_emb with shape [batch, >= {context_len}, dim], got {tuple(history_emb.shape)}."
         )
-    if history_emb.shape[1] < 1:
-        raise ValueError("history_emb must contain at least one frame.")
-    if history_emb.shape[1] < context_len:
-        pad = history_emb[:, :1].expand(-1, context_len - history_emb.shape[1], -1)
-        history_emb = torch.cat((pad, history_emb), dim=1)
     deriv_seq = history_emb[:, -context_len:]
     components = [deriv_seq[:, -1]]
     for _ in range(markov_deriv):
@@ -334,7 +313,10 @@ def lewm_forward(self, batch: dict[str, torch.Tensor], stage: str, args: argpars
         pred_state = self.model.predict(ctx_state, ctx_act)[:, 0]
         pred_next = pred_state[..., :embed_dim]
         tgt_next = emb[:, step + 1]
-        tgt_history = emb[:, : step + 2]
+        if args.markov_deriv > 0:
+            tgt_history = torch.cat((emb[:, step + 1 - args.markov_deriv : step + 1], tgt_next.unsqueeze(1)), dim=1)
+        else:
+            tgt_history = tgt_next.unsqueeze(1)
         tgt_state = build_markov_state(tgt_history, args.markov_deriv)
         pred_losses.append((pred_state - tgt_state).pow(2).mean())
         pred_embs.append(pred_next)
@@ -415,18 +397,7 @@ def sanitize_hparams(args: argparse.Namespace) -> dict[str, object]:
     for key, value in hparams.items():
         if isinstance(value, Path):
             hparams[key] = str(value)
-        elif isinstance(value, list):
-            hparams[key] = [str(item) if isinstance(item, Path) else item for item in value]
     return hparams
-
-
-def resolve_dataset_paths(dataset_paths: list[Path | str]) -> list[Path]:
-    resolved_paths = [Path(path).expanduser().resolve() for path in dataset_paths]
-    missing_paths = [path for path in resolved_paths if not path.is_file()]
-    if missing_paths:
-        missing_str = ", ".join(str(path) for path in missing_paths)
-        raise FileNotFoundError(f"Dataset file(s) not found: {missing_str}")
-    return resolved_paths
 
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
@@ -463,7 +434,7 @@ def resolve_resume_checkpoint(args: argparse.Namespace, run_dir: Path) -> Path |
     return checkpoint_path
 
 
-def load_pretrained_model(checkpoint_path: Path) -> JEPA:
+def load_pretrained_encoder(checkpoint_path: Path) -> torch.nn.Module:
     source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     encoder = getattr(source_model, "encoder", None)
     predictor = getattr(source_model, "predictor", None)
@@ -474,18 +445,22 @@ def load_pretrained_model(checkpoint_path: Path) -> JEPA:
             "Expected a JEPA-compatible object checkpoint with "
             f"`encoder`, `predictor`, and `action_encoder`, got {source_type}."
         )
-    return source_model
+    if encoder is None:
+        raise AttributeError("Source checkpoint does not contain model.encoder.")
+    return encoder
 
 
 def main() -> None:
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
 
-    dataset_paths = resolve_dataset_paths(args.dataset_path)
+    dataset_path = args.dataset_path.expanduser().resolve()
     run_dir = args.run_dir.expanduser().resolve()
     resume_checkpoint_path = resolve_resume_checkpoint(args, run_dir)
     init_checkpoint_path = None if resume_checkpoint_path is not None else resolve_init_checkpoint(args)
 
+    if not dataset_path.is_file():
+        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
     if run_dir.exists() and resume_checkpoint_path is None:
         raise FileExistsError(f"Run dir already exists: {run_dir}")
     if not run_dir.exists() and resume_checkpoint_path is not None:
@@ -493,18 +468,14 @@ def main() -> None:
 
     spt.set(cache_dir=str(run_dir))
 
-    datasets = [
-        LeWMPushTDataset(
-            dataset_path,
-            markov_deriv=args.markov_deriv,
-            num_preds=args.num_preds,
-            frameskip=args.frameskip,
-            img_size=args.img_size,
-            action_dim=args.action_dim,
-        )
-        for dataset_path in dataset_paths
-    ]
-    dataset: Dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
+    dataset = LeWMOGBenchCubeDataset(
+        dataset_path,
+        markov_deriv=args.markov_deriv,
+        num_preds=args.num_preds,
+        frameskip=args.frameskip,
+        img_size=args.img_size,
+        action_dim=args.action_dim,
+    )
     if len(dataset) < 2:
         raise ValueError(f"Need at least 2 valid training windows for train/val splitting, got {len(dataset)}.")
     train_len = int(len(dataset) * args.train_split)
@@ -536,10 +507,7 @@ def main() -> None:
 
     world_model = build_model(args)
     if resume_checkpoint_path is None:
-        pretrained_model = load_pretrained_model(init_checkpoint_path)
-        pretrained_encoder = getattr(pretrained_model, "encoder", None)
-        if pretrained_encoder is None:
-            raise AttributeError("Source checkpoint does not contain model.encoder.")
+        pretrained_encoder = load_pretrained_encoder(init_checkpoint_path)
         try:
             world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
         except RuntimeError as exc:
@@ -547,16 +515,6 @@ def main() -> None:
                 "Failed to load encoder weights from the init checkpoint. "
                 "Check encoder-scale, patch-size, and encoder architecture compatibility."
             ) from exc
-        if args.load_projector:
-            pretrained_projector = getattr(pretrained_model, "projector", None)
-            if pretrained_projector is None:
-                raise AttributeError("Source checkpoint does not contain model.projector.")
-            world_model.projector.load_state_dict(pretrained_projector.state_dict(), strict=True)
-        if args.load_mlpdyn:
-            pretrained_predictor = getattr(pretrained_model, "predictor", None)
-            if pretrained_predictor is None:
-                raise AttributeError("Source checkpoint does not contain model.predictor.")
-            world_model.predictor.load_state_dict(pretrained_predictor.state_dict(), strict=True)
 
     optimizers = {
         "model_opt": {
@@ -582,26 +540,12 @@ def main() -> None:
         with (run_dir / "config.json").open("w") as f:
             json.dump(config, f, indent=2, default=str)
 
-        loaded_modules = ["encoder"]
-        if args.load_projector:
-            loaded_modules.append("projector")
-        if args.load_mlpdyn:
-            loaded_modules.append("predictor")
-
-        reinitialized_modules = ["action_encoder", "pred_proj"]
-        if not args.load_projector:
-            reinitialized_modules.insert(0, "projector")
-        if not args.load_mlpdyn:
-            reinitialized_modules.insert(1 if not args.load_projector else 0, "predictor")
-
         init_report = {
             "init_checkpoint": str(init_checkpoint_path),
-            "loaded_modules": loaded_modules,
-            "reinitialized_modules": reinitialized_modules,
+            "loaded_modules": ["encoder"],
+            "reinitialized_modules": ["projector", "predictor", "action_encoder", "pred_proj"],
             "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
             "freeze_projector_epochs": int(args.freeze_projector_epochs),
-            "load_projector": bool(args.load_projector),
-            "load_mlpdyn": bool(args.load_mlpdyn),
         }
         with (run_dir / "init_report.json").open("w") as f:
             json.dump(init_report, f, indent=2)

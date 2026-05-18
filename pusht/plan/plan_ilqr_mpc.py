@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import itertools
 import json
 import os
@@ -27,10 +28,10 @@ from pusht.shared.pusht_env import (
     make_pusht_env,
     reset_pusht_env_to_state,
 )
-from pusht.train.mlpdyn_train import LeWMPushTDataset, build_markov_state, required_markov_history
+from pusht.train.mlpdyn_train import build_markov_state, required_markov_history
 
 DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_eval.h5"
-DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft"
+DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_2"
 DEFAULT_OUT_DIR = "pusht/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
@@ -40,7 +41,7 @@ Q_TERMINAL = 10.0
 Q_STAGE = 0.005
 R_CONTROL = 0.001
 VIDEO_FPS = 10
-EPISODE_IDX = None # 480, 12148
+EPISODE_IDX = 133 # 480, 12148
 CONTROL_MIN_NORM = -1.5
 CONTROL_MAX_NORM = 1.5
 ENV_ACTION_SCALE = 100.0
@@ -90,6 +91,53 @@ def load_config(model_dir: Path) -> dict[str, object]:
         raise FileNotFoundError(f"Model config not found: {config_path}")
     with config_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def resolve_dataset_paths(value: object, fallback: Path) -> list[Path]:
+    if value is None:
+        raw_paths: list[object] = [fallback]
+    elif isinstance(value, (str, Path)):
+        parsed_value = value
+        if isinstance(value, str):
+            try:
+                literal = ast.literal_eval(value)
+            except (SyntaxError, ValueError):
+                literal = None
+            if isinstance(literal, list):
+                parsed_value = literal
+        raw_paths = parsed_value if isinstance(parsed_value, list) else [parsed_value]
+    elif isinstance(value, list):
+        raw_paths = value
+    else:
+        raise TypeError(f"Unsupported dataset path config type: {type(value).__name__}.")
+
+    resolved_paths = [Path(path).expanduser().resolve() for path in raw_paths]
+    missing_paths = [path for path in resolved_paths if not path.is_file()]
+    if missing_paths:
+        missing_str = ", ".join(str(path) for path in missing_paths)
+        raise FileNotFoundError(f"Dataset file(s) not found: {missing_str}")
+    return resolved_paths
+
+
+def load_action_stats(dataset_paths: list[Path], action_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    finite_action_blocks: list[np.ndarray] = []
+    for dataset_path in dataset_paths:
+        with h5py.File(dataset_path, "r") as h5:
+            if int(h5["action"].shape[-1]) != action_dim:
+                raise ValueError(
+                    f"Expected action_dim={action_dim} for {dataset_path}, got {h5['action'].shape[-1]}."
+                )
+            finite_actions = np.asarray(h5["action"][:], dtype=np.float32)
+            finite_actions = finite_actions[~np.isnan(finite_actions).any(axis=1)]
+            if finite_actions.size:
+                finite_action_blocks.append(finite_actions)
+    if not finite_action_blocks:
+        raise ValueError("No finite actions found across the configured training datasets.")
+    finite_actions = np.concatenate(finite_action_blocks, axis=0)
+    action_mean = finite_actions.mean(axis=0, keepdims=True).astype(np.float32)
+    action_std = finite_actions.std(axis=0, keepdims=True).astype(np.float32)
+    action_std = np.maximum(action_std, 1e-6)
+    return action_mean, action_std
 
 
 def resolve_model_dir(args: argparse.Namespace) -> Path:
@@ -693,19 +741,10 @@ def main() -> None:
             f"This PushT MPC planner currently supports frameskip=1 only, but the model config has frameskip={frameskip}."
         )
 
-    train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
-    train_stats_dataset = LeWMPushTDataset(
-        train_dataset_path,
-        markov_deriv=markov_deriv,
-        num_preds=1,
-        frameskip=frameskip,
-        img_size=img_size,
-        action_dim=action_dim,
-    )
+    train_dataset_paths = resolve_dataset_paths(config.get("dataset_path"), dataset_path)
     pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
     pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
-    action_mean = train_stats_dataset.action_mean.astype(np.float32)
-    action_std = train_stats_dataset.action_std.astype(np.float32)
+    action_mean, action_std = load_action_stats(train_dataset_paths, action_dim)
 
     with h5py.File(dataset_path, "r") as h5:
         ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
@@ -901,6 +940,7 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "config_path": str(model_dir / "config.json"),
         "dataset_path": str(dataset_path),
+        "train_dataset_paths": [str(path) for path in train_dataset_paths],
         "dataset_state_format": state_format,
         "markov_deriv": markov_deriv,
         "action_history_size": 1,
