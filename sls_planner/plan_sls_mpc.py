@@ -336,7 +336,7 @@ def main():
     W_state = W_state.at[state_dim // 2 :].set(0.2)  # You can adjust this weighting as needed
     W_term = jnp.ones((state_dim,))*0.10   # Terminal cost weight to ensure we prioritize reaching the goal state
     W_term = W_term.at[:state_dim // 2].set(1000.0)  # Heavily weight the embedding dimensions at the terminal state
-    cost = make_tracking_cost(action_weight=0.01, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state)  # W_term will be set later after we get the goal state
+    cost = make_tracking_cost(action_weight=0.0001, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state)  # W_term will be set later after we get the goal state
 
     save_rgb_image(run_dir / "start_image.png", pixels_np[0])
     save_rgb_image(run_dir / "goal_image.png", pixels_np[-1])

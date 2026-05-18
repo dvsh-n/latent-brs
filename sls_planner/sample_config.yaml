@@ -5,8 +5,8 @@ error_model_ckpt: "error_model/lightning_logs/version_1/checkpoints/best-error-m
 dataset_path: "reacher/data/test_data_50hz/reacher_test.h5"
 out_dir: "reacher/plan/sls_mpc_conformal"
 device: "auto"
-horizon: 25
-max_mpc_steps: 120
+horizon: 5
+max_mpc_steps: 300
 video_fps: 50
-episode_idx: 5  # Use a number (e.g. 5) or null for random
+episode_idx: 6588  # Use a number (e.g. 5) or null for random
 seed: 42
