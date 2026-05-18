@@ -11,11 +11,21 @@ from pathlib import Path
 import numpy as np
 from tqdm import trange
 
-from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, get_pusht_agent_pos, get_pusht_block_pose, make_pusht_env
+from pusht.shared.pusht_env import (
+    DEFAULT_PUSHT_ENV_ID,
+    get_pusht_agent_pos,
+    get_pusht_block_pose,
+    make_pusht_env,
+    reset_pusht_env_to_state,
+)
 from pusht.shared.utils import load_expert_policy_bundle, pusht_observation_to_policy_batch, select_expert_action
 
 DEFAULT_MODEL_DIR = Path("pusht/models")
 DEFAULT_OUT_DIR = Path("pusht/plan/diffusion_plan")
+PUSHT_WALL_MIN = 5.0
+PUSHT_WALL_MAX = 506.0
+PUSHT_WALL_RADIUS = 2.0
+PUSHT_AGENT_RADIUS = 15.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,8 +41,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=10, help="Output video frame rate.")
     parser.add_argument("--action-mode", default="auto", choices=["auto", "absolute", "relative"])
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--control-noise", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--control-noise", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--control-noise-std", type=float, default=8.5)
+    parser.add_argument(
+        "--edge-sample",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep the T initialization from env.reset() but respawn the pusher on a random legal edge.",
+    )
     parser.add_argument(
         "--control-interval",
         type=int,
@@ -89,6 +105,78 @@ def _clip_action_to_space(action: np.ndarray, env: Any) -> np.ndarray:
     return np.clip(action, low, high).astype(np.float32)
 
 
+def _pusht_agent_bounds() -> tuple[np.ndarray, np.ndarray]:
+    min_coord = PUSHT_WALL_MIN + PUSHT_WALL_RADIUS + PUSHT_AGENT_RADIUS
+    max_coord = PUSHT_WALL_MAX - PUSHT_WALL_RADIUS - PUSHT_AGENT_RADIUS
+    low = np.full((2,), min_coord, dtype=np.float32)
+    high = np.full((2,), max_coord, dtype=np.float32)
+    return low, high
+
+
+def _sample_agent_pos_on_edge(rng: np.random.Generator) -> np.ndarray:
+    low, high = _pusht_agent_bounds()
+    edge = int(rng.integers(4))
+    coord = float(rng.uniform(float(low[0]), float(high[0])))
+    if edge == 0:
+        return np.asarray([low[0], coord], dtype=np.float32)
+    if edge == 1:
+        return np.asarray([high[0], coord], dtype=np.float32)
+    if edge == 2:
+        return np.asarray([coord, low[1]], dtype=np.float32)
+    return np.asarray([coord, high[1]], dtype=np.float32)
+
+
+def _refresh_observation(
+    observation: dict[str, Any],
+    *,
+    pixels: np.ndarray,
+    agent_pos: np.ndarray,
+) -> dict[str, Any]:
+    updated = dict(observation)
+    if "pixels" in updated:
+        updated["pixels"] = pixels
+    if "image" in updated:
+        updated["image"] = pixels
+    if "agent_pos" in updated:
+        updated["agent_pos"] = agent_pos.astype(np.float32, copy=True)
+    if "proprio" in updated:
+        proprio = np.asarray(updated["proprio"], dtype=np.float32).copy()
+        if proprio.shape[0] < 2:
+            raise ValueError("Expected PushT proprio observations with at least 2 entries for agent xy.")
+        proprio[:2] = agent_pos
+        updated["proprio"] = proprio
+    if "state" in updated:
+        state = np.asarray(updated["state"], dtype=np.float32).copy()
+        if state.shape[0] < 2:
+            raise ValueError("Expected PushT state observations with at least 2 entries for agent xy.")
+        state[:2] = agent_pos
+        updated["state"] = state
+    return updated
+
+
+def _maybe_edge_sample_observation(
+    env: Any,
+    observation: dict[str, Any],
+    *,
+    enabled: bool,
+    rng: np.random.Generator,
+) -> tuple[dict[str, Any], np.ndarray]:
+    initial_agent_pos = get_pusht_agent_pos(env).astype(np.float32, copy=True)
+    if not enabled:
+        return observation, initial_agent_pos
+    if not isinstance(observation, dict):
+        raise ValueError("--edge-sample requires dict observations containing agent position fields.")
+
+    block_pose = get_pusht_block_pose(env)
+    sampled_agent_pos = _sample_agent_pos_on_edge(rng)
+    state = np.asarray(
+        [sampled_agent_pos[0], sampled_agent_pos[1], block_pose[0], block_pose[1], block_pose[2], 0.0, 0.0],
+        dtype=np.float64,
+    )
+    pixels = reset_pusht_env_to_state(env, state)
+    return _refresh_observation(observation, pixels=pixels, agent_pos=sampled_agent_pos), sampled_agent_pos
+
+
 def extract_goal_pose(env) -> list[float] | None:
     goal_pose = getattr(env.unwrapped, "goal_pose", None)
     if goal_pose is None:
@@ -112,6 +200,12 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     episode_seed = None if args.seed is None else args.seed + episode_idx
     observation, info = env.reset(seed=episode_seed)
     rng = np.random.default_rng(episode_seed)
+    observation, initial_agent_pos = _maybe_edge_sample_observation(
+        env,
+        observation,
+        enabled=args.edge_sample,
+        rng=rng,
+    )
 
     frames = [_policy_view_frame(bundle, observation, env)]
     total_reward = 0.0
@@ -165,8 +259,10 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
         "control_noise": bool(args.control_noise),
         "control_noise_std": float(args.control_noise_std),
         "goal_pose": goal_pose,
+        "initial_agent_pos": initial_agent_pos.tolist(),
         "final_block_pose": final_block_pose,
         "final_agent_pos": final_agent_pos,
+        "edge_sample": bool(args.edge_sample),
         "video_path": str(video_path) if video_path is not None else None,
     }
 

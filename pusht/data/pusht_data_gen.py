@@ -19,14 +19,18 @@ try:
 except ModuleNotFoundError:
     hdf5plugin = None
 
-from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env
+from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env, reset_pusht_env_to_state
 from pusht.shared.utils import env_action_from_policy_action, load_expert_policy_bundle
 
 DEFAULT_MODEL_DIR = Path("pusht/models")
-DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_diffusion_eval.h5")
-ROLLOUT_MODES = ("expert", "expert_plus_noise")
-RATIOS = (1.0, 0.0)  # expert, expert_plus_noise
-DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500)
+DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_diffusion_edge.h5")
+ROLLOUT_MODES = ("expert", "expert_plus_noise", "expert_edge_sample")
+RATIOS = (0.0, 0.0, 1.0)  # expert, expert_plus_noise, expert_edge_sample
+DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500, 500)
+PUSHT_WALL_MIN = 5.0
+PUSHT_WALL_MAX = 506.0
+PUSHT_WALL_RADIUS = 2.0
+PUSHT_AGENT_RADIUS = 15.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--env-id", default=DEFAULT_PUSHT_ENV_ID)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    parser.add_argument("--num-episodes", type=int, default=1_000)
+    parser.add_argument("--num-episodes", type=int, default=5_000)
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument(
         "--max-steps-expert",
@@ -48,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_ENV_STEPS_BY_MODE[1],
         help="Max env steps for expert_plus_noise rollouts.",
+    )
+    parser.add_argument(
+        "--max-steps-expert-edge-sample",
+        type=int,
+        default=DEFAULT_MAX_ENV_STEPS_BY_MODE[2],
+        help="Max env steps for expert_edge_sample rollouts.",
     )
     parser.add_argument("--image-height", type=int, default=224)
     parser.add_argument("--image-width", type=int, default=224)
@@ -120,9 +130,31 @@ def _extract_goal_pose(env) -> tuple[float, float, float]:
     return float(goal[0]), float(goal[1]), float(goal[2])
 
 
+def _pusht_agent_bounds() -> tuple[np.ndarray, np.ndarray]:
+    min_coord = PUSHT_WALL_MIN + PUSHT_WALL_RADIUS + PUSHT_AGENT_RADIUS
+    max_coord = PUSHT_WALL_MAX - PUSHT_WALL_RADIUS - PUSHT_AGENT_RADIUS
+    low = np.full((2,), min_coord, dtype=np.float32)
+    high = np.full((2,), max_coord, dtype=np.float32)
+    return low, high
+
+
+def _sample_agent_pos_on_edge(rng: np.random.Generator) -> np.ndarray:
+    low, high = _pusht_agent_bounds()
+    edge = int(rng.integers(4))
+    coord = float(rng.uniform(float(low[0]), float(high[0])))
+    if edge == 0:
+        return np.asarray([low[0], coord], dtype=np.float32)
+    if edge == 1:
+        return np.asarray([high[0], coord], dtype=np.float32)
+    if edge == 2:
+        return np.asarray([coord, low[1]], dtype=np.float32)
+    return np.asarray([coord, high[1]], dtype=np.float32)
+
+
 class PushTPrivilegedObsWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, *, vector_env_index: int):
         super().__init__(env)
+        self.vector_env_index = int(vector_env_index)
         self.observation_space = gym.spaces.Dict(
             {
                 **self.observation_space.spaces,
@@ -144,6 +176,29 @@ class PushTPrivilegedObsWrapper(gym.Wrapper):
     def step(self, action):
         observation, reward, terminated, truncated, info = self.env.step(action)
         return self._augment(observation), reward, terminated, truncated, info
+
+    def maybe_edge_sample_reset(
+        self,
+        enabled_by_env: np.ndarray | list[bool],
+        seed_by_env: np.ndarray | list[int | None],
+    ) -> dict[str, Any]:
+        base_env = getattr(self.env, "unwrapped", self.env)
+        enabled = bool(np.asarray(enabled_by_env)[self.vector_env_index])
+        if not enabled:
+            raw_observation = base_env.get_obs()
+            return self._augment(raw_observation)
+
+        seed = np.asarray(seed_by_env, dtype=object)[self.vector_env_index]
+        rng = np.random.default_rng(None if seed is None else int(seed))
+        sampled_agent_pos = _sample_agent_pos_on_edge(rng)
+        block_x, block_y, block_theta = _extract_block_pose(self.unwrapped)
+        state = np.asarray(
+            [sampled_agent_pos[0], sampled_agent_pos[1], block_x, block_y, block_theta, 0.0, 0.0],
+            dtype=np.float64,
+        )
+        reset_pusht_env_to_state(base_env, state)
+        raw_observation = base_env.get_obs()
+        return self._augment(raw_observation)
 
 
 def _make_state(raw_observation: dict[str, Any], env) -> np.ndarray:
@@ -209,6 +264,7 @@ def _mode_max_steps(args: argparse.Namespace, mode: str) -> int:
     mapping = {
         "expert": args.max_steps_expert,
         "expert_plus_noise": args.max_steps_expert_noisy,
+        "expert_edge_sample": args.max_steps_expert_edge_sample,
     }
     return int(mapping[mode])
 
@@ -372,7 +428,7 @@ class H5EpisodeWriter:
         self.h5.close()
 
 
-def make_env(args: argparse.Namespace):
+def make_env(args: argparse.Namespace, *, vector_env_index: int):
     env = make_pusht_env(
         args.env_id,
         obs_type="pixels_agent_pos",
@@ -384,7 +440,7 @@ def make_env(args: argparse.Namespace):
         visualization_height=args.image_height,
         hide_target=args.hide_target,
     )
-    return PushTPrivilegedObsWrapper(env)
+    return PushTPrivilegedObsWrapper(env, vector_env_index=vector_env_index)
 
 
 def _resize_hwc_uint8(image: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -483,7 +539,10 @@ def _extract_vector_success(
 
 
 def make_vector_env(args: argparse.Namespace) -> gym.vector.VectorEnv:
-    env_fns = [lambda args=args: make_env(args) for _ in range(args.num_envs)]
+    env_fns = [
+        (lambda env_idx=env_idx, args=args: make_env(args, vector_env_index=env_idx))
+        for env_idx in range(args.num_envs)
+    ]
     env_cls = gym.vector.AsyncVectorEnv if args.async_envs else gym.vector.SyncVectorEnv
     try:
         from gymnasium.vector import AutoresetMode
@@ -507,6 +566,8 @@ def main() -> None:
         raise ValueError("--max-steps-expert must be >= 1.")
     if args.max_steps_expert_noisy < 1:
         raise ValueError("--max-steps-expert-noisy must be >= 1.")
+    if args.max_steps_expert_edge_sample < 1:
+        raise ValueError("--max-steps-expert-edge-sample must be >= 1.")
     if args.expert_noise_std < 0.0:
         raise ValueError("--expert-noise-std must be >= 0.")
     if args.out.exists():
@@ -531,11 +592,30 @@ def main() -> None:
                 attempts += args.num_envs
                 bundle.policy.reset()
                 raw_observations, _ = env.reset(seed=reset_seeds)
+                rollout_modes = _sample_rollout_modes(args, mode_rng, args.num_envs)
+                edge_sample_mask = np.asarray(
+                    [mode == "expert_edge_sample" for mode in rollout_modes],
+                    dtype=bool,
+                )
+                if edge_sample_mask.any():
+                    refreshed_observations = env.call(
+                        "maybe_edge_sample_reset",
+                        edge_sample_mask,
+                        reset_seeds,
+                    )
+                    for env_idx, observation in enumerate(refreshed_observations):
+                        if not edge_sample_mask[env_idx]:
+                            continue
+                        for key, value in observation.items():
+                            if isinstance(value, dict):
+                                for subkey, subvalue in value.items():
+                                    raw_observations[key][subkey][env_idx] = subvalue
+                            else:
+                                raw_observations[key][env_idx] = value
                 previous_actions = np.zeros((args.num_envs, 2), dtype=np.float32)
                 active = np.ones(args.num_envs, dtype=bool)
                 env_actions = np.zeros((args.num_envs, 2), dtype=np.float32)
                 logged_actions = np.zeros((args.num_envs, 2), dtype=np.float32)
-                rollout_modes = _sample_rollout_modes(args, mode_rng, args.num_envs)
                 max_steps_by_env = np.asarray([_mode_max_steps(args, mode) for mode in rollout_modes], dtype=np.int32)
                 episode_rngs = [np.random.default_rng(reset_seeds[env_idx]) for env_idx in range(args.num_envs)]
                 batch_pixels: list[list[np.ndarray]] = [[] for _ in range(args.num_envs)]
@@ -579,6 +659,12 @@ def main() -> None:
                             )
                             env_actions[env_idx] = noisy_env_action
                             logged_actions[env_idx] = noisy_logged_action
+                        edge_mask = np.asarray(
+                            [active[idx] and rollout_modes[idx] == "expert_edge_sample" for idx in range(args.num_envs)],
+                            dtype=bool,
+                        )
+                        env_actions[edge_mask] = expert_env_actions[edge_mask]
+                        logged_actions[edge_mask] = expert_logged_actions[edge_mask]
 
                     for env_idx in range(args.num_envs):
                         if not active[env_idx]:

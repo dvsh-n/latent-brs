@@ -140,25 +140,27 @@ def make_no_target_env(*, height: int, width: int, max_episode_steps: int = 300)
 
 
 def set_pusht_state(env: Any, state: np.ndarray) -> None:
-    env.agent.velocity = [0.0, 0.0]
-    env.block.velocity = [0.0, 0.0]
-    env.block.angular_velocity = 0.0
+    base_env = getattr(env, "unwrapped", env)
+    base_env.agent.velocity = [0.0, 0.0]
+    base_env.block.velocity = [0.0, 0.0]
+    base_env.block.angular_velocity = 0.0
     state = np.asarray(state, dtype=np.float64)
-    env.agent.position = list(state[:2])
+    base_env.agent.position = list(state[:2])
     # The T body has an offset center of gravity, so setting position and then
     # angle shifts the rendered pose. Apply angle first, then place the body.
-    env.block.angle = float(state[4])
-    env.block.position = list(state[2:4])
-    env.space.step(env.dt)
-    env.agent.velocity = [float(state[5]), float(state[6])] if state.shape[0] >= 7 else [0.0, 0.0]
-    env.block.velocity = [0.0, 0.0]
-    env.block.angular_velocity = 0.0
-    env._last_action = None
+    base_env.block.angle = float(state[4])
+    base_env.block.position = list(state[2:4])
+    base_env.space.step(base_env.dt)
+    base_env.agent.velocity = [float(state[5]), float(state[6])] if state.shape[0] >= 7 else [0.0, 0.0]
+    base_env.block.velocity = [0.0, 0.0]
+    base_env.block.angular_velocity = 0.0
+    base_env._last_action = None
 
 
 def reset_pusht_env_to_state(env: Any, state: np.ndarray) -> np.ndarray:
-    set_pusht_state(env, np.asarray(state, dtype=np.float64))
-    return np.asarray(env._render(visualize=False), dtype=np.uint8)
+    base_env = getattr(env, "unwrapped", env)
+    set_pusht_state(base_env, np.asarray(state, dtype=np.float64))
+    return np.asarray(base_env._render(visualize=False), dtype=np.uint8)
 
 
 def get_pusht_block_pose(env: Any) -> np.ndarray:

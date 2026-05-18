@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-max-iters", type=int, default=35)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
-    parser.add_argument("--joint1-range", type=float, default=0.25)
-    parser.add_argument("--joint2-range", type=float, default=0.12)
+    parser.add_argument("--joint1-range", type=float, default=0.35)
+    parser.add_argument("--joint2-range", type=float, default=0.35)
     parser.add_argument("--set-pca-count", type=int, default=192)
     parser.add_argument("--set-norm-count", type=int, default=192)
     parser.add_argument("--set-cal-count", type=int, default=192)
@@ -76,13 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlay-perturb-alpha", type=float, default=0.05)
     parser.add_argument("--constraint-margin", type=float, default=0.08)
     parser.add_argument("--constraint-activation", type=float, default=1.35)
-    parser.add_argument("--obstacle-penalty", type=float, default=25.0)
     parser.add_argument("--constraint-rho", type=float, default=1.0)
     parser.add_argument("--constraint-admm-iters", type=int, default=60)
     parser.add_argument("--constraint-admm-tol", type=float, default=1e-4)
     parser.add_argument("--qp-regularization", type=float, default=1e-5)
     parser.add_argument("--force-rerun-rollout", action="store_true", default=False)
-    parser.add_argument("--force-rerun-constrained", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if args.max_mpc_steps is not None:
@@ -99,22 +97,6 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
-
-
-def infer_constrained_cache_path(
-    out_dir: Path,
-    checkpoint_path: Path,
-    episode_idx: int,
-    obstacle_step: int,
-    args: argparse.Namespace,
-) -> Path:
-    stem = checkpoint_path.stem
-    name = (
-        f"episode_{episode_idx:05d}_{stem}_obs{obstacle_step:04d}_h{args.horizon}_"
-        f"mpc{args.constrained_max_mpc_steps}_cm{args.constraint_margin:g}_ca{args.constraint_activation:g}_"
-        f"op{args.obstacle_penalty:g}_rho{args.constraint_rho:g}.pt"
-    )
-    return out_dir / "constrained_rollout_cache" / name
 
 
 class LinearConstraintADMMQP:
@@ -170,7 +152,6 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
         obstacle_right_pinv: np.ndarray,
         obstacle_margin: float,
         obstacle_activation: float,
-        obstacle_penalty: float,
         constraint_rho: float,
         constraint_admm_iters: int,
         constraint_admm_tol: float,
@@ -183,7 +164,6 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
         self.obstacle_right_pinv = np.asarray(obstacle_right_pinv, dtype=np.float64).copy()
         self.obstacle_margin = float(obstacle_margin)
         self.obstacle_activation = float(obstacle_activation)
-        self.obstacle_penalty = float(obstacle_penalty)
         self.qp_solver = LinearConstraintADMMQP(
             rho=constraint_rho,
             max_iters=constraint_admm_iters,
@@ -195,18 +175,12 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
     def _embedding_coords(self, embedding: np.ndarray) -> np.ndarray:
         return (embedding - self.obstacle_center) @ self.obstacle_right_pinv
 
-    def _obstacle_violation(self, x_traj: torch.Tensor) -> torch.Tensor:
-        emb = x_traj[1:, : self.embed_dim]
-        center = torch.tensor(self.obstacle_center, dtype=emb.dtype, device=emb.device)
-        right_pinv = torch.tensor(self.obstacle_right_pinv, dtype=emb.dtype, device=emb.device)
-        coords = (emb - center) @ right_pinv
-        max_abs = torch.max(torch.abs(coords), dim=1).values
-        margin = (1.0 + self.obstacle_margin) - max_abs
-        hinge = torch.clamp(margin, min=0.0)
-        return self.obstacle_penalty * torch.sum(hinge * hinge)
+    def _constraint_value(self, embedding: np.ndarray, normal: np.ndarray, rhs: float) -> float:
+        return float(normal @ embedding - rhs)
 
-    def _trajectory_merit(self, x_traj: torch.Tensor, u_seq: torch.Tensor, x_goal: torch.Tensor) -> torch.Tensor:
-        return self._trajectory_cost(x_traj, u_seq, x_goal) + self._obstacle_violation(x_traj)
+    def _state_inside_obstacle(self, embedding: np.ndarray) -> bool:
+        coords = self._embedding_coords(embedding)
+        return bool(np.max(np.abs(coords)) <= (1.0 + self.obstacle_margin))
 
     def _select_constraint_rows(self, x_traj: np.ndarray) -> list[tuple[int, np.ndarray, float]]:
         rows: list[tuple[int, np.ndarray, float]] = []
@@ -224,6 +198,18 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
             rhs = 1.0 + self.obstacle_margin + float(normal @ self.obstacle_center)
             rows.append((step, normal.astype(np.float64), rhs))
         return rows
+
+    def _constraints_satisfied(
+        self,
+        x_traj: np.ndarray,
+        rows: list[tuple[int, np.ndarray, float]],
+        tol: float = 1e-7,
+    ) -> bool:
+        for step, normal, rhs in rows:
+            embedding = x_traj[step, : self.embed_dim]
+            if self._constraint_value(embedding, normal, rhs) < -tol:
+                return False
+        return True
 
     def _build_state_sensitivity(self, a_seq: np.ndarray, b_seq: np.ndarray) -> list[np.ndarray]:
         total_u = self.horizon * self.action_dim
@@ -243,6 +229,7 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
         x_goal: np.ndarray,
         a_seq: np.ndarray,
         b_seq: np.ndarray,
+        rows: list[tuple[int, np.ndarray, float]],
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
         total_u = self.horizon * self.action_dim
         sens = self._build_state_sensitivity(a_seq, b_seq)
@@ -267,7 +254,6 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
         grad += q_terminal * (terminal_s.T @ terminal_err)
         hess = 0.5 * (hess + hess.T)
 
-        rows = self._select_constraint_rows(x_traj)
         if not rows:
             return hess, grad, np.zeros((0, total_u), dtype=np.float64), np.zeros(0, dtype=np.float64), 0
 
@@ -276,7 +262,7 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
         for step, normal, rhs in rows:
             s_embed = sens[step][: self.embed_dim]
             g_rows.append(-(normal @ s_embed))
-            h_rows.append(float(normal @ x_traj[step, : self.embed_dim] - rhs))
+            h_rows.append(float(self._constraint_value(x_traj[step, : self.embed_dim], normal, rhs)))
 
         return hess, grad, np.stack(g_rows, axis=0), np.asarray(h_rows, dtype=np.float64), len(rows)
 
@@ -289,12 +275,19 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
         t0 = time.perf_counter()
 
         x_traj = self._rollout(x0, u_seq)
-        current_merit = float(self._trajectory_merit(x_traj, u_seq, x_goal).item())
+        current_cost = float(self._trajectory_cost(x_traj, u_seq, x_goal).item())
         iterations = 0
-        accepted_constraints = 0
+        current_rows = self._select_constraint_rows(x_traj.detach().cpu().numpy().astype(np.float64))
+        feasible_initial = self._constraints_satisfied(
+            x_traj.detach().cpu().numpy().astype(np.float64),
+            current_rows,
+        )
+        accepted_constraints = len(current_rows)
         admm_iters = 0.0
         admm_primal = 0.0
         admm_dual = 0.0
+        accepted = feasible_initial
+        stop_reason = "max_iters"
 
         for iteration in range(self.max_iters):
             iterations = iteration + 1
@@ -303,12 +296,14 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
             u_np = u_seq.detach().cpu().numpy().astype(np.float64)
             a_np = a_t.detach().cpu().numpy().astype(np.float64)
             b_np = b_t.detach().cpu().numpy().astype(np.float64)
+            current_rows = self._select_constraint_rows(x_np)
             hess, grad, g_mat, h_vec, n_constraints = self._build_local_qp(
                 x_np,
                 u_np,
                 x_goal_np,
                 a_np,
                 b_np,
+                current_rows,
             )
             du_flat, qp_stats = self.qp_solver.solve(hess, grad, g_mat, h_vec)
             du_seq = torch.tensor(
@@ -317,40 +312,50 @@ class ObstacleConstrainedILQRMPCSolver(planner.ILQRMPCSolver):
                 device=self.device,
             )
 
-            accepted = False
             best_candidate: tuple[torch.Tensor, torch.Tensor, float, float] | None = None
             for alpha in self.line_search_alphas:
                 u_new = u_seq + alpha * du_seq
                 x_new = self._rollout(x0, u_new)
-                new_merit = float(self._trajectory_merit(x_new, u_new, x_goal).item())
-                if np.isfinite(new_merit) and new_merit < current_merit:
-                    best_candidate = (x_new, u_new, new_merit, alpha)
-                    accepted = True
+                x_new_np = x_new.detach().cpu().numpy().astype(np.float64)
+                if not self._constraints_satisfied(x_new_np, current_rows):
+                    continue
+                new_cost = float(self._trajectory_cost(x_new, u_new, x_goal).item())
+                if np.isfinite(new_cost) and new_cost < current_cost:
+                    best_candidate = (x_new, u_new, new_cost, alpha)
                     break
 
-            if not accepted:
+            if best_candidate is None:
+                stop_reason = "no_feasible_step"
                 break
 
-            x_traj, u_seq, current_merit, alpha = best_candidate
+            accepted = True
+            x_traj, u_seq, current_cost, alpha = best_candidate
             accepted_constraints = n_constraints
             admm_iters = qp_stats["iters"]
             admm_primal = qp_stats["primal_residual"]
             admm_dual = qp_stats["dual_residual"]
             max_du = float(torch.max(torch.abs(alpha * du_seq)).item())
             if max_du <= self.tol:
+                stop_reason = "converged"
                 break
 
         self.prev_u_guess = u_seq.detach().clone()
         planner.maybe_cuda_synchronize(self.device)
         solve_time = time.perf_counter() - t0
         final_cost = float(self._trajectory_cost(x_traj, u_seq, x_goal).item())
+        final_x_np = x_traj.detach().cpu().numpy().astype(np.float64)
+        final_rows = self._select_constraint_rows(final_x_np)
+        feasible_final = self._constraints_satisfied(final_x_np, final_rows)
         self.last_solve_stats = {
-            "merit": float(current_merit),
-            "obstacle_penalty": float(self._obstacle_violation(x_traj).item()),
+            "cost": float(current_cost),
             "active_constraints": float(accepted_constraints),
             "admm_iters": float(admm_iters),
             "admm_primal_residual": float(admm_primal),
             "admm_dual_residual": float(admm_dual),
+            "accepted": float(1.0 if accepted else 0.0),
+            "feasible_initial": float(1.0 if feasible_initial else 0.0),
+            "feasible_final": float(1.0 if feasible_final else 0.0),
+            "stop_reason": stop_reason,
         }
         return (
             x_traj.detach().cpu().numpy().astype(np.float64),
@@ -439,7 +444,6 @@ def run_constrained_rollout(
         obstacle_right_pinv=np.asarray(zonotope["right_pinv"], dtype=np.float64),
         obstacle_margin=args.constraint_margin,
         obstacle_activation=args.constraint_activation,
-        obstacle_penalty=args.obstacle_penalty,
         constraint_rho=args.constraint_rho,
         constraint_admm_iters=args.constraint_admm_iters,
         constraint_admm_tol=args.constraint_admm_tol,
@@ -469,22 +473,29 @@ def run_constrained_rollout(
     solve_times_ms: list[float] = []
     ilqr_iterations: list[int] = []
     plan_costs: list[float] = []
-    plan_merits: list[float] = []
-    obstacle_penalties: list[float] = []
     active_constraints: list[float] = []
     admm_iterations: list[float] = []
+    solver_feasible: list[float] = []
     stop_reason = "max_mpc_steps"
 
     for _ in tqdm(range(args.constrained_max_mpc_steps), desc="Obstacle-aware MPC rollout"):
         current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
-        _, u_plan, solve_time, n_iters, plan_cost = mpc_solver.solve(current_state_np, goal_state_np)
+        x_plan, u_plan, solve_time, n_iters, plan_cost = mpc_solver.solve(current_state_np, goal_state_np)
         solve_times_ms.append(solve_time * 1000.0)
         ilqr_iterations.append(int(n_iters))
         plan_costs.append(float(plan_cost))
-        plan_merits.append(float(mpc_solver.last_solve_stats.get("merit", plan_cost)))
-        obstacle_penalties.append(float(mpc_solver.last_solve_stats.get("obstacle_penalty", 0.0)))
         active_constraints.append(float(mpc_solver.last_solve_stats.get("active_constraints", 0.0)))
         admm_iterations.append(float(mpc_solver.last_solve_stats.get("admm_iters", 0.0)))
+        solver_feasible.append(float(mpc_solver.last_solve_stats.get("feasible_final", 0.0)))
+
+        if float(mpc_solver.last_solve_stats.get("accepted", 0.0)) < 0.5:
+            stop_reason = "constraint_infeasible"
+            break
+
+        next_embedding_plan = np.asarray(x_plan[1, :embed_dim], dtype=np.float64)
+        if mpc_solver._state_inside_obstacle(next_embedding_plan):
+            stop_reason = "predicted_obstacle_violation"
+            break
 
         u0_norm = u_plan[0].astype(np.float32)
         u0_raw = planner.normalized_to_raw_action(u0_norm, action_mean, action_std)
@@ -513,6 +524,10 @@ def run_constrained_rollout(
         observation_goal_distances.append(planner.compute_observation_goal_distance(current_obs, goal_obs))
         latent_goal_distances.append(float(torch.linalg.vector_norm(current_state - goal_state_t).item()))
 
+        if mpc_solver._state_inside_obstacle(np.asarray(rollout_emb[-1][:embed_dim], dtype=np.float64)):
+            stop_reason = "observed_obstacle_violation"
+            break
+
         reached_goal, _ = planner.goal_reached(current_obs, goal_obs)
         if reached_goal:
             stop_reason = "goal_reached"
@@ -535,10 +550,9 @@ def run_constrained_rollout(
         "solve_times_ms": np.asarray(solve_times_ms, dtype=np.float32),
         "ilqr_iterations": np.asarray(ilqr_iterations, dtype=np.int32),
         "plan_costs": np.asarray(plan_costs, dtype=np.float32),
-        "plan_merits": np.asarray(plan_merits, dtype=np.float32),
-        "obstacle_penalties": np.asarray(obstacle_penalties, dtype=np.float32),
         "active_constraints": np.asarray(active_constraints, dtype=np.float32),
         "admm_iterations": np.asarray(admm_iterations, dtype=np.float32),
+        "solver_feasible": np.asarray(solver_feasible, dtype=np.float32),
         "stop_reason": stop_reason,
     }
 
@@ -740,22 +754,16 @@ def main() -> None:
     empirical_coverage = float(np.mean(heldout_inside))
     log_progress(f"Built obstacle zonotope with held-out coverage {empirical_coverage:.4f}.")
 
-    constrained_cache_path = infer_constrained_cache_path(out_root, checkpoint_path, args.episode_idx, obstacle_step, args)
-    if constrained_cache_path.is_file() and not args.force_rerun_constrained:
-        constrained = torch.load(constrained_cache_path, map_location="cpu", weights_only=False)
-    else:
-        log_progress("Running constrained rollout.")
-        constrained = run_constrained_rollout(
-            model=model,
-            config=config,
-            rollout=nominal,
-            zonotope=zonotope,
-            device=device,
-            frame_batch_size=args.frame_batch_size,
-            args=args,
-        )
-        constrained_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(constrained, constrained_cache_path)
+    log_progress("Running constrained rollout.")
+    constrained = run_constrained_rollout(
+        model=model,
+        config=config,
+        rollout=nominal,
+        zonotope=zonotope,
+        device=device,
+        frame_batch_size=args.frame_batch_size,
+        args=args,
+    )
 
     log_progress("Preparing overlays, videos, and comparison plots.")
     nominal_frames = np.asarray(nominal["rollout_frames"], dtype=np.uint8)
@@ -872,7 +880,6 @@ def main() -> None:
             "global_pca": global_pca,
             "local_pca": local_pca,
             "nominal_rollout_cache_path": str(nominal_cache_path),
-            "constrained_rollout_cache_path": str(constrained_cache_path),
             "background_rows": background_rows.astype(np.int64),
             "sampled_qpos": sampled_qpos.astype(np.float64),
             "obstacle_position_samples": position_samples.astype(np.float64),
@@ -888,12 +895,10 @@ def main() -> None:
             "episode_idx": int(args.episode_idx),
             "obstacle_step": int(obstacle_step),
             "nominal_rollout_cache_path": str(nominal_cache_path),
-            "constrained_rollout_cache_path": str(constrained_cache_path),
             "checkpoint_path": str(checkpoint_path),
             "background_dataset_path": str(background_dataset_path),
             "constraint_margin": float(args.constraint_margin),
             "constraint_activation": float(args.constraint_activation),
-            "obstacle_penalty": float(args.obstacle_penalty),
             "unconstrained_max_mpc_steps": int(args.unconstrained_max_mpc_steps),
             "constrained_max_mpc_steps": int(args.constrained_max_mpc_steps),
             "empirical_coverage": empirical_coverage,
@@ -902,13 +907,12 @@ def main() -> None:
             "nominal_final_obs_goal_distance": float(np.asarray(nominal["observation_goal_distances"], dtype=np.float64)[-1]),
             "constrained_final_obs_goal_distance": float(np.asarray(constrained["observation_goal_distances"], dtype=np.float64)[-1]),
             "constrained_mean_active_constraints": float(np.mean(np.asarray(constrained["active_constraints"], dtype=np.float64))) if np.asarray(constrained["active_constraints"]).size > 0 else 0.0,
-            "constrained_mean_obstacle_penalty": float(np.mean(np.asarray(constrained["obstacle_penalties"], dtype=np.float64))) if np.asarray(constrained["obstacle_penalties"]).size > 0 else 0.0,
+            "constrained_mean_solver_feasible": float(np.mean(np.asarray(constrained["solver_feasible"], dtype=np.float64))) if np.asarray(constrained["solver_feasible"]).size > 0 else 0.0,
         },
     )
 
     log_progress("Obstacle-aware planning complete.")
     print(f"Output dir: {episode_dir}")
-    print(f"Constrained rollout cache: {constrained_cache_path}")
 
 
 if __name__ == "__main__":
