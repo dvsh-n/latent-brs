@@ -24,9 +24,9 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data_random_50hz/reacher_random_expert.h5"
-DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft_1"
-DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_2"
+DEFAULT_DATASET_PATH = "reacher/data/train_data_noisy/reacher_test.h5"
+DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft_4"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_5"
 FIXED_FRAMESKIP = 1
 
 
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=24)
+    parser.add_argument("--embed-dim", type=int, default=9)
     parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)

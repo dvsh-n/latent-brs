@@ -25,17 +25,17 @@ from reacher.train.mlpdyn_train import LeWMReacherDataset
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
 DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_5"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "cuda"
 HORIZON = 20
-MAX_MPC_STEPS = 150
-Q_TERMINAL = 10.0
+MAX_MPC_STEPS = 100
+Q_TERMINAL = 5.0
 Q_STAGE = 0.005
-R_CONTROL = 0.1
+R_CONTROL = 0.001
 VIDEO_FPS = 60
-EPISODE_IDX = 829
+EPISODE_IDX = 520
 
 
 def parse_args() -> argparse.Namespace:

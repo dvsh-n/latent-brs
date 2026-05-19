@@ -33,7 +33,7 @@ from reacher.eval.reacher_policy_viz import (
 
 DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"
 DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac/vecnormalize.pkl"
-DEFAULT_OUTDIR = "reacher/data/train_data_noisy"
+DEFAULT_OUTDIR = "reacher/data/test_data_noisy"
 DEFAULT_OUTPUT_NAME = "reacher_test.h5"
 ROLLOUT_MODES = ("expert", "expert_plus_noise")
 DEFAULT_ROLLOUT_RATIOS = (0.4, 0.6)
@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=224)
     parser.add_argument("--quality", type=int, default=8)
     parser.add_argument("--compression", choices=("none", "lzf", "gzip"), default="lzf")
-    parser.add_argument("--device", default="mps")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--deterministic",
         action="store_true",
