@@ -1,0 +1,59 @@
+{
+  "output_model_name": "models/dinowm",
+  "subdir": "run_meta",
+  "seed": 42,
+  "dataset_name": "rope",
+  "cache_dir": null,
+  "n_steps": 4,
+  "frameskip": 1,
+  "batch_size": 128,
+  "num_workers": 8,
+  "train_split": 0.9,
+  "backbone": {
+    "name": "facebook/dinov2-small",
+    "type": "dinov2_small",
+    "is_video_encoder": false
+  },
+  "image_size": 224,
+  "patch_size": 14,
+  "wm": {
+    "history_size": 3,
+    "num_preds": 1,
+    "encoding": {
+      "action": 10
+    }
+  },
+  "predictor": {
+    "size": "small",
+    "depth": 6,
+    "heads": 16,
+    "mlp_dim": 2048,
+    "dim_head": 64,
+    "dropout": 0.1,
+    "emb_dropout": 0.0
+  },
+  "optimizer": {
+    "type": "AdamW",
+    "lr": 0.0005,
+    "weight_decay": 0.0
+  },
+  "trainer": {
+    "max_epochs": 10,
+    "strategy": "ddp",
+    "devices": "auto",
+    "accelerator": "gpu",
+    "precision": "16-mixed",
+    "gradient_clip_val": 1.0
+  },
+  "wandb": {
+    "enable": false,
+    "project": "stable-wm",
+    "entity": "stable-wm"
+  },
+  "dump_object": true,
+  "n_gpus": 1,
+  "cpus_per_task": 8,
+  "extra_dims": {
+    "action": 3
+  }
+}
