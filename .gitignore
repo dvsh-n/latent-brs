@@ -19,6 +19,7 @@ reacher/models/lewm_reacher*/
 *.pkl
 *.gif
 *.z**
+*.log
 **/runs/
 **/__pycache__/
 reacher/models/sam3

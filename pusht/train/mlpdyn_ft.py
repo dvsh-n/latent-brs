@@ -29,8 +29,8 @@ DEFAULT_DATASET_PATHS = [
     Path("pusht/data/pusht_diffusion_train.h5"),
     Path("pusht/data/pusht_diffusion_edge.h5"),
 ]
-DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_2"
+DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_2"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_3"
 FIXED_FRAMESKIP = 1
 
 
@@ -53,9 +53,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=48)
+    parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--markov-deriv", type=int, default=2)
-    parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
@@ -74,16 +74,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--load-projector",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Load projector weights from the init checkpoint.",
     )
     parser.add_argument(
         "--load-mlpdyn",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Load MLP dynamics weights from the init checkpoint.",
     )
-    parser.add_argument("--batch-size", type=int, default=110)
+    parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(

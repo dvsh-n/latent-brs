@@ -33,11 +33,12 @@ from reacher.eval.reacher_policy_viz import (
 
 DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"
 DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac/vecnormalize.pkl"
-DEFAULT_OUTDIR = "reacher/data/test_data_noisy"
-DEFAULT_OUTPUT_NAME = "reacher_test.h5"
-ROLLOUT_MODES = ("expert", "expert_plus_noise")
-DEFAULT_ROLLOUT_RATIOS = (0.4, 0.6)
+DEFAULT_OUTDIR = "reacher/data/obtuse_rollouts"
+DEFAULT_OUTPUT_NAME = "reacher_train.h5"
+ROLLOUT_MODES = ("expert", "expert_plus_noise", "obtuse")
+DEFAULT_ROLLOUT_RATIOS = (0.0, 0.0, 1.0)
 EXPERT_NOISE_STD = 2.0
+JOINT2_OBTUSE_MARGIN_RAD = 0.35
 
 # Local timing/video knobs.
 PHYSICS_FREQ_HZ = 50.0
@@ -57,13 +58,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=200_000,
+        default=None,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=10_000,
+        default=5_000,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -85,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ROLLOUT_RATIOS[1],
         help="Relative amount of noised expert trajectories to collect.",
+    )
+    parser.add_argument(
+        "--obtuse-ratio",
+        type=float,
+        default=DEFAULT_ROLLOUT_RATIOS[2],
+        help="Relative amount of trajectories that must flip joint 2 across the acute/obtuse boundary.",
     )
     parser.add_argument("--width", type=int, default=224)
     parser.add_argument("--height", type=int, default=224)
@@ -151,7 +158,7 @@ def clip_action_to_space(action: np.ndarray, env: object) -> np.ndarray:
 
 def rollout_probabilities(args: argparse.Namespace) -> np.ndarray:
     ratios = np.asarray(
-        [args.expert_ratio, args.expert_plus_noise_ratio],
+        [args.expert_ratio, args.expert_plus_noise_ratio, args.obtuse_ratio],
         dtype=np.float64,
     )
     if ratios.shape != (len(ROLLOUT_MODES),):
@@ -167,6 +174,13 @@ def rollout_probabilities(args: argparse.Namespace) -> np.ndarray:
 def sample_rollout_mode(args: argparse.Namespace, rng: np.random.Generator) -> str:
     probabilities = rollout_probabilities(args)
     return str(rng.choice(ROLLOUT_MODES, p=probabilities))
+
+
+def is_obtuse_rollout(states: np.ndarray, margin_rad: float = JOINT2_OBTUSE_MARGIN_RAD) -> bool:
+    if states.ndim != 2 or states.shape[1] < 2:
+        raise ValueError(f"Expected states with shape (T, >=2), got {states.shape}.")
+    joint2 = np.asarray(states[:, 1], dtype=np.float32)
+    return bool(np.min(joint2) <= -margin_rad and np.max(joint2) >= margin_rad)
 
 
 def collect_trajectory(
@@ -336,6 +350,7 @@ def main() -> None:
     step_counts: list[int] = []
     terminated_flags: list[bool] = []
     skipped_short = 0
+    skipped_obtuse_mismatch = 0
     seed_offset = 0
     rollout_mode_rng = np.random.default_rng(args.seed)
     rollout_mode_by_episode: list[str] = []
@@ -365,6 +380,7 @@ def main() -> None:
         h5.attrs["rollout_modes"] = json.dumps(list(ROLLOUT_MODES))
         h5.attrs["rollout_mode_probabilities"] = json.dumps(rollout_mode_probs.tolist())
         h5.attrs["expert_noise_std"] = EXPERT_NOISE_STD
+        h5.attrs["joint2_obtuse_margin_rad"] = JOINT2_OBTUSE_MARGIN_RAD
 
         ep_len_ds = create_resizable_dataset(h5, "ep_len", (), np.int64, chunks=True)
         ep_offset_ds = create_resizable_dataset(h5, "ep_offset", (), np.int64, chunks=True)
@@ -411,6 +427,9 @@ def main() -> None:
                     max_blank_steps=args.max_blank_steps,
                     rollout_mode=rollout_mode,
                 )
+                if rollout_mode == "obtuse" and not is_obtuse_rollout(states):
+                    skipped_obtuse_mismatch += 1
+                    continue
                 if actions.shape[0] < args.min_steps:
                     skipped_short += 1
                     continue
@@ -455,6 +474,7 @@ def main() -> None:
                     episodes=len(step_counts),
                     transitions=int(np.sum(step_counts, dtype=np.int64)),
                     skipped=skipped_short,
+                    obtuse_skipped=skipped_obtuse_mismatch,
                 )
 
         ep_len = np.asarray(ep_len_ds[:], dtype=np.int64)
@@ -463,6 +483,7 @@ def main() -> None:
         h5.attrs["total_frames"] = int(pixels_ds.shape[0])
         h5.attrs["total_transitions"] = total_transitions
         h5.attrs["skipped_short_episodes"] = skipped_short
+        h5.attrs["skipped_obtuse_mismatch_episodes"] = skipped_obtuse_mismatch
         h5.attrs["mean_reward"] = float(np.mean(rewards)) if rewards else 0.0
         h5.attrs["mean_episode_steps"] = float(np.mean(step_counts)) if step_counts else 0.0
         h5.attrs["usable_train_windows_default"] = valid_training_windows(ep_len)
@@ -481,9 +502,12 @@ def main() -> None:
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
         "terminated_episodes": int(np.sum(terminated_flags, dtype=np.int64)),
         "skipped_short_episodes": skipped_short,
+        "skipped_obtuse_mismatch_episodes": skipped_obtuse_mismatch,
         "expert_episodes": int(sum(mode == "expert" for mode in rollout_mode_by_episode)),
         "expert_plus_noise_episodes": int(sum(mode == "expert_plus_noise" for mode in rollout_mode_by_episode)),
+        "obtuse_episodes": int(sum(mode == "obtuse" for mode in rollout_mode_by_episode)),
         "expert_noise_std": EXPERT_NOISE_STD,
+        "joint2_obtuse_margin_rad": JOINT2_OBTUSE_MARGIN_RAD,
         "usable_train_windows_default": valid_training_windows(np.asarray(step_counts, dtype=np.int64) + 1)
         if step_counts
         else 0,

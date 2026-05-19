@@ -21,21 +21,20 @@ from tqdm.auto import tqdm
 import json
 
 from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
-from reacher.train.mlpdyn_train import LeWMReacherDataset
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_5"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/obtuse_rollouts/reacher_train.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_7"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "cuda"
 HORIZON = 20
 MAX_MPC_STEPS = 100
-Q_TERMINAL = 5.0
+Q_TERMINAL = 10.0
 Q_STAGE = 0.005
-R_CONTROL = 0.001
+R_CONTROL = 0.1
 VIDEO_FPS = 60
-EPISODE_IDX = 520
+EPISODE_IDX = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +77,52 @@ def load_config(model_dir: Path) -> dict[str, object]:
         raise FileNotFoundError(f"Model config not found: {config_path}")
     with config_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def resolve_training_dataset_paths(dataset_config: object, default_dataset_path: Path) -> list[Path]:
+    if dataset_config is None:
+        raw_paths = [default_dataset_path]
+    elif isinstance(dataset_config, (str, Path)):
+        raw_paths = [dataset_config]
+    elif isinstance(dataset_config, list):
+        if not dataset_config:
+            raise ValueError("Training config dataset_path is an empty list.")
+        raw_paths = dataset_config
+    else:
+        raise TypeError(f"Unsupported dataset_path config type: {type(dataset_config).__name__}.")
+
+    dataset_paths = [Path(str(path)).expanduser().resolve() for path in raw_paths]
+    missing_paths = [path for path in dataset_paths if not path.is_file()]
+    if missing_paths:
+        missing_str = ", ".join(str(path) for path in missing_paths)
+        raise FileNotFoundError(f"Training dataset file not found: {missing_str}")
+    return dataset_paths
+
+
+def load_action_stats(dataset_paths: list[Path], action_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    total_count = 0
+    action_sum = np.zeros((action_dim,), dtype=np.float64)
+    action_sq_sum = np.zeros((action_dim,), dtype=np.float64)
+
+    for dataset_path in dataset_paths:
+        with h5py.File(dataset_path, "r") as h5:
+            if int(h5["action"].shape[-1]) != action_dim:
+                raise ValueError(f"Expected action_dim={action_dim}, got {h5['action'].shape[-1]} in {dataset_path}.")
+            actions = np.asarray(h5["action"][:], dtype=np.float32)
+        finite_actions = actions[~np.isnan(actions).any(axis=1)]
+        if finite_actions.size == 0:
+            continue
+        total_count += int(finite_actions.shape[0])
+        action_sum += finite_actions.sum(axis=0, dtype=np.float64)
+        action_sq_sum += np.square(finite_actions, dtype=np.float64).sum(axis=0, dtype=np.float64)
+
+    if total_count == 0:
+        raise ValueError("No finite actions found across the configured training datasets.")
+
+    action_mean = action_sum / total_count
+    action_var = np.maximum(action_sq_sum / total_count - np.square(action_mean), 0.0)
+    action_std = np.maximum(np.sqrt(action_var), 1e-6)
+    return action_mean.astype(np.float32, copy=False), action_std.astype(np.float32, copy=False)
 
 
 def require_device(device_arg: str) -> torch.device:
@@ -343,6 +388,7 @@ class ILQRMPCSolver:
         self,
         dynamics: MarkovDynamicsTorch,
         *,
+        state_cost_dim: int,
         horizon: int,
         q_terminal: float,
         q_stage: float,
@@ -354,6 +400,7 @@ class ILQRMPCSolver:
     ) -> None:
         self.dynamics = dynamics
         self.state_dim = dynamics.state_dim
+        self.state_cost_dim = int(state_cost_dim)
         self.action_dim = dynamics.action_dim
         self.horizon = int(horizon)
         self.q_terminal = float(q_terminal)
@@ -363,10 +410,23 @@ class ILQRMPCSolver:
         self.tol = float(tol)
         self.regularization = float(regularization)
         self.device = device
+        if self.state_cost_dim <= 0 or self.state_cost_dim > self.state_dim:
+            raise ValueError(
+                f"state_cost_dim must be in [1, {self.state_dim}], got {self.state_cost_dim}."
+            )
         self.prev_u_guess = torch.zeros((self.horizon, self.action_dim), dtype=torch.float32, device=device)
         self.eye_x = torch.eye(self.state_dim, dtype=torch.float32, device=device)
+        self.eye_x_cost = torch.zeros((self.state_dim, self.state_dim), dtype=torch.float32, device=device)
+        self.eye_x_cost[: self.state_cost_dim, : self.state_cost_dim] = torch.eye(
+            self.state_cost_dim, dtype=torch.float32, device=device
+        )
         self.eye_u = torch.eye(self.action_dim, dtype=torch.float32, device=device)
         self.line_search_alphas = (1.0, 0.5, 0.25, 0.1, 0.05, 0.01)
+
+    def _state_error(self, x: torch.Tensor, x_goal: torch.Tensor) -> torch.Tensor:
+        err = torch.zeros_like(x)
+        err[: self.state_cost_dim] = x[: self.state_cost_dim] - x_goal[: self.state_cost_dim]
+        return err
 
     def _make_initial_action_guess(self) -> torch.Tensor:
         if self.horizon <= 1:
@@ -388,10 +448,10 @@ class ILQRMPCSolver:
     def _trajectory_cost(self, x_traj: torch.Tensor, u_seq: torch.Tensor, x_goal: torch.Tensor) -> torch.Tensor:
         cost = torch.zeros((), dtype=x_traj.dtype, device=x_traj.device)
         for step in range(self.horizon):
-            state_err = x_traj[step] - x_goal
+            state_err = self._state_error(x_traj[step], x_goal)
             cost = cost + self.q_stage * torch.dot(state_err, state_err)
             cost = cost + self.r_control * torch.dot(u_seq[step], u_seq[step])
-        terminal_err = x_traj[self.horizon] - x_goal
+        terminal_err = self._state_error(x_traj[self.horizon], x_goal)
         cost = cost + self.q_terminal * torch.dot(terminal_err, terminal_err)
         return cost
 
@@ -435,20 +495,20 @@ class ILQRMPCSolver:
             k_seq = torch.empty((self.horizon, self.action_dim), dtype=torch.float32, device=self.device)
             kk_seq = torch.empty((self.horizon, self.action_dim, self.state_dim), dtype=torch.float32, device=self.device)
 
-            terminal_err = x_traj[self.horizon] - x_goal
+            terminal_err = self._state_error(x_traj[self.horizon], x_goal)
             v_x = 2.0 * self.q_terminal * terminal_err
-            v_xx = 2.0 * self.q_terminal * self.eye_x
+            v_xx = 2.0 * self.q_terminal * self.eye_x_cost
             backward_ok = True
 
             for step in range(self.horizon - 1, -1, -1):
-                x_err = x_traj[step] - x_goal
+                x_err = self._state_error(x_traj[step], x_goal)
                 u = u_seq[step]
                 a = a_seq[step]
                 b = b_seq[step]
 
                 l_x = 2.0 * self.q_stage * x_err
                 l_u = 2.0 * self.r_control * u
-                l_xx = 2.0 * self.q_stage * self.eye_x
+                l_xx = 2.0 * self.q_stage * self.eye_x_cost
                 l_uu = 2.0 * self.r_control * self.eye_u
 
                 q_x = l_x + a.T @ v_x
@@ -546,18 +606,9 @@ def main() -> None:
     embed_dim = int(config.get("embed_dim", 18))
     markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
 
-    train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
-    train_stats_dataset = LeWMReacherDataset(
-        train_dataset_path,
-        history_size=history_size,
-        num_preds=1,
-        frameskip=int(config.get("frameskip", 1)),
-        img_size=img_size,
-        action_dim=action_dim,
-    )
+    train_dataset_paths = resolve_training_dataset_paths(config.get("dataset_path"), dataset_path)
     pixel_mean, pixel_std = imagenet_pixel_stats(device)
-    action_mean = train_stats_dataset.action_mean.astype(np.float32)
-    action_std = train_stats_dataset.action_std.astype(np.float32)
+    action_mean, action_std = load_action_stats(train_dataset_paths, action_dim)
 
     with h5py.File(dataset_path, "r") as h5:
         ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
@@ -630,6 +681,7 @@ def main() -> None:
     dynamics = MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
     mpc_solver = ILQRMPCSolver(
         dynamics,
+        state_cost_dim=embed_dim,
         horizon=args.horizon,
         q_terminal=args.q_terminal,
         q_stage=args.q_stage,
