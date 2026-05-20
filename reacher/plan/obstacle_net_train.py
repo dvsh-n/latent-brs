@@ -38,7 +38,7 @@ DEFAULT_ROLLOUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn/1779300191_episode_00163"
 DEFAULT_NOMINAL_ROLLOUT_NAME = "nominal_rollout.pt"
 DEFAULT_ROLLOUT_PATH = str(Path(DEFAULT_ROLLOUT_DIR) / DEFAULT_NOMINAL_ROLLOUT_NAME)
 DEFAULT_OUT_DIR = str(Path(DEFAULT_ROLLOUT_DIR) / "obstacle_net")
-DEFAULT_OBSTACLE_STEP = -1
+DEFAULT_OBSTACLE_STEP = 10
 DEFAULT_OVERLAY_PERTURB_ALPHA = 0.035
 
 
@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obstacle-step", type=int, default=DEFAULT_OBSTACLE_STEP)
     parser.add_argument("--frame-batch-size", type=int, default=32)
 
-    parser.add_argument("--joint1-range", type=float, default=0.25)
+    parser.add_argument("--joint1-range", type=float, default=0.15)
     parser.add_argument("--joint2-range", type=float, default=0.15)
     parser.add_argument("--obstacle-sample-count", type=int, default=2048)
     parser.add_argument("--outside-sample-count", type=int, default=2048)
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-frac", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--force-retrain", action="store_true", default=False)
+    parser.add_argument("--force-retrain", action="store_true", default=True)
     return parser.parse_args()
 
 
@@ -301,9 +301,12 @@ def sample_outside_qpos(
     accepted: list[np.ndarray] = []
     remaining = int(count)
     attempts = 0
+    valid_width = np.isfinite(lower) & np.isfinite(upper) & ((upper - lower) > 1e-8)
     while remaining > 0 and attempts < max_resample_factor:
         batch_count = max(remaining * 2, 256)
         sampled = rng.uniform(lower[None, :], upper[None, :], size=(batch_count, center_qpos.shape[0]))
+        if np.any(~valid_width):
+            sampled[:, ~valid_width] = rng.uniform(-np.pi, np.pi, size=(batch_count, int(np.sum(~valid_width))))
         delta = np.abs(sampled - center_qpos[None, :])
         keep = np.any(delta > obstacle_ranges[None, :], axis=1)
         kept = sampled[keep]
@@ -396,7 +399,17 @@ def sample_local_perturbations(
     count: int,
 ) -> np.ndarray:
     noise = rng.uniform(-joint_ranges, joint_ranges, size=(count, center_qpos.shape[0]))
-    return np.clip(center_qpos[None, :] + noise, lower[None, :], upper[None, :]).astype(np.float64)
+    sampled = center_qpos[None, :] + noise
+    valid_width = np.isfinite(lower) & np.isfinite(upper) & ((upper - lower) > 1e-8)
+    if np.any(valid_width):
+        sampled[:, valid_width] = np.clip(
+            sampled[:, valid_width],
+            lower[None, valid_width],
+            upper[None, valid_width],
+        )
+    if np.any(~valid_width):
+        sampled[:, ~valid_width] = ((sampled[:, ~valid_width] + np.pi) % (2.0 * np.pi)) - np.pi
+    return sampled.astype(np.float64)
 
 
 def render_qpos_batch(
