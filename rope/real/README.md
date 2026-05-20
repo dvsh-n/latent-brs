@@ -26,7 +26,6 @@ two-arm/table/rope task frame.
 - `rope/data/iiwa_hardware.py`: Drake LCM station for the two iiwas.
 - `rope/data/iiwa_cartesian_ik.py`: Drake single-arm Cartesian IK helper for manual tests.
 - `rope/data/home_bimanual_7d.py`: conservative homing script.
-- `rope/data/rope_hardware_preflight.py`: no-rope guarded motion preflight.
 - `rope/data/test_bimanual_cartesian_motion.py`: small Cartesian hardware sanity test.
 - `rope/data/motion_bimanual_position.py`: larger manual Cartesian waypoint motion.
 - `rope/data/rope_real_data_gen.py`: real dataset collector.
@@ -49,11 +48,6 @@ left_q[0:7], right_q[0:7]
 
 Use `--arm-mapping robot1-left` only if the physical setup is swapped.
 
-The two arms are not supposed to move to the exact same Cartesian point. A rope
-task target is `[reach, height, width]`: both endpoints share reach and height,
-while the left endpoint is at `+width/2` in y and the right endpoint is at
-`-width/2` in y.
-
 ## Lab Run Sequence
 
 Run everything from the repo root on the lab machine that has Drake and can see
@@ -65,20 +59,7 @@ the iiwa LCM channels.
 python3 rope/data/home_bimanual_7d.py
 ```
 
-2. No-rope guarded rope-task preflight:
-
-```bash
-python3 rope/data/rope_hardware_preflight.py \
-  --reset-duration 12.0 \
-  --cycles 1 \
-  --i-understand-this-moves-real-robots
-```
-
-This moves from the measured current joint state into the center of the rope
-task workspace, then runs a tiny smooth reach/height/width wiggle. It does not
-need rope or clamps attached.
-
-3. Optional small Cartesian sanity test:
+2. Optional small Cartesian sanity test:
 
 ```bash
 python3 rope/data/test_bimanual_cartesian_motion.py
@@ -87,20 +68,19 @@ python3 rope/data/test_bimanual_cartesian_motion.py
 Skip this if homing and LCM status are already known-good. The real collector
 does not depend on this script.
 
-4. Do one short collection dry run with collision guard enabled:
+3. Do one short collection dry run with collision guard enabled:
 
 ```bash
 python3 rope/data/rope_real_data_gen.py \
   --robot-backend drake-lcm \
   --num-trajectories 1 \
   --max-episode-steps 20 \
-  --reset-duration 8.0 \
   --save-mp4 \
   --camera-index 0 \
   --i-understand-this-moves-real-robots
 ```
 
-5. Inspect the generated MP4 and HDF5 before collecting more:
+4. Inspect the generated MP4 and HDF5 before collecting more:
 
 ```bash
 python3 - <<'PY'
@@ -118,7 +98,7 @@ with h5py.File(path, "r") as h5:
 PY
 ```
 
-6. Collect a larger run after the dry run looks sane:
+5. Collect a larger run after the dry run looks sane:
 
 ```bash
 python3 rope/data/rope_real_data_gen.py \
