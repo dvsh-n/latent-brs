@@ -14,8 +14,8 @@ from tqdm import tqdm
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 
 # --- Re-defined Constants from mlpdyn_eval to break circular import ---
-DEFAULT_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_1"
+DEFAULT_DATASET_PATH = "reacher/data/test_data_50hz_random/reacher_test.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_7"
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
@@ -109,14 +109,23 @@ def main():
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--out-file", type=Path, default="lewm_one_step_error_data.pt")
     parser.add_argument("--frame-batch-size", type=int, default=128)
+    
+    # Add these as command-line arguments so they have safe defaults
+    parser.add_argument("--history-size", type=int, default=1) 
+    parser.add_argument("--num-preds", type=int, default=1)
+    parser.add_argument("--frameskip", type=int, default=1)
+    parser.add_argument("--img-size", type=int, default=224)
+    parser.add_argument("--action-dim", type=int, default=2)
     args = parser.parse_args()
 
     with open(args.model_dir / "config.json") as f:
         config = json.load(f)
     
-    # Config injection
+    # Safe Config injection: only overwrite if the key exists AND isn't None
     for k in ["history_size", "num_preds", "frameskip", "img_size", "action_dim"]:
-        setattr(args, k, config.get(k))
+        val = config.get(k)
+        if val is not None:
+            setattr(args, k, val)
 
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -125,11 +134,11 @@ def main():
     else:
         device = torch.device("cpu")
 
-        
     model = torch.load(latest_object_checkpoint(args.model_dir), map_location=device, weights_only=False).eval()
     
     with h5py.File(args.dataset_path, "r") as h5:
         ep_len = h5["ep_len"][:]
+        
     valid_indices = np.flatnonzero(ep_len - 1 - (args.history_size + args.num_preds) * args.frameskip >= 0)
 
     all_x, all_a, all_e = [], [], []
@@ -140,6 +149,7 @@ def main():
 
     torch.save({"x_t": torch.cat(all_x), "a_t": torch.cat(all_a), "error": torch.cat(all_e)}, args.out_file)
     print(f"Saved {len(torch.cat(all_x))} transitions to {args.out_file}")
+
 
 if __name__ == "__main__":
     main()

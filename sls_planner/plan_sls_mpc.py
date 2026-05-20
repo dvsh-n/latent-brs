@@ -279,6 +279,7 @@ def main():
     model = torch.load(checkpoint_path, map_location=device, weights_only=False).to(device).eval()
     
     state_dim = config_dict.get("markov_state_dim", 2 * config_dict.get("embed_dim", 18))
+    # breakpoint()
     action_dim = config_dict.get("action_dim", 2)
     img_size = config_dict.get("img_size", 224)
 
@@ -331,12 +332,12 @@ def main():
 
 
     # State tracking weights (using format from mpc_neural.py)
-    W_state = jnp.ones((state_dim,))* 0.002
+    W_state = jnp.ones((state_dim,))* 10.0
     # make the last 18 dimensions (the embedding) more important to track than the delta dimensions
-    W_state = W_state.at[state_dim // 2 :].set(0.2)  # You can adjust this weighting as needed
-    W_term = jnp.ones((state_dim,))*0.10   # Terminal cost weight to ensure we prioritize reaching the goal state
-    W_term = W_term.at[:state_dim // 2].set(1000.0)  # Heavily weight the embedding dimensions at the terminal state
-    cost = make_tracking_cost(action_weight=0.0001, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state)  # W_term will be set later after we get the goal state
+    W_state = W_state.at[state_dim // 2 :].set(1.0)  # You can adjust this weighting as needed
+    W_term = jnp.ones((state_dim,))*0.1   # Terminal cost weight to ensure we prioritize reaching the goal state
+    W_term = W_term.at[:state_dim // 2].set(4000.0)  # Heavily weight the embedding dimensions at the terminal state
+    cost = make_tracking_cost(action_weight=0.01, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state)  # W_term will be set later after we get the goal state
 
     save_rgb_image(run_dir / "start_image.png", pixels_np[0])
     save_rgb_image(run_dir / "goal_image.png", pixels_np[-1])
@@ -364,8 +365,8 @@ def main():
     
     admm_cfg = ADMMConfig(
         eps_abs=1e-2, 
-        eps_rel=0,
-        rho_max=1e3, 
+        eps_rel=1e-4,
+        rho_max=1e2, 
         max_iterations=400,
         rho_update_frequency=20,
         initial_rho=1.0,

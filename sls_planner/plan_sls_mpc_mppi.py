@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Plan in Reacher pixel space using Conformal SLS MPC over a Markov-state PyTorch world model."""
-
-# from __future__ import annotations
+"""Plan in Reacher pixel space using Conformal SLS MPC warmstarted by MPPI over a Markov-state world model."""
 
 import os
 import sys
@@ -9,11 +7,9 @@ import re
 import time
 import json
 from pathlib import Path
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Optional
 
-
-# If macOS, use glfw, otherwise default to egl (Linux/headless)
 if sys.platform == "darwin":
     os.environ.setdefault("MUJOCO_GL", "glfw")
 else:
@@ -25,12 +21,10 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 import pyrallis
-import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
-from jax import config
-# Adopted from mpc_neural.py precision settings
+from jax import config, lax
 config.update("jax_default_matmul_precision", "highest")
 config.update("jax_enable_x64", True)
 
@@ -41,17 +35,20 @@ from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.utils.constraint_utils import combine_constraints, make_state_box_constraints
 
+# MPPI planner imports
+from gpu_sls.mppi_planner import MPPIPlanner
+
 # Local reacher imports
 from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.mlpdyn_train import LeWMReacherDataset
-from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
+from reacher.train.reacher_policy_train import DmControlGymEnv
 from error_model import MGNLLPredictor
 
 # --- Configuration Dataclass ---
 @dataclass
 class PlanSLSConfig:
-    """Configuration for Conformal SLS MPC Planning"""
-    q_learned: float = field(default=0.0, metadata={"help": "Conformal quantile for the disturbance bound (required)."})
+    """Configuration for Conformal SLS MPC Planning with MPPI Warmstart"""
+    q_learned: float = field(default=0.0, metadata={"help": "Conformal quantile for the disturbance bound."})
     model_dir: Path = field(default=Path("reacher/models/mlpdyn_ft_1"))
     error_model_ckpt: Path = field(default=Path("reacher/models/error_model/best-error-model.ckpt"))
     dataset_path: Path = field(default=Path("reacher/data/test_data_50hz/reacher_test.h5"))
@@ -62,15 +59,21 @@ class PlanSLSConfig:
     video_fps: int = field(default=60)
     episode_idx: Optional[int] = field(default=None)
     seed: int = field(default=42)
+    
+    # MPPI configuration fields
+    mppi_samples: int = 512
+    mppi_update_iter: int = 5
+    mppi_reward_weight: float = 20.0
+    mppi_noise_level: float = 0.15
+    mppi_beta_filter: float = 0.7
 
-# --- JAX / PyTorch Bridge ---
+
+# --- JAX / PyTorch Bridge & Rollout Utils ---
 
 def build_jax_dynamics(torch_dynamics_net: torch.nn.Module, device: torch.device, state_dim: int, action_dim: int):
-    """Wraps a PyTorch MLP into a JAX-differentiable function using custom_vjp."""
-    
+    """Wraps a PyTorch MLP into a JAX-differentiable function."""
     def _fwd_fn(x_np, u_np):
         with torch.no_grad():
-            # Add np.asarray() around inputs
             x_t = torch.from_numpy(np.array(x_np)).float().to(device)
             u_t = torch.from_numpy(np.array(u_np)).float().to(device)
             inp = torch.cat((x_t, u_t), dim=-1)
@@ -81,17 +84,13 @@ def build_jax_dynamics(torch_dynamics_net: torch.nn.Module, device: torch.device
             return np.asarray(out.cpu().numpy(), dtype=np.float64)
 
     def _vjp_fn(x_np, u_np, g_np):
-        # Add np.asarray() around inputs
         x_t = torch.from_numpy(np.array(x_np)).float().to(device).requires_grad_(True)
         u_t = torch.from_numpy(np.array(u_np)).float().to(device).requires_grad_(True)
         inp = torch.cat((x_t, u_t), dim=-1)
-        
         if inp.ndim == 1:
             out = torch_dynamics_net(inp.unsqueeze(0)).squeeze(0)
         else:
             out = torch_dynamics_net(inp)
-            
-        # Add np.asarray() around inputs
         g_t = torch.from_numpy(np.asarray(g_np)).float().to(device)
         out.backward(g_t)
         return np.asarray(x_t.grad.cpu().numpy(), dtype=np.float64), np.asarray(u_t.grad.cpu().numpy(), dtype=np.float64)
@@ -115,21 +114,42 @@ def build_jax_dynamics(torch_dynamics_net: torch.nn.Module, device: torch.device
     jax_dynamics.defvjp(jax_dynamics_fwd, jax_dynamics_bwd)
     return jax_dynamics
 
+
+def make_mppi_rollout_and_eval(jax_dynamics_fn, state_dim, action_dim, horizon, W_state, goal_state):
+    """Creates rollout and evaluation hooks compatible with sampling planners."""
+    def mppi_rollout_fn(state_cur, act_seqs, reach_config=None):
+        B = act_seqs.shape[0]
+        
+        def single_sample_rollout(actions):
+            def step(state, u):
+                next_state = jax_dynamics_fn(state, u, 0.0, 1.0)
+                return next_state, next_state
+            _, states = lax.scan(step, state_cur, actions)
+            return states
+
+        state_seqs = jax.vmap(single_sample_rollout)(act_seqs)
+        return state_seqs, {}
+
+    def mppi_eval_fn(state_seqs, act_seqs, reach_config=None, aux=None, *args, **kwargs):
+        delta = state_seqs - goal_state[None, None, :]
+        stage_costs = jnp.sum(W_state[None, None, :] * (delta ** 2), axis=-1)
+        action_costs = 0.01 * jnp.sum(act_seqs ** 2, axis=-1)
+        total_costs = jnp.sum(stage_costs + action_costs, axis=-1)
+        return {"rewards": -total_costs}
+
+    return mppi_rollout_fn, mppi_eval_fn
+
+
 def build_jax_disturbance(error_model: torch.nn.Module, q_learned: float, device: torch.device, state_dim: int, action_dim: int):
-    """Wraps the Conformal MGNLL Error model into a JAX callable for SLS E matrices."""
-    
+    """Wraps the Conformal MGNLL Error model into a JAX callable."""
     def _dist_fn(X_prefix_np, U_prefix_np):
         with torch.no_grad():
             X_t = torch.from_numpy(np.array(X_prefix_np)).float().to(device)
             U_t = torch.from_numpy(np.array(U_prefix_np)).float().to(device)
-            
             if X_t.ndim == 1:
                 X_t = X_t.unsqueeze(0)
                 U_t = U_t.unsqueeze(0)
-            
-            # Concatenate the true planned states and actions (36 + 2 = 38 dims)
             model_input = torch.cat([X_t, U_t], dim=-1)
-            
             L = error_model(model_input) 
             E = q_learned * L
             return np.asarray(E.cpu().numpy(), dtype=np.float64)
@@ -137,7 +157,6 @@ def build_jax_disturbance(error_model: torch.nn.Module, q_learned: float, device
     def jax_disturbance(X_prefix, U_prefix):
         T = X_prefix.shape[0]
         result_shape = jax.ShapeDtypeStruct((T, state_dim, state_dim), jnp.float64)
-        # Add U_prefix to the pure_callback arguments
         return jax.pure_callback(_dist_fn, result_shape, X_prefix, U_prefix, vmap_method="sequential")
         
     return jax_disturbance
@@ -145,15 +164,10 @@ def build_jax_disturbance(error_model: torch.nn.Module, q_learned: float, device
 # --- Cost and Constraints ---
 
 def make_tracking_cost(action_weight: float = 0.1, horizon: int = 35, W_term: Optional[jnp.ndarray] = None, goal_state: Optional[jnp.ndarray] = None):
-    """Quadratic tracking cost with a terminal weight/reference branch using JAX primitives."""
     def cost(W, reference, z, u, t):
-        # Use jnp.where for branching on the traced index 't'
         is_not_terminal = (t < horizon)
-        
-        # Select appropriate weight and reference for stage vs terminal cost
         active_W = jnp.where(is_not_terminal, W, W_term)
         active_ref = jnp.where(is_not_terminal, reference[t], goal_state)
-        
         dz = z - active_ref
         return jnp.sum(active_W * dz**2) + action_weight * jnp.sum(u**2)
     return cost
@@ -164,7 +178,7 @@ def make_control_box_constraints(u_min, u_max):
         return jnp.concatenate([u - u_max, u_min - u], axis=0)
     return constraints
 
-# --- Setup Utilities ---
+# --- Setup Helpers ---
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
@@ -259,8 +273,13 @@ def reset_env_to_state(env: DmControlGymEnv, *, seed: int, qpos: np.ndarray, qve
     env._last_action = np.zeros_like(env.action_space.low, dtype=np.float32)
     return physics.render(height=height, width=width, camera_id=0)
 
-# --- Main Pipeline ---
+def shift_warmstart(X: jnp.ndarray, U: jnp.ndarray):
+    X_shift = jnp.concatenate([X[1:], X[-1:]], axis=0)
+    U_shift = jnp.concatenate([U[1:], U[-1:]], axis=0)
+    return X_shift, U_shift
 
+
+# --- Main Pipeline ---
 
 def main():
     cfg = pyrallis.parse(config_class=PlanSLSConfig)
@@ -323,96 +342,89 @@ def main():
     run_dir = out_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Subfolder specifically allocated for keeping grid subplot images
-    tube_plots_dir = run_dir / "tube_plots"
-    tube_plots_dir.mkdir(parents=True, exist_ok=True)
-
-    # 5. Goal State Extraction
+    # 5. Goal State Extraction & Cost Weights Setup
     pixels_t = preprocess_pixels(pixels_np, img_size=img_size, pixel_mean=pixel_mean, pixel_std=pixel_std)
     true_latents = encode_frames(model, pixels_t, device=device, frame_batch_size=32)
     start_state = make_markov_state(true_latents[0]).detach().cpu().numpy().astype(np.float64)
     goal_state = make_markov_state(true_latents[-1]).detach().cpu().numpy().astype(np.float64)
     goal_obs = obs_np[-1].astype(np.float32)
 
-
-    # State tracking weights (using format from mpc_neural.py)
-    W_state = jnp.ones((state_dim,))* 1.0
-    # make the last 18 dimensions (the embedding) more important to track than the delta dimensions
-    W_state = W_state.at[state_dim // 2 :].set(0.01)  # You can adjust this weighting as needed
-    W_term = jnp.ones((state_dim,))*0.01   # Terminal cost weight to ensure we prioritize reaching the goal state
-    W_term = W_term.at[:state_dim // 2].set(3.0)  # Heavily weight the embedding dimensions at the terminal state
-    cost = make_tracking_cost(action_weight=0.001, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state)  # W_term will be set later after we get the goal state
+    W_state = jnp.ones((state_dim,)) * 10.0
+    W_state = W_state.at[state_dim // 2 :].set(1.0)
+    W_term = jnp.ones((state_dim,)) * 0.1
+    W_term = W_term.at[:state_dim // 2].set(4000.0)
+    cost = make_tracking_cost(action_weight=0.01, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state)
 
     save_rgb_image(run_dir / "start_image.png", pixels_np[0])
     save_rgb_image(run_dir / "goal_image.png", pixels_np[-1])
 
-    # 6. SLS Configuration
+    # 6. MPPI Planner Configuration & Setup
+    mppi_config_dict = {
+        "planning": {
+            "action_dim": action_dim,
+            "n_sample": cfg.mppi_samples,
+            "horizon": cfg.horizon,
+            "n_update_iter": cfg.mppi_update_iter,
+            "use_last": True,
+            "reject_bad": False,
+            "mppi": {
+                "reward_weight": cfg.mppi_reward_weight,
+                "noise_level": cfg.mppi_noise_level,
+                "noise_decay": 1.0,
+                "beta_filter": cfg.mppi_beta_filter
+            }
+        }
+    }
+    
+    mppi_rollout, mppi_eval = make_mppi_rollout_and_eval(
+        dynamics, state_dim, action_dim, cfg.horizon, W_state, goal_state
+    )
+    
+    u_min, u_max = -500.0 * jnp.ones(action_dim), 500.0 * jnp.ones(action_dim)
+    mppi_planner = MPPIPlanner(
+        config=mppi_config_dict,
+        model_rollout_fn=mppi_rollout,
+        evaluate_traj_fn=mppi_eval,
+        action_lower_lim=u_min,
+        action_upper_lim=u_max
+    )
+
+    # Clean standard JAX closure wrapper to maintain strict jax.jit tracking compatibility
+    def standard_mppi_jit_wrapper(key, state, init_act):
+        return mppi_planner.trajectory_optimization(key, state, init_act, skip=False)
+
+    jit_mppi_trajopt = jax.jit(standard_mppi_jit_wrapper)
+
+    # 7. SLS Solver Configuration
     sls_cfg = SLSConfig(
-        max_sls_iterations=1,        # Fixed: Changed from 1 to 2 to trigger robust optimization steps
+        max_sls_iterations=1,
         sls_primal_tol=1e-2,
-        # enable_fastsls=False,
-        enable_fastsls=True,
-        max_initial_sqp_iterations=0,
+        enable_fastsls=False,
         initialize_nominal=True,
-        warm_start=True,             # Fixed: Warm start enabled to preserve structured tubes across loops
-        rti=False,                   # Fixed: RTI disabled to guarantee full loop synthesis
-        # Replicate Q_bar/R_bar format from mpc_neural for GenericMPC footprint
-        R_bar = None, # jnp.broadcast_to(jnp.eye(action_dim) * 0.1, (cfg.horizon, action_dim, action_dim)),
-        Q_bar = None, # jnp.broadcast_to(jnp.eye(state_dim) * 10.0, (cfg.horizon + 1, state_dim, state_dim)),
+        warm_start=True, # Modified to use warmstarts from MPPI
+        rti=True,
+        R_bar=None,
+        Q_bar=None,
     )
-    
-    sqp_cfg = SQPConfig(
-        max_sqp_iterations=3, 
-        warm_start=False,
-        feas_tol=1e-2, 
-        step_tol=1e-4,
-        line_search=False
-    )
-    
-    admm_cfg = ADMMConfig(
-        eps_abs=1e-2, 
-        eps_rel=1e-4,
-        rho_max=1e2, 
-        max_iterations=200,
-        rho_update_frequency=20,
-        initial_rho=1.0,
-    )
+    sqp_cfg = SQPConfig(max_sqp_iterations=1, warm_start=False, feas_tol=1e-2, step_tol=1e-4, line_search=False)
+    admm_cfg = ADMMConfig(eps_abs=1e-2, eps_rel=1e-4, rho_max=1e2, max_iterations=400, rho_update_frequency=20, initial_rho=1.0)
     
     mpc_dt = 1.0 / physics_freq_hz
-    
-    mpc_cfg = MPCConfig(
-        n=state_dim,
-        nu=action_dim,
-        N=cfg.horizon,
-        W=W_state,
-        u_ref=jnp.zeros(action_dim),
-        dt=mpc_dt,
-    )
+    mpc_cfg = MPCConfig(n=state_dim, nu=action_dim, N=cfg.horizon, W=W_state, u_ref=jnp.zeros(action_dim), dt=mpc_dt)
 
-    u_min, u_max = -500.0 * jnp.ones(action_dim), 500.0 * jnp.ones(action_dim)
     x_min, x_max = -1000.0 * jnp.ones(state_dim), 1000.0 * jnp.ones(state_dim)
-    constraints_all = combine_constraints(
-        make_state_box_constraints(x_min, x_max), 
-        make_control_box_constraints(u_min, u_max)
-    )
+    constraints_all = combine_constraints(make_state_box_constraints(x_min, x_max), make_control_box_constraints(u_min, u_max))
 
-    
-    # sls_cfg = replace(sls_cfg, Q_bar=Q_bar, R_bar=R_bar)
     controller = GenericMPC(
         sls_cfg, sqp_cfg, admm_cfg,
-        config=mpc_cfg,
-        dynamics=dynamics,
-        constraints=constraints_all,
-        obstacles=jnp.zeros((0, 3)), 
-        cost=cost,
-        num_constraints=2 * action_dim + 2 * state_dim,
-        disturbance=disturbance,
-        shift=1,
+        config=mpc_cfg, dynamics=dynamics, constraints=constraints_all,
+        obstacles=jnp.zeros((0, 3)), cost=cost, num_constraints=2 * action_dim + 2 * state_dim,
+        disturbance=disturbance, shift=1,
         X_in=jnp.zeros((mpc_cfg.N + 1, mpc_cfg.n), dtype=jnp.float64),
         U_in=jnp.zeros((mpc_cfg.N, mpc_cfg.nu), dtype=jnp.float64),
     )
 
-    # 7. Env Setup & MPC Loop
+    # 8. Env Setup & Receding Horizon MPC Loop
     env = make_render_env(seed=episode_seed, time_limit=time_limit, width=width, height=height, physics_freq_hz=physics_freq_hz)
     current_frame = reset_env_to_state(env, seed=episode_seed, qpos=qpos_np[0], qvel=qvel_np[0], height=height, width=width)
     
@@ -420,67 +432,52 @@ def main():
     current_state = make_markov_state(current_emb).detach().cpu().numpy().astype(np.float64)
 
     rollout_frames = [current_frame.copy()]
-    X_ref = jnp.tile(goal_state[None, :], (cfg.horizon + 1, 1))
+    
+    prev_U = jnp.zeros((cfg.horizon, action_dim), dtype=jnp.float64)
+    jax_seed_key = jax.random.PRNGKey(cfg.seed)
 
-    # Initialize previous action fallback just in case solver fails
-    prev_u0 = np.zeros(action_dim, dtype=np.float32)
+    pbar = tqdm(range(cfg.max_mpc_steps), desc="MPPI + SLS Steps")
+    for _ in pbar:
+        jax_seed_key, subkey = jax.random.split(jax_seed_key)
+        
+        # 8a. Query MPPI Trajectory Optimization for Warmstart Sequence
+        init_act_seq = jnp.concatenate([prev_U[1:], prev_U[-1:]], axis=0)
+        mppi_res = jit_mppi_trajopt(
+            subkey, 
+            jnp.asarray(current_state), 
+            init_act_seq
+        )
+        
+        X_mppi = jnp.asarray(mppi_res["state_seq"])
+        U_mppi = jnp.asarray(mppi_res["act_seq"])
+        
+        X_warmstart = jnp.concatenate([jnp.asarray(current_state)[None, :], X_mppi], axis=0) 
+        X_ref = X_warmstart
 
-    pbar = tqdm(range(cfg.max_mpc_steps), desc="SLS MPC Steps")
-    for mpc_step in pbar:
-        # Solve with Error Handling
+        # Seed solver memory footprint states
+        controller.X_in = X_warmstart
+        controller.U_in = U_mppi
+
+        # 8b. Run SLS Refinement
         try:
             u0, X_pred, U_pred, *solver_info = controller.run(
                 x0=current_state, reference=X_ref, parameter=mpc_dt
             )
-            solver_status = "genericmpc"
+            solver_status = "sls_refined"
         except Exception as e:
             print(f"\n[WARN] GenericMPC solve raised exception: {e}")
             u0, X_pred, U_pred = None, None, None
-            solver_info = []
 
-        # breakpoint()
         if u0 is None or not jnp.all(jnp.isfinite(X_pred)) or not jnp.all(jnp.isfinite(U_pred)):
-            print("\n[WARN] SLS Solver failed or returned NaN. Using fallback (previous action).")
-            u0 = prev_u0
-            solver_status = "fallback"
-        else:
-            prev_u0 = np.asarray(u0, dtype=np.float32)
+            print("\n[WARN] SLS Solver failed. Falling back directly to MPPI nominal candidates.")
+            X_pred = X_warmstart
+            U_pred = U_mppi
+            u0 = U_pred[0]
+            solver_status = "mppi_fallback"
             
-            # --- Extract, Save, and Plot Project Tube Widths ---
-            if len(solver_info) >= 3:
-                Phi_x = solver_info[2]
-                # breakpoint()
-                # Calculate the tube widths identically to sls_visual.py's get_trajectory_tubes
-                tube = np.asarray(jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1))
-                
-                # Save raw tube width data
-                np.save(tube_plots_dir / f"tube_widths_step_{mpc_step:03d}.npy", tube)
-                
-                # Formulate a proper layout grid for subplotting 36 dimensions
-                n_cols = 6
-                n_rows = int(np.ceil(state_dim / n_cols))
-                fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 2.2 * n_rows), sharex=True)
-                axes = np.atleast_1d(axes).flatten()
-                horizon_axis = np.arange(cfg.horizon + 1)
-                
-                for dim_idx in range(state_dim):
-                    ax = axes[dim_idx]
-                    ax.plot(horizon_axis, tube[:, dim_idx], color="tab:blue", linewidth=1.5)
-                    ax.set_title(f"Dim {dim_idx}", fontsize=8)
-                    ax.grid(True, linestyle="--", alpha=0.5)
-                    ax.tick_params(axis="both", which="major", labelsize=8)
-                
-                # Turn off unused subplot panes if state_dim doesn't fill the final row
-                for dim_idx in range(state_dim, len(axes)):
-                    axes[dim_idx].axis("off")
-                
-                fig.suptitle(f"Projected Tube Widths Across Horizon (MPC Step {mpc_step})", fontsize=14)
-                plt.tight_layout()
-                plt.savefig(tube_plots_dir / f"tube_widths_step_{mpc_step:03d}.png", dpi=120)
-                plt.close()
-            # ----------------------------------------------------
+        prev_X, prev_U = shift_warmstart(X_pred, U_pred)
         
-        # Apply Action
+        # 8c. Apply Action Step
         u0_norm = np.asarray(u0, dtype=np.float32)
         u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
         obs, _, terminated, truncated, _ = env.step(u0_raw)
@@ -488,19 +485,18 @@ def main():
         current_obs = np.asarray(obs, dtype=np.float32)
         current_frame = env._env.physics.render(height=height, width=width, camera_id=0)
         
-        # Next State encoding
+        # 8d. State Update
         next_emb = encode_single_frame(model, current_frame, device=device, img_size=img_size, pixel_mean=pixel_mean, pixel_std=pixel_std)
         current_state = make_markov_state(next_emb, current_emb).detach().cpu().numpy().astype(np.float64)
         current_emb = next_emb
 
         rollout_frames.append(current_frame.copy())
         
-        # Telemetry
         obs_err = float(np.linalg.norm(current_obs - goal_obs))
         latent_err = float(np.linalg.norm(current_state - goal_state))
         pbar.set_postfix(obs_err=f"{obs_err:.3f}", lat_err=f"{latent_err:.3f}", status=solver_status)
 
-        if obs_err <= 0.05 or terminated or truncated:
+        if latent_err <= 0.05 or terminated or truncated:
             break
 
     if rollout_frames:

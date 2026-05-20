@@ -196,7 +196,7 @@ def plot_visualizations(ratios, cluster_metrics, alpha):
     plot_clustered_coverage(cluster_metrics, 1 - alpha)
 
 if __name__ == "__main__":
-    PATH = "lewm_one_step_error_data.pt"
+    PATH = "lewm_one_step_error_data_random.pt"
     ALPHA = 0.1
 
     dm = ErrorDataModule(data_path=PATH, batch_size=4096)

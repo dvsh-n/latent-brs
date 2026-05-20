@@ -73,10 +73,13 @@ def compute_and_save_quantile(
     model.to(device)
     model.eval()
 
+    
+
     # 2. Load dataset directly to control indexing
     full_dict = torch.load(data_path)
     dataset = ErrorDataset(full_dict)
     n_total = len(dataset)
+    breakpoint()
     
     # Define ranges:
     # 0% - 50%: Training/Val (Already used)
@@ -123,8 +126,8 @@ def compute_and_save_quantile(
 
 if __name__ == "__main__":
     # Update these paths to match your PACE or local directory structure
-    DATA_PATH = "lewm_one_step_error_data.pt"
+    DATA_PATH = "lewm_one_step_error_data_random.pt"
     # Using the checkpoint filename visible in your screenshot
-    CKPT_PATH = "lightning_logs/version_1/checkpoints/best-error-model-epoch=396.ckpt"
+    CKPT_PATH = "lightning_logs/version_4/checkpoints/best-error-model-epoch=395.ckpt"
     
     compute_and_save_quantile(DATA_PATH, CKPT_PATH)

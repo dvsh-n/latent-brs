@@ -193,8 +193,8 @@ def compute_and_save_quantile(
 
 if __name__ == "__main__":
     # Update these paths to match your PACE or local directory structure
-    DATA_PATH = "lewm_one_step_error_data.pt"
+    DATA_PATH = "lewm_one_step_error_data_random.pt"
     # Using the checkpoint filename visible in your screenshot
-    CKPT_PATH = "lightning_logs/version_1/checkpoints/best-error-model-epoch=396.ckpt"
+    CKPT_PATH = "lightning_logs/version_4/checkpoints/best-error-model-epoch=395.ckpt"
     
     compute_and_save_quantile(DATA_PATH, CKPT_PATH)
