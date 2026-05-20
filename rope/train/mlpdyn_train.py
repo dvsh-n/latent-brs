@@ -23,8 +23,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from rope.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "rope/data/expert_data/rope_random_cubic_spline.h5"
-DEFAULT_RUN_DIR = "rope/models/mlpdyn"
+DEFAULT_DATASET_PATH = "rope/data/train_data_noshadow/rope_random_cubic_spline.h5"
+DEFAULT_RUN_DIR = "rope/models/mlpdyn_noshadow"
 FINETUNE_DIR = None
 FIXED_FRAMESKIP = 1
 

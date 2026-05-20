@@ -19,14 +19,17 @@ import stable_pretraining as spt
 import torch
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 
 from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data_random_50hz/reacher_random_expert.h5"
-DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft_1"
-DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_2"
+DEFAULT_DATASET_PATHS = [
+    Path("reacher/data/train_data_noisy/reacher_train.h5"),
+    Path("reacher/data/obtuse_rollouts/reacher_train.h5"),
+]
+DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft_7"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_8"
 FIXED_FRAMESKIP = 1
 
 
@@ -40,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
     )
-    parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
+    parser.add_argument("--dataset-path", type=Path, nargs="+", default=DEFAULT_DATASET_PATHS)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--output-model-name", default="lewm")
     parser.add_argument("--seed", type=int, default=3072)
@@ -49,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=24)
+    parser.add_argument("--embed-dim", type=int, default=5)
     parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
@@ -67,7 +70,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=120)
+    parser.add_argument(
+        "--load-projector",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load projector weights from the init checkpoint.",
+    )
+    parser.add_argument(
+        "--load-mlpdyn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load MLP dynamics weights from the init checkpoint.",
+    )
+    parser.add_argument("--batch-size", type=int, default=110)
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
@@ -397,6 +412,8 @@ def sanitize_hparams(args: argparse.Namespace) -> dict[str, object]:
     for key, value in hparams.items():
         if isinstance(value, Path):
             hparams[key] = str(value)
+        elif isinstance(value, list):
+            hparams[key] = [str(item) if isinstance(item, Path) else item for item in value]
     return hparams
 
 
@@ -434,27 +451,33 @@ def resolve_resume_checkpoint(args: argparse.Namespace, run_dir: Path) -> Path |
     return checkpoint_path
 
 
-def load_pretrained_encoder(checkpoint_path: Path) -> torch.nn.Module:
+def load_pretrained_model(checkpoint_path: Path) -> JEPA:
     source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if not isinstance(source_model, JEPA):
-        raise TypeError(f"Expected JEPA object checkpoint, got {type(source_model).__name__}.")
     encoder = getattr(source_model, "encoder", None)
-    if encoder is None:
-        raise AttributeError("Source checkpoint does not contain model.encoder.")
-    return encoder
+    predictor = getattr(source_model, "predictor", None)
+    action_encoder = getattr(source_model, "action_encoder", None)
+    if encoder is None or predictor is None or action_encoder is None:
+        source_type = f"{type(source_model).__module__}.{type(source_model).__name__}"
+        raise TypeError(
+            "Expected a JEPA-compatible object checkpoint with "
+            f"`encoder`, `predictor`, and `action_encoder`, got {source_type}."
+        )
+    return source_model
 
 
 def main() -> None:
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
 
-    dataset_path = args.dataset_path.expanduser().resolve()
+    dataset_paths = [dataset_path.expanduser().resolve() for dataset_path in args.dataset_path]
     run_dir = args.run_dir.expanduser().resolve()
     resume_checkpoint_path = resolve_resume_checkpoint(args, run_dir)
     init_checkpoint_path = None if resume_checkpoint_path is not None else resolve_init_checkpoint(args)
 
-    if not dataset_path.is_file():
-        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+    missing_dataset_paths = [dataset_path for dataset_path in dataset_paths if not dataset_path.is_file()]
+    if missing_dataset_paths:
+        missing_list = ", ".join(str(dataset_path) for dataset_path in missing_dataset_paths)
+        raise FileNotFoundError(f"Dataset file not found: {missing_list}")
     if run_dir.exists() and resume_checkpoint_path is None:
         raise FileExistsError(f"Run dir already exists: {run_dir}")
     if not run_dir.exists() and resume_checkpoint_path is not None:
@@ -462,14 +485,18 @@ def main() -> None:
 
     spt.set(cache_dir=str(run_dir))
 
-    dataset = LeWMOGBenchCubeDataset(
-        dataset_path,
-        markov_deriv=args.markov_deriv,
-        num_preds=args.num_preds,
-        frameskip=args.frameskip,
-        img_size=args.img_size,
-        action_dim=args.action_dim,
-    )
+    datasets = [
+        LeWMOGBenchCubeDataset(
+            dataset_path,
+            markov_deriv=args.markov_deriv,
+            num_preds=args.num_preds,
+            frameskip=args.frameskip,
+            img_size=args.img_size,
+            action_dim=args.action_dim,
+        )
+        for dataset_path in dataset_paths
+    ]
+    dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
     if len(dataset) < 2:
         raise ValueError(f"Need at least 2 valid training windows for train/val splitting, got {len(dataset)}.")
     train_len = int(len(dataset) * args.train_split)
@@ -501,7 +528,8 @@ def main() -> None:
 
     world_model = build_model(args)
     if resume_checkpoint_path is None:
-        pretrained_encoder = load_pretrained_encoder(init_checkpoint_path)
+        pretrained_model = load_pretrained_model(init_checkpoint_path)
+        pretrained_encoder = getattr(pretrained_model, "encoder", None)
         try:
             world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
         except RuntimeError as exc:
@@ -509,6 +537,16 @@ def main() -> None:
                 "Failed to load encoder weights from the init checkpoint. "
                 "Check encoder-scale, patch-size, and encoder architecture compatibility."
             ) from exc
+        if args.load_projector:
+            pretrained_projector = getattr(pretrained_model, "projector", None)
+            if pretrained_projector is None:
+                raise AttributeError("Source checkpoint does not contain model.projector.")
+            world_model.projector.load_state_dict(pretrained_projector.state_dict(), strict=True)
+        if args.load_mlpdyn:
+            pretrained_predictor = getattr(pretrained_model, "predictor", None)
+            if pretrained_predictor is None:
+                raise AttributeError("Source checkpoint does not contain model.predictor.")
+            world_model.predictor.load_state_dict(pretrained_predictor.state_dict(), strict=True)
 
     optimizers = {
         "model_opt": {
