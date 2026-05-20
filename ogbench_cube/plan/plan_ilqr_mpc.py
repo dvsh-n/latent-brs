@@ -28,7 +28,7 @@ from ogbench_cube.data.ogbench_cube_data_gen import LocalCubePlanOracle
 from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
-DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn"
+DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_1"
 DEFAULT_OUT_DIR = "ogbench_cube/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
@@ -38,7 +38,7 @@ Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 20
-EPISODE_IDX = None
+EPISODE_IDX = 396
 MAX_ORACLE_STEPS = 80
 ORACLE_SEGMENT_DT = 0.4
 ORACLE_NOISE = 0.0
