@@ -1,5 +1,12 @@
 import time
+import sys
+from pathlib import Path
+
 import numpy as np
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from drake import lcmt_iiwa_status
 from pydrake.all import (
@@ -11,6 +18,15 @@ from pydrake.all import (
 )
 
 from iiwa_hardware import MakeFullBimanualStation
+from rope.real.collision_guard import MujocoArmCollisionGuard
+from rope.shared.lab_env import LabEnv
+
+
+def validate_bimanual_home_path(q0_start, q1_start, q0_goal, q1_goal, duration):
+    guard = MujocoArmCollisionGuard(LabEnv(), min_arm_arm_distance=0.06)
+    start = np.concatenate([q0_start, q1_start])
+    goal = np.concatenate([q0_goal, q1_goal])
+    guard.validate_path(start, goal, duration=duration, label="home")
 
 
 def read_current_iiwa_positions(timeout_sec=5.0):
@@ -136,6 +152,10 @@ def main():
         raise RuntimeError(
             f"Target is too far for a safe home motion: max_move={max_move_deg:.2f} deg"
         )
+
+    print("Checking bimanual arm-arm collision path...")
+    validate_bimanual_home_path(q0_start, q1_start, q0_goal, q1_goal, duration)
+    print("Collision path check passed.")
 
     builder = DiagramBuilder()
 

@@ -76,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status-timeout", type=float, default=5.0)
     parser.add_argument("--max-control-joint-step-deg", type=float, default=5.0)
     parser.add_argument("--max-reset-joint-move-deg", type=float, default=90.0)
+    parser.add_argument("--disable-collision-guard", action="store_true")
+    parser.add_argument("--arm-arm-min-distance", type=float, default=0.06)
+    parser.add_argument("--collision-control-samples", type=int, default=5)
+    parser.add_argument("--collision-reset-samples", type=int, default=25)
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--camera-capture-width", type=int, default=None)
     parser.add_argument("--camera-capture-height", type=int, default=None)
@@ -210,6 +214,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-control-joint-step-deg must be positive.")
     if args.max_reset_joint_move_deg <= 0.0:
         raise ValueError("--max-reset-joint-move-deg must be positive.")
+    if args.arm_arm_min_distance < 0.0:
+        raise ValueError("--arm-arm-min-distance cannot be negative.")
+    if args.collision_control_samples < 1:
+        raise ValueError("--collision-control-samples must be positive.")
+    if args.collision_reset_samples < 1:
+        raise ValueError("--collision-reset-samples must be positive.")
 
 
 def main() -> None:
@@ -234,7 +244,16 @@ def main() -> None:
         capture_width=args.camera_capture_width,
         capture_height=args.camera_capture_height,
     )
-    env = RealRopeEnv(robot=robot, camera=camera, command_duration=args.control_timestep, reset_duration=args.reset_duration)
+    env = RealRopeEnv(
+        robot=robot,
+        camera=camera,
+        command_duration=args.control_timestep,
+        reset_duration=args.reset_duration,
+        enable_collision_guard=not args.disable_collision_guard,
+        arm_arm_min_distance=args.arm_arm_min_distance,
+        collision_control_samples=args.collision_control_samples,
+        collision_reset_samples=args.collision_reset_samples,
+    )
     compression = None if args.compression == "none" else args.compression
 
     rewards: list[float] = []
@@ -265,6 +284,10 @@ def main() -> None:
             h5.attrs["drake_publish_period"] = args.drake_publish_period
             h5.attrs["max_control_joint_step_deg"] = args.max_control_joint_step_deg
             h5.attrs["max_reset_joint_move_deg"] = args.max_reset_joint_move_deg
+            h5.attrs["collision_guard_enabled"] = not args.disable_collision_guard
+            h5.attrs["arm_arm_min_distance"] = args.arm_arm_min_distance
+            h5.attrs["collision_control_samples"] = args.collision_control_samples
+            h5.attrs["collision_reset_samples"] = args.collision_reset_samples
             h5.attrs["seed"] = args.seed
             h5.attrs["video_dir"] = str(video_dir)
             h5.attrs["video_resolution"] = json.dumps([args.height, args.width])

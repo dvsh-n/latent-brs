@@ -16,10 +16,18 @@ random rope task policy
 
 MuJoCo is used only for IK/FK helper math. It does not simulate the real data.
 
+The standalone Cartesian motion scripts use `iiwa_cartesian_ik.py` and Drake's
+single-arm iiwa model. They are useful for hardware sanity checks, but the rope
+dataset collector still uses `LabEnv` because it already encodes the shared
+two-arm/table/rope task frame.
+
 ## Files That Matter
 
 - `rope/data/iiwa_hardware.py`: Drake LCM station for the two iiwas.
+- `rope/data/iiwa_cartesian_ik.py`: Drake single-arm Cartesian IK helper for manual tests.
 - `rope/data/home_bimanual_7d.py`: conservative homing script.
+- `rope/data/test_bimanual_cartesian_motion.py`: small Cartesian hardware sanity test.
+- `rope/data/motion_bimanual_position.py`: larger manual Cartesian waypoint motion.
 - `rope/data/rope_real_data_gen.py`: real dataset collector.
 - `rope/real/drake_lcm_backend.py`: backend that connects the collector to the Drake LCM station.
 
@@ -51,7 +59,16 @@ the iiwa LCM channels.
 python3 rope/data/home_bimanual_7d.py
 ```
 
-2. Do one short collection dry run:
+2. Optional small Cartesian sanity test:
+
+```bash
+python3 rope/data/test_bimanual_cartesian_motion.py
+```
+
+Skip this if homing and LCM status are already known-good. The real collector
+does not depend on this script.
+
+3. Do one short collection dry run with collision guard enabled:
 
 ```bash
 python3 rope/data/rope_real_data_gen.py \
@@ -63,7 +80,7 @@ python3 rope/data/rope_real_data_gen.py \
   --i-understand-this-moves-real-robots
 ```
 
-3. Inspect the generated MP4 and HDF5 before collecting more:
+4. Inspect the generated MP4 and HDF5 before collecting more:
 
 ```bash
 python3 - <<'PY'
@@ -81,7 +98,7 @@ with h5py.File(path, "r") as h5:
 PY
 ```
 
-4. Collect a larger run after the dry run looks sane:
+5. Collect a larger run after the dry run looks sane:
 
 ```bash
 python3 rope/data/rope_real_data_gen.py \
@@ -105,7 +122,17 @@ Defaults are intentionally conservative:
 --status-timeout 5.0
 --max-control-joint-step-deg 5.0
 --max-reset-joint-move-deg 90.0
+--arm-arm-min-distance 0.06
+--collision-control-samples 5
+--collision-reset-samples 25
 ```
+
+The collector checks the interpolated joint path in the two-arm MuJoCo model
+before every hardware command. The homing and optional Cartesian scripts run
+the same arm-arm path check before sending their planned motion. These checks
+reject arm-arm contacts and any sampled arm-arm collision geometry distance
+below `--arm-arm-min-distance`. Keep this enabled unless you are deliberately
+debugging the guard itself.
 
 For the first hardware test, keep `--max-episode-steps` small and keep someone
 near the E-stop.
