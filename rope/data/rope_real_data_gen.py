@@ -266,7 +266,6 @@ def main() -> None:
 
     try:
         env.connect()
-        env.reset()
         sample_step_info = env.get_step_info(elapsed_time=0.0)
         sample_frame = env.get_rgb_frame()
         obs_dim = int(sample_step_info["observation"].shape[0])
