@@ -19,7 +19,7 @@ from pydrake.all import (
 
 from iiwa_hardware import MakeFullBimanualStation
 from rope.real.collision_guard import MujocoArmCollisionGuard
-from rope.shared.lab_env import LabEnv
+from rope.shared.lab_env import LabEnv, TaskState
 
 
 def validate_bimanual_home_path(q0_start, q1_start, q0_goal, q1_goal, duration):
@@ -27,6 +27,16 @@ def validate_bimanual_home_path(q0_start, q1_start, q0_goal, q1_goal, duration):
     start = np.concatenate([q0_start, q1_start])
     goal = np.concatenate([q0_goal, q1_goal])
     guard.validate_path(start, goal, duration=duration, label="home")
+
+
+def mirrored_rope_home_goal():
+    env = LabEnv()
+    task_target = env.task_bounds.clip(env.nominal_state).as_array()
+    env.reset(TaskState.from_array(task_target))
+    q_goal = env.get_arm_joint_positions()
+    left_site = env.data.site_xpos[env.arm1_site_id].copy()
+    right_site = env.data.site_xpos[env.arm2_site_id].copy()
+    return q_goal[:7], q_goal[7:], task_target, left_site, right_site
 
 
 def read_current_iiwa_positions(timeout_sec=5.0):
@@ -100,29 +110,9 @@ class JointMonitor(LeafSystem):
 
 
 def main():
-    # ==========================
-    # Edit these target poses.
-    # Unit: degrees, 7 joints.
-    # ==========================
-    # q0_goal_deg = np.array([
-    #     -30.0, 60.0, -150.0, 55.0, 0.0, 45.0, 0.0
-    # ])
-
-    # q1_goal_deg = np.array([
-    #     30.0, 60.0, -30.0, -55.0, 0.0, -45.0, 0.0
-    # ])
-
-    # home for manipulation
-    q0_goal_deg = np.array([
-        -65.0, 3.0, -167.0, 113.0, 8.0, 5.0, 0.0
-    ])
-
-    q1_goal_deg = np.array([
-        65.0, 3.0, -13.0, -113.0, -8.0, -5.0, 0.0
-    ])
-
-    q0_goal = np.deg2rad(q0_goal_deg)
-    q1_goal = np.deg2rad(q1_goal_deg)
+    q0_goal, q1_goal, task_target, left_site, right_site = mirrored_rope_home_goal()
+    q0_goal_deg = np.rad2deg(q0_goal)
+    q1_goal_deg = np.rad2deg(q1_goal)
 
     # Safety settings.
     max_speed_deg_s = 3.0       # conservative homing speed
@@ -134,6 +124,9 @@ def main():
 
     print("arm0 start deg =", np.round(np.rad2deg(q0_start), 2))
     print("arm1 start deg =", np.round(np.rad2deg(q1_start), 2))
+    print("rope task home [reach, height, width] =", np.round(task_target, 4))
+    print("expected left attachment site =", np.round(left_site, 4))
+    print("expected right attachment site =", np.round(right_site, 4))
     print("arm0 goal  deg =", np.round(q0_goal_deg, 2))
     print("arm1 goal  deg =", np.round(q1_goal_deg, 2))
 

@@ -25,7 +25,7 @@ two-arm/table/rope task frame.
 
 - `rope/data/iiwa_hardware.py`: Drake LCM station for the two iiwas.
 - `rope/data/iiwa_cartesian_ik.py`: Drake single-arm Cartesian IK helper for manual tests.
-- `rope/data/home_bimanual_7d.py`: conservative homing script.
+- `rope/data/home_bimanual_7d.py`: conservative homing script to the mirrored rope-task home pose.
 - `rope/data/test_bimanual_cartesian_motion.py`: small Cartesian hardware sanity test.
 - `rope/data/motion_bimanual_position.py`: larger manual Cartesian waypoint motion.
 - `rope/data/rope_real_data_gen.py`: real dataset collector.
@@ -58,6 +58,11 @@ the iiwa LCM channels.
 ```bash
 python3 rope/data/home_bimanual_7d.py
 ```
+
+This reads the current iiwa joint positions, computes the mirrored rope home
+pose from `LabEnv`, checks the full two-arm path for arm-arm collision, and then
+moves slowly to that pose. The two attachment sites should have nearly equal
+`x/z` and opposite-sign `y`.
 
 2. Optional small Cartesian sanity test:
 
