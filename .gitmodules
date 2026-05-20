@@ -15,7 +15,8 @@
 	url = https://github.com/huggingface/lerobot.git
 [submodule "third_party/gpu_sls"]
 	path = third_party/gpu_sls
-	url = https://github.com/Jeff300fang/gpu_sls.git
+	url = https://github.com/AnutamKS/gpu_sls.git
+	branch = wm_sls
 [submodule "third_party/ogbench"]
 	path = third_party/ogbench
 	url = https://github.com/seohongpark/ogbench.git
