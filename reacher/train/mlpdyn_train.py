@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/expert_data_50hz/reacher_expert.h5"
-DEFAULT_RUN_DIR = "reacher/models/mlpdyn_straighten"
+DEFAULT_DATASET_PATH = "reacher/data/train_data_noisy/reacher_train.h5"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_no_ms"
 FINETUNE_DIR = None
 FIXED_FRAMESKIP = 1
 
@@ -42,9 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=18)
+    parser.add_argument("--embed-dim", type=int, default=12)
     parser.add_argument("--history-size", type=int, default=1)
-    parser.add_argument("--num-preds", type=int, default=6, help="Autoregressive rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=1, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
@@ -58,9 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=100)
-    parser.add_argument("--num-workers", type=int, default=10)
-    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=110)
+    parser.add_argument("--num-workers", type=int, default=24)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
         "--persistent-workers",
         action="store_true",

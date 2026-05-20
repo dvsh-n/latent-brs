@@ -23,18 +23,18 @@ import json
 from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/obtuse_rollouts/reacher_train.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_7"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_4"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "cuda"
 HORIZON = 20
 MAX_MPC_STEPS = 100
-Q_TERMINAL = 10.0
+Q_TERMINAL = 2.5
 Q_STAGE = 0.005
-R_CONTROL = 0.1
+R_CONTROL = 0.01
 VIDEO_FPS = 60
-EPISODE_IDX = None
+EPISODE_IDX = 163
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-max-iters", type=int, default=35)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
+    parser.add_argument("--swap-start-goal", action="store_true", default=True)
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -174,6 +175,11 @@ def save_rollout_video(frames: list[np.ndarray], out_dir: Path, fps: int) -> Pat
     except Exception:
         imageio.mimwrite(gif_path, frames, fps=fps)
         return gif_path
+
+
+def save_torch_payload(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
 
 
 def preprocess_pixels(
@@ -653,15 +659,17 @@ def main() -> None:
         device=device,
         frame_batch_size=args.frame_batch_size,
     )
-    start_emb = true_latents[0]
-    goal_emb = true_latents[-1]
+    start_idx = -1 if args.swap_start_goal else 0
+    goal_idx = 0 if args.swap_start_goal else -1
+    start_emb = true_latents[start_idx]
+    goal_emb = true_latents[goal_idx]
     start_state = make_markov_state(start_emb)
     goal_state = make_markov_state(goal_emb)
     if int(start_state.numel()) != markov_state_dim:
         raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {start_state.numel()}.")
 
-    save_rgb_image(out_dir / "start_image.png", pixels_np[0])
-    save_rgb_image(out_dir / "goal_image.png", pixels_np[-1])
+    save_rgb_image(out_dir / "start_image.png", pixels_np[start_idx])
+    save_rgb_image(out_dir / "goal_image.png", pixels_np[goal_idx])
 
     env = make_render_env(
         seed=episode_seed,
@@ -673,8 +681,8 @@ def main() -> None:
     render_start = reset_env_to_state(
         env,
         seed=episode_seed,
-        qpos=qpos_np[0],
-        qvel=qvel_np[0],
+        qpos=qpos_np[start_idx],
+        qvel=qvel_np[start_idx],
         height=height,
         width=width,
     )
@@ -702,14 +710,21 @@ def main() -> None:
         pixel_std=pixel_std,
     )
     current_state = make_markov_state(current_emb)
+    initial_current_state = current_state.detach().cpu().clone()
     goal_state_np = goal_state.detach().cpu().numpy().astype(np.float64)
-    goal_obs = obs_np[-1].astype(np.float32)
+    goal_obs = obs_np[goal_idx].astype(np.float32)
     obs_dim = int(goal_obs.shape[0])
     current_obs = build_observation_from_env(env, obs_dim=obs_dim, goal_obs=goal_obs)
 
     rollout_frames = [current_frame.copy()]
+    executed_qpos = [np.asarray(env._env.physics.data.qpos[: qpos_np.shape[1]], dtype=np.float32).copy()]
+    executed_qvel = [np.asarray(env._env.physics.data.qvel[: qvel_np.shape[1]], dtype=np.float32).copy()]
+    executed_embeddings = [current_emb.detach().cpu().numpy().astype(np.float32)]
+    executed_states = [current_state.detach().cpu().numpy().astype(np.float32)]
     executed_actions_raw: list[np.ndarray] = []
     executed_actions_norm: list[np.ndarray] = []
+    nominal_state_rollouts: list[np.ndarray] = []
+    nominal_action_rollouts: list[np.ndarray] = []
     latent_goal_distances = [float(torch.linalg.vector_norm(current_state - goal_state).item())]
     embedding_goal_distances = [float(torch.linalg.vector_norm(current_emb - goal_emb).item())]
     observation_goal_distances = [compute_observation_goal_distance(current_obs, goal_obs)]
@@ -722,6 +737,8 @@ def main() -> None:
     for _ in pbar:
         current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
         x_plan, u_plan, solve_time, n_iters, plan_cost = mpc_solver.solve(current_state_np, goal_state_np)
+        nominal_state_rollouts.append(x_plan.copy())
+        nominal_action_rollouts.append(u_plan.copy())
         solve_times_ms.append(solve_time * 1000.0)
         ilqr_iterations.append(int(n_iters))
         ilqr_costs.append(float(plan_cost))
@@ -746,6 +763,10 @@ def main() -> None:
         current_emb = next_emb
 
         rollout_frames.append(current_frame.copy())
+        executed_qpos.append(np.asarray(env._env.physics.data.qpos[: qpos_np.shape[1]], dtype=np.float32).copy())
+        executed_qvel.append(np.asarray(env._env.physics.data.qvel[: qvel_np.shape[1]], dtype=np.float32).copy())
+        executed_embeddings.append(current_emb.detach().cpu().numpy().astype(np.float32))
+        executed_states.append(current_state.detach().cpu().numpy().astype(np.float32))
         latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
         embedding_goal_distance = float(torch.linalg.vector_norm(current_emb - goal_emb).item())
         obs_goal_distance = compute_observation_goal_distance(current_obs, goal_obs)
@@ -773,6 +794,94 @@ def main() -> None:
     final_obs = build_observation_from_env(env, obs_dim=obs_dim, goal_obs=goal_obs)
     video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
     env.close()
+
+    rollout_payload = {
+        "metadata": {
+            "run_name": run_name,
+            "out_dir": str(out_dir),
+            "dataset_path": str(dataset_path),
+            "model_dir": str(model_dir),
+            "checkpoint_path": str(checkpoint_path),
+            "episode_idx": int(episode_idx),
+            "episode_seed": int(episode_seed),
+            "episode_length": int(pixels_np.shape[0]),
+            "physics_freq_hz": float(physics_freq_hz),
+            "time_limit": float(time_limit),
+            "height": int(height),
+            "width": int(width),
+            "device": str(device),
+            "img_size": int(img_size),
+            "action_dim": int(action_dim),
+            "embed_dim": int(embed_dim),
+            "markov_state_dim": int(markov_state_dim),
+            "obs_dim": int(obs_dim),
+            "frame_batch_size": int(args.frame_batch_size),
+            "horizon": int(args.horizon),
+            "max_mpc_steps": int(args.max_mpc_steps),
+            "video_fps": int(args.video_fps),
+            "q_terminal": float(args.q_terminal),
+            "q_stage": float(args.q_stage),
+            "r_control": float(args.r_control),
+            "ilqr_max_iters": int(args.ilqr_max_iters),
+            "ilqr_tol": float(args.ilqr_tol),
+            "ilqr_regularization": float(args.ilqr_regularization),
+            "seed": None if args.seed is None else int(args.seed),
+            "swap_start_goal": bool(args.swap_start_goal),
+            "start_idx": int(start_idx),
+            "goal_idx": int(goal_idx),
+            "planned_steps": int(len(nominal_state_rollouts)),
+            "executed_steps": int(len(executed_actions_raw)),
+            "stop_reason": stop_reason,
+            "video_path": video_path,
+        },
+        "episode_data": {
+            "pixels": pixels_np,
+            "qpos": qpos_np,
+            "qvel": qvel_np,
+            "observation": obs_np,
+        },
+        "planner_data": {
+            "action_mean": action_mean,
+            "action_std": action_std,
+            "goal_obs": goal_obs,
+            "start_embedding": start_emb.detach().cpu(),
+            "goal_embedding": goal_emb.detach().cpu(),
+            "start_state": start_state.detach().cpu(),
+            "goal_state": goal_state.detach().cpu(),
+            "initial_current_state": initial_current_state,
+            "final_qpos": final_qpos,
+            "final_qvel": final_qvel,
+            "final_obs": final_obs,
+        },
+        "nominal_rollouts": {
+            "state_plans": np.stack(nominal_state_rollouts, axis=0)
+            if nominal_state_rollouts
+            else np.empty((0, args.horizon + 1, markov_state_dim), dtype=np.float64),
+            "action_plans": np.stack(nominal_action_rollouts, axis=0)
+            if nominal_action_rollouts
+            else np.empty((0, args.horizon, action_dim), dtype=np.float64),
+            "solve_times_ms": np.asarray(solve_times_ms, dtype=np.float64),
+            "ilqr_iterations": np.asarray(ilqr_iterations, dtype=np.int64),
+            "ilqr_costs": np.asarray(ilqr_costs, dtype=np.float64),
+        },
+        "executed_rollout": {
+            "frames": np.stack(rollout_frames, axis=0),
+            "qpos": np.stack(executed_qpos, axis=0),
+            "qvel": np.stack(executed_qvel, axis=0),
+            "embeddings": np.stack(executed_embeddings, axis=0),
+            "states": np.stack(executed_states, axis=0),
+            "actions_raw": np.stack(executed_actions_raw, axis=0)
+            if executed_actions_raw
+            else np.empty((0, action_dim), dtype=np.float32),
+            "actions_norm": np.stack(executed_actions_norm, axis=0)
+            if executed_actions_norm
+            else np.empty((0, action_dim), dtype=np.float32),
+            "latent_goal_distances": np.asarray(latent_goal_distances, dtype=np.float64),
+            "embedding_goal_distances": np.asarray(embedding_goal_distances, dtype=np.float64),
+            "observation_goal_distances": np.asarray(observation_goal_distances, dtype=np.float64),
+        },
+    }
+    save_torch_payload(out_dir / "nominal_rollout.pt", rollout_payload)
 
     print(f"Saved to: {out_dir}")
 

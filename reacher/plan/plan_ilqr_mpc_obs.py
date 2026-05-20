@@ -29,7 +29,7 @@ from reacher.plan import plan_ilqr_mpc as nominal_planner
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 
 DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_4"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_obs"
 DEFAULT_OBSTACLE_DIR = "reacher/plan/obstacle_nets/episode_00520/step_0100/7128698f4baacd83"
 DEVICE = "cuda"
@@ -37,7 +37,7 @@ HORIZON = 20
 MAX_MPC_STEPS = 100
 Q_TERMINAL = 10.0
 Q_STAGE = 0.005
-R_CONTROL = 0.1
+R_CONTROL = 0.01
 VIDEO_FPS = 60
 
 
