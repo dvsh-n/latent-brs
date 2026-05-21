@@ -26,7 +26,7 @@ from ogbench_cube.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 DEFAULT_DATASET_PATH = "ogbench_cube/data/expert_data/ogbench_cube_expert.h5"
 DEFAULT_INIT_RUN_DIR = "ogbench_cube/models/mlpdyn"
-DEFAULT_RUN_DIR = "ogbench_cube/models/mlpdyn"
+DEFAULT_RUN_DIR = "ogbench_cube/models/mlpdyn_1"
 FIXED_FRAMESKIP = 1
 
 
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=18)
+    parser.add_argument("--embed-dim", type=int, default=8)
     parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=6, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=5)
@@ -67,6 +67,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
+    parser.add_argument(
+        "--load-projector",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load projector weights from the init checkpoint.",
+    )
+    parser.add_argument(
+        "--load-mlpdyn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load MLP dynamics weights from the init checkpoint.",
+    )
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=10)
     parser.add_argument("--prefetch-factor", type=int, default=1)
@@ -434,14 +446,18 @@ def resolve_resume_checkpoint(args: argparse.Namespace, run_dir: Path) -> Path |
     return checkpoint_path
 
 
-def load_pretrained_encoder(checkpoint_path: Path) -> torch.nn.Module:
+def load_pretrained_model(checkpoint_path: Path) -> JEPA:
     source_model = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if not isinstance(source_model, JEPA):
-        raise TypeError(f"Expected JEPA object checkpoint, got {type(source_model).__name__}.")
     encoder = getattr(source_model, "encoder", None)
-    if encoder is None:
-        raise AttributeError("Source checkpoint does not contain model.encoder.")
-    return encoder
+    predictor = getattr(source_model, "predictor", None)
+    action_encoder = getattr(source_model, "action_encoder", None)
+    if encoder is None or predictor is None or action_encoder is None:
+        source_type = f"{type(source_model).__module__}.{type(source_model).__name__}"
+        raise TypeError(
+            "Expected a JEPA-compatible object checkpoint with "
+            f"`encoder`, `predictor`, and `action_encoder`, got {source_type}."
+        )
+    return source_model
 
 
 def main() -> None:
@@ -501,7 +517,8 @@ def main() -> None:
 
     world_model = build_model(args)
     if resume_checkpoint_path is None:
-        pretrained_encoder = load_pretrained_encoder(init_checkpoint_path)
+        pretrained_model = load_pretrained_model(init_checkpoint_path)
+        pretrained_encoder = getattr(pretrained_model, "encoder", None)
         try:
             world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
         except RuntimeError as exc:
@@ -509,6 +526,16 @@ def main() -> None:
                 "Failed to load encoder weights from the init checkpoint. "
                 "Check encoder-scale, patch-size, and encoder architecture compatibility."
             ) from exc
+        if args.load_projector:
+            pretrained_projector = getattr(pretrained_model, "projector", None)
+            if pretrained_projector is None:
+                raise AttributeError("Source checkpoint does not contain model.projector.")
+            world_model.projector.load_state_dict(pretrained_projector.state_dict(), strict=True)
+        if args.load_mlpdyn:
+            pretrained_predictor = getattr(pretrained_model, "predictor", None)
+            if pretrained_predictor is None:
+                raise AttributeError("Source checkpoint does not contain model.predictor.")
+            world_model.predictor.load_state_dict(pretrained_predictor.state_dict(), strict=True)
 
     optimizers = {
         "model_opt": {

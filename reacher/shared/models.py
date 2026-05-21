@@ -16,6 +16,13 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
     return x * (1 + scale) + shift
 
 
+class Sin(nn.Module):
+    """Sinusoidal activation kept for checkpoint compatibility."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(x)
+
+
 class SIGReg(torch.nn.Module):
     """Sketch Isotropic Gaussian Regularizer used by LE-WM."""
 
@@ -266,6 +273,7 @@ class MLPDynamicsPredictor(nn.Module):
         hidden_width: int = 1024,
         depth: int = 4,
         dropout: float = 0.0,
+        activation_fn: type[nn.Module] | str = nn.GELU,
     ) -> None:
         super().__init__()
         if history_size < 1:
@@ -283,12 +291,13 @@ class MLPDynamicsPredictor(nn.Module):
         self.action_history_size = int(action_history_size or history_size)
         self.num_preds = int(num_preds)
         input_dim = self.history_size * self.embed_dim + self.action_history_size * self.action_dim
+        activation_cls = resolve_activation_fn(activation_fn)
 
         layers: list[nn.Module] = []
         current_dim = input_dim
         for _ in range(depth):
             layers.append(nn.Linear(current_dim, hidden_width))
-            layers.append(nn.GELU())
+            layers.append(activation_cls())
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
             current_dim = hidden_width
@@ -310,6 +319,22 @@ class MLPDynamicsPredictor(nn.Module):
         x = torch.cat((emb.flatten(1), action.flatten(1)), dim=-1)
         pred = self.net(x)
         return pred.reshape(emb.shape[0], self.num_preds, self.embed_dim)
+
+
+def resolve_activation_fn(activation_fn: type[nn.Module] | str) -> type[nn.Module]:
+    if isinstance(activation_fn, str):
+        activations = {
+            "relu": nn.ReLU,
+            "gelu": nn.GELU,
+            "tanh": nn.Tanh,
+            "sin": Sin,
+        }
+        try:
+            return activations[activation_fn.lower()]
+        except KeyError as exc:
+            choices = ", ".join(sorted(activations))
+            raise ValueError(f"Unsupported activation_fn={activation_fn!r}. Expected one of: {choices}.") from exc
+    return activation_fn
 
 
 def _build_koopman_encoder(

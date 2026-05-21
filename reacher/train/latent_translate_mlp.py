@@ -24,9 +24,9 @@ from tqdm.auto import tqdm
 DEFAULT_DATASET_PATHS = [
     Path("reacher/data/train_data_noisy/reacher_train.h5"),
 ]
-DEFAULT_SOURCE_MODEL_DIR = Path("reacher/models/mlpdyn_ft_4")
+DEFAULT_SOURCE_MODEL_DIR = Path("reacher/models/mlpdyn_ft_5")
 DEFAULT_TARGET_MODEL_DIR = Path("reacher/models/mlpdyn_ft_7")
-DEFAULT_RUN_DIR = Path("reacher/models/latent_translate_4_to_7")
+DEFAULT_RUN_DIR = Path("reacher/models/latent_translate_5_to_7")
 DEFAULT_OUTPUT_MODEL_NAME = "latent_translate"
 
 

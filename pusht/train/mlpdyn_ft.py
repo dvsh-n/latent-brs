@@ -28,6 +28,7 @@ from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 DEFAULT_DATASET_PATHS = [
     Path("pusht/data/pusht_diffusion_train.h5"),
     Path("pusht/data/pusht_diffusion_edge.h5"),
+    Path("pusht/data/pusht_diffusion_random.h5"),
 ]
 DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_2"
 DEFAULT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_3"
@@ -53,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--embed-dim", type=int, default=64)
     parser.add_argument("--markov-deriv", type=int, default=2)
     parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)

@@ -85,6 +85,9 @@ class RopeSpec:
     sag: float = 0.03
     slack_scale: float = 1.10
     rgba: tuple[float, float, float, float] = (0.58, 0.44, 0.27, 1.0)
+    proxy_mass: float = 0.002
+    proxy_stiffness: float = 4000.0
+    proxy_damping: float = 40.0
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,7 @@ class BaseEnvConfig:
     task_bounds: TaskBounds = field(default_factory=TaskBounds)
     nominal_task_state: TaskState = field(default_factory=lambda: TaskState.from_array(NOMINAL_TASK_STATE))
     rope_spec: RopeSpec = field(default_factory=RopeSpec)
+    enable_proxy_rope: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,11 +139,132 @@ def build_rope_tendon_xml(spec: RopeSpec, task_bounds: TaskBounds) -> str:
     )
 
 
+def proxy_segment_count(spec: RopeSpec) -> int:
+    return max(2, int(spec.segments))
+
+
+def proxy_node_count(spec: RopeSpec) -> int:
+    return proxy_segment_count(spec) - 1
+
+
+def proxy_segment_rest_length(task_bounds: TaskBounds, spec: RopeSpec) -> float:
+    return rope_rest_length(task_bounds, spec) / float(proxy_segment_count(spec))
+
+
+def build_proxy_curve_points(left: np.ndarray, right: np.ndarray, *, node_count: int, sag_depth: float) -> np.ndarray:
+    points: list[np.ndarray] = [left.astype(np.float64).copy()]
+    for index in range(node_count):
+        t = float(index + 1) / float(node_count + 1)
+        position = (1.0 - t) * left + t * right
+        position[2] -= sag_depth * 4.0 * t * (1.0 - t)
+        points.append(position.astype(np.float64, copy=False))
+    points.append(right.astype(np.float64).copy())
+    return np.stack(points, axis=0)
+
+
+def polyline_length(points: np.ndarray) -> float:
+    if points.shape[0] < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+
+
+def solve_proxy_sag_depth(
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    node_count: int,
+    target_length: float,
+    min_sag_depth: float,
+) -> float:
+    chord = float(np.linalg.norm(right - left))
+    if target_length <= chord + 1e-9:
+        return 0.0
+
+    lower = max(0.0, float(min_sag_depth))
+    lower_points = build_proxy_curve_points(left, right, node_count=node_count, sag_depth=lower)
+    if polyline_length(lower_points) >= target_length:
+        return lower
+
+    upper = max(lower if lower > 0.0 else 0.01, 0.01)
+    for _ in range(64):
+        upper_points = build_proxy_curve_points(left, right, node_count=node_count, sag_depth=upper)
+        if polyline_length(upper_points) >= target_length:
+            break
+        upper *= 2.0
+
+    for _ in range(80):
+        mid = 0.5 * (lower + upper)
+        mid_points = build_proxy_curve_points(left, right, node_count=node_count, sag_depth=mid)
+        if polyline_length(mid_points) < target_length:
+            lower = mid
+        else:
+            upper = mid
+    return upper
+
+
+def build_proxy_rope_xml(spec: RopeSpec, task_bounds: TaskBounds) -> tuple[str, str]:
+    width = max(0.001, 0.35 * spec.radius)
+    site_size = max(0.0005, 0.25 * width)
+    body_lines = [
+        '    <body name="proxy_left_anchor" mocap="true" pos="0 0 0">',
+        f'      <site name="proxy_left_anchor_site" pos="0 0 0" size="{site_size:.6f}" rgba="0 0 0 0"/>',
+        "    </body>",
+        '    <body name="proxy_right_anchor" mocap="true" pos="0 0 0">',
+        f'      <site name="proxy_right_anchor_site" pos="0 0 0" size="{site_size:.6f}" rgba="0 0 0 0"/>',
+        "    </body>",
+    ]
+
+    for index in range(proxy_node_count(spec)):
+        node_name = f"proxy_node_{index:02d}"
+        joint_name = f"{node_name}_joint"
+        site_name = f"{node_name}_site"
+        geom_name = f"{node_name}_geom"
+        body_lines.extend(
+            [
+                f'    <body name="{node_name}" pos="0 0 0">',
+                f'      <freejoint name="{joint_name}"/>',
+                (
+                    f'      <geom name="{geom_name}" type="sphere" size="{width:.6f}" '
+                    f'mass="{spec.proxy_mass:.6f}" rgba="0 0 0 0" contype="0" conaffinity="0"/>'
+                ),
+                f'      <site name="{site_name}" pos="0 0 0" size="{site_size:.6f}" rgba="0 0 0 0"/>',
+                "    </body>",
+            ]
+        )
+
+    point_sites = ["proxy_left_anchor_site"]
+    point_sites.extend(f"proxy_node_{index:02d}_site" for index in range(proxy_node_count(spec)))
+    point_sites.append("proxy_right_anchor_site")
+
+    tendon_lines = []
+    segment_rest = proxy_segment_rest_length(task_bounds, spec)
+    for index, (site_a, site_b) in enumerate(zip(point_sites[:-1], point_sites[1:], strict=True)):
+        tendon_lines.extend(
+            [
+                (
+                    f'    <spatial name="proxy_segment_{index:02d}" width="{width:.6f}" '
+                    f'range="0 {segment_rest:.6f}" limited="true" '
+                    f'stiffness="{spec.proxy_stiffness:.6f}" damping="{spec.proxy_damping:.6f}" '
+                    'rgba="0 0 0 0">'
+                ),
+                f'      <site site="{site_a}"/>',
+                f'      <site site="{site_b}"/>',
+                "    </spatial>",
+            ]
+        )
+
+    return "\n".join(body_lines), "\n".join(tendon_lines)
+
+
 def build_lab_scene_xml(
     base_config: BaseEnvConfig | None = None,
 ) -> str:
     config = BaseEnvConfig() if base_config is None else base_config
     rope_tendon_xml = build_rope_tendon_xml(config.rope_spec, config.task_bounds)
+    proxy_body_xml = ""
+    proxy_tendon_xml = ""
+    if config.enable_proxy_rope:
+        proxy_body_xml, proxy_tendon_xml = build_proxy_rope_xml(config.rope_spec, config.task_bounds)
     return f"""
 <mujoco model="lab_scene_control">
   <compiler angle="radian"/>
@@ -203,10 +328,12 @@ def build_lab_scene_xml(
             mode="fixed"
             pos="0 0 3.0"
             xyaxes="1 0 0  0 1 0"/>
+{proxy_body_xml}
   </worldbody>
 
   <tendon>
 {rope_tendon_xml}
+{proxy_tendon_xml}
   </tendon>
 </mujoco>
 """.strip()
@@ -382,6 +509,11 @@ class LabEnv:
     arm2_dofadr: np.ndarray = field(init=False)
     arm1_site_id: int = field(init=False)
     arm2_site_id: int = field(init=False)
+    proxy_left_mocap_id: int = field(init=False)
+    proxy_right_mocap_id: int = field(init=False)
+    proxy_node_qposadr: np.ndarray = field(init=False)
+    proxy_node_qveladr: np.ndarray = field(init=False)
+    proxy_node_site_ids: np.ndarray = field(init=False)
     joint_controller: JointPositionController = field(init=False)
     task_controller: SymmetricTaskController = field(init=False)
 
@@ -392,6 +524,26 @@ class LabEnv:
         self.data = make_data(self.model)
         self.arm1_site_id = self.model.site("arm1_attachment_site").id
         self.arm2_site_id = self.model.site("arm2_attachment_site").id
+        self.proxy_left_mocap_id = -1
+        self.proxy_right_mocap_id = -1
+        self.proxy_node_qposadr = np.zeros((0,), dtype=int)
+        self.proxy_node_qveladr = np.zeros((0,), dtype=int)
+        self.proxy_node_site_ids = np.zeros((0,), dtype=int)
+        if self.base_config.enable_proxy_rope:
+            self.proxy_left_mocap_id = int(self.model.body_mocapid[self.model.body("proxy_left_anchor").id])
+            self.proxy_right_mocap_id = int(self.model.body_mocapid[self.model.body("proxy_right_anchor").id])
+            self.proxy_node_qposadr = np.asarray(
+                [self.model.joint(f"proxy_node_{index:02d}_joint").qposadr[0] for index in range(proxy_node_count(self.rope_spec))],
+                dtype=int,
+            )
+            self.proxy_node_qveladr = np.asarray(
+                [self.model.joint(f"proxy_node_{index:02d}_joint").dofadr[0] for index in range(proxy_node_count(self.rope_spec))],
+                dtype=int,
+            )
+            self.proxy_node_site_ids = np.asarray(
+                [self.model.site(f"proxy_node_{index:02d}_site").id for index in range(proxy_node_count(self.rope_spec))],
+                dtype=int,
+            )
         self.arm1_qposadr, self.arm1_dofadr = self._joint_addresses("arm1_joint")
         self.arm2_qposadr, self.arm2_dofadr = self._joint_addresses("arm2_joint")
         self.joint_lower = np.zeros(self.model.nq, dtype=float)
@@ -458,6 +610,10 @@ class LabEnv:
         self.data.qpos[self.arm2_qposadr] = qpos[7:]
         self.data.ctrl[:] = qpos
         mujoco.mj_forward(self.model, self.data)
+        if self.base_config.enable_proxy_rope:
+            self._sync_proxy_anchors()
+            self._initialize_proxy_rope()
+            mujoco.mj_forward(self.model, self.data)
 
     def reset(self, task_state: TaskState | None = None) -> mujoco.MjData:
         mujoco.mj_resetData(self.model, self.data)
@@ -467,6 +623,8 @@ class LabEnv:
         self.set_arm_joint_positions(joint_targets)
         self.task_controller.set_target(desired)
         self.data.qvel[:] = 0.0
+        if self.base_config.enable_proxy_rope:
+            self._sync_proxy_anchors()
         mujoco.mj_forward(self.model, self.data)
         return self.data
 
@@ -491,12 +649,77 @@ class LabEnv:
     def step(self, nstep: int = 1) -> mujoco.MjData:
         self.data.ctrl[:] = self.joint_controller.target
         for _ in range(nstep):
+            if self.base_config.enable_proxy_rope:
+                self._sync_proxy_anchors()
             mujoco.mj_step(self.model, self.data)
+        if self.base_config.enable_proxy_rope:
+            self._sync_proxy_anchors()
+            self._initialize_proxy_rope()
         mujoco.mj_forward(self.model, self.data)
         return self.data
 
     def launch_viewer(self) -> None:
         mujoco.viewer.launch(self.model, self.data)
+
+    def _sync_proxy_anchors(self) -> None:
+        if not self.base_config.enable_proxy_rope:
+            return
+        left = self.data.site_xpos[self.arm1_site_id].copy()
+        right = self.data.site_xpos[self.arm2_site_id].copy()
+        self.data.mocap_pos[self.proxy_left_mocap_id] = left
+        self.data.mocap_pos[self.proxy_right_mocap_id] = right
+        self.data.mocap_quat[self.proxy_left_mocap_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        self.data.mocap_quat[self.proxy_right_mocap_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
+    def _initialize_proxy_rope(self) -> None:
+        if not self.base_config.enable_proxy_rope:
+            return
+        left = self.data.site_xpos[self.arm1_site_id].copy()
+        right = self.data.site_xpos[self.arm2_site_id].copy()
+        node_count = proxy_node_count(self.rope_spec)
+        target_length = rope_rest_length(self.task_bounds, self.rope_spec)
+        sag_depth = solve_proxy_sag_depth(
+            left,
+            right,
+            node_count=node_count,
+            target_length=target_length,
+            min_sag_depth=self.rope_spec.sag,
+        )
+        curve_points = build_proxy_curve_points(left, right, node_count=node_count, sag_depth=sag_depth)
+        for index, qposadr in enumerate(self.proxy_node_qposadr):
+            position = curve_points[index + 1]
+            self.data.qpos[qposadr : qposadr + 3] = position
+            self.data.qpos[qposadr + 3 : qposadr + 7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        if self.proxy_node_qveladr.size > 0:
+            qveladr = self.proxy_node_qveladr[0]
+            span = 6 * node_count
+            self.data.qvel[qveladr : qveladr + span] = 0.0
+
+    def get_proxy_rope_points(self) -> np.ndarray:
+        if not self.base_config.enable_proxy_rope:
+            raise RuntimeError("Proxy rope is disabled for this environment.")
+        left = self.data.site_xpos[self.arm1_site_id].copy()
+        right = self.data.site_xpos[self.arm2_site_id].copy()
+        points = [left]
+        points.extend(self.data.site_xpos[site_id].copy() for site_id in self.proxy_node_site_ids)
+        points.append(right)
+        return np.stack(points, axis=0)
+
+    def get_proxy_rope_midpoint(self) -> np.ndarray:
+        if not self.base_config.enable_proxy_rope:
+            raise RuntimeError("Proxy rope is disabled for this environment.")
+        points = self.get_proxy_rope_points()
+        midpoint_index = 0.5 * float(points.shape[0] - 1)
+        lower_index = int(np.floor(midpoint_index))
+        upper_index = int(np.ceil(midpoint_index))
+        if lower_index == upper_index:
+            return points[lower_index].copy()
+        return (0.5 * (points[lower_index] + points[upper_index])).copy()
+
+    def get_proxy_rope_midpoint_height(self) -> float:
+        if not self.base_config.enable_proxy_rope:
+            raise RuntimeError("Proxy rope is disabled for this environment.")
+        return float(self.get_proxy_rope_midpoint()[2])
 
 
 @dataclass

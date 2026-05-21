@@ -23,14 +23,25 @@ from pusht.shared.pusht_env import DEFAULT_PUSHT_ENV_ID, make_pusht_env, reset_p
 from pusht.shared.utils import env_action_from_policy_action, load_expert_policy_bundle
 
 DEFAULT_MODEL_DIR = Path("pusht/models")
-DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_diffusion_edge.h5")
-ROLLOUT_MODES = ("expert", "expert_plus_noise", "expert_edge_sample")
-RATIOS = (0.0, 0.0, 1.0)  # expert, expert_plus_noise, expert_edge_sample
-DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500, 500)
+DEFAULT_OUTPUT_PATH = Path("pusht/data/pusht_diffusion_random.h5")
+ROLLOUT_MODES = ("expert", "expert_plus_noise", "expert_edge_sample", "biased_random")
+RATIOS = (0.0, 0.0, 0.0, 1.0)  # expert, expert_plus_noise, expert_edge_sample, biased_random
+DEFAULT_MAX_ENV_STEPS_BY_MODE = (500, 500, 500, 50)
 PUSHT_WALL_MIN = 5.0
 PUSHT_WALL_MAX = 506.0
 PUSHT_WALL_RADIUS = 2.0
 PUSHT_AGENT_RADIUS = 15.0
+ENV_ACTION_SCALE = 100.0
+TEE_SCALE = 30.0
+TEE_LENGTH = 4.0
+TEE_BAR_X_MIN = -TEE_LENGTH * TEE_SCALE / 2.0
+TEE_BAR_X_MAX = TEE_LENGTH * TEE_SCALE / 2.0
+TEE_BAR_Y_MIN = 0.0
+TEE_BAR_Y_MAX = TEE_SCALE
+TEE_STEM_X_MIN = -TEE_SCALE / 2.0
+TEE_STEM_X_MAX = TEE_SCALE / 2.0
+TEE_STEM_Y_MIN = TEE_SCALE
+TEE_STEM_Y_MAX = TEE_LENGTH * TEE_SCALE
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--env-id", default=DEFAULT_PUSHT_ENV_ID)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    parser.add_argument("--num-episodes", type=int, default=5_000)
+    parser.add_argument("--num-episodes", type=int, default=100_000)
     parser.add_argument("--start-seed", type=int, default=0)
     parser.add_argument(
         "--max-steps-expert",
@@ -59,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_ENV_STEPS_BY_MODE[2],
         help="Max env steps for expert_edge_sample rollouts.",
     )
+    parser.add_argument(
+        "--max-steps-biased-random",
+        type=int,
+        default=DEFAULT_MAX_ENV_STEPS_BY_MODE[3],
+        help="Max env steps for biased_random rollouts.",
+    )
     parser.add_argument("--image-height", type=int, default=224)
     parser.add_argument("--image-width", type=int, default=224)
     parser.add_argument(
@@ -72,6 +89,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-failures", action="store_true", default=True)
     parser.add_argument("--hide-target", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--expert-noise-std", type=float, default=8.5)
+    parser.add_argument(
+        "--biased-random-direction-kappa",
+        type=float,
+        default=1.5,
+        help="Von Mises concentration around the direction to the T for biased_random rollouts.",
+    )
+    parser.add_argument(
+        "--biased-random-magnitude-min",
+        type=float,
+        default=15.0,
+        help="Minimum sampled target displacement magnitude in pixels for biased_random rollouts.",
+    )
+    parser.add_argument(
+        "--biased-random-magnitude-max",
+        type=float,
+        default=35.0,
+        help="Maximum sampled target displacement magnitude in pixels for biased_random rollouts.",
+    )
+    parser.add_argument(
+        "--biased-random-aim-mode",
+        choices=("center", "surface"),
+        default="surface",
+        help="Whether biased_random rollouts aim toward the block center or a random point on the T surface.",
+    )
     parser.add_argument(
         "--pixel-compression",
         choices=("blosc", "lzf", "gzip", "none"),
@@ -244,6 +285,53 @@ def _policy_action_to_relative_action(policy_action: np.ndarray, agent_pos: np.n
     return np.clip((policy_action - agent_pos) / 100.0, -1.0, 1.0).astype(np.float32)
 
 
+def _clip_action_to_space_single(action: np.ndarray, action_space: gym.Space | None) -> np.ndarray:
+    if action_space is None:
+        return np.asarray(action, dtype=np.float32)
+    high = np.asarray(getattr(action_space, "high", None))
+    low = np.asarray(getattr(action_space, "low", None))
+    if high.shape != action.shape or low.shape != action.shape:
+        return np.asarray(action, dtype=np.float32)
+    return np.clip(action, low, high).astype(np.float32)
+
+
+def _target_xy_to_env_action(action_space: gym.Space | None, agent_xy: np.ndarray, target_xy: np.ndarray) -> np.ndarray:
+    if action_space is not None:
+        high = np.asarray(getattr(action_space, "high", None))
+        low = np.asarray(getattr(action_space, "low", None))
+        if high.shape == (2,) and low.shape == (2,) and np.all(high <= 1.0) and np.all(low >= -1.0):
+            return np.clip((target_xy - agent_xy) / ENV_ACTION_SCALE, low, high).astype(np.float32)
+    return target_xy.astype(np.float32)
+
+
+def _rotation_matrix(theta: float) -> np.ndarray:
+    c = float(np.cos(theta))
+    s = float(np.sin(theta))
+    return np.asarray([[c, -s], [s, c]], dtype=np.float32)
+
+
+def _sample_point_on_t(block_pose: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    bar_area = (TEE_BAR_X_MAX - TEE_BAR_X_MIN) * (TEE_BAR_Y_MAX - TEE_BAR_Y_MIN)
+    stem_area = (TEE_STEM_X_MAX - TEE_STEM_X_MIN) * (TEE_STEM_Y_MAX - TEE_STEM_Y_MIN)
+    if float(rng.uniform()) < bar_area / (bar_area + stem_area):
+        local_xy = np.asarray(
+            [
+                rng.uniform(TEE_BAR_X_MIN, TEE_BAR_X_MAX),
+                rng.uniform(TEE_BAR_Y_MIN, TEE_BAR_Y_MAX),
+            ],
+            dtype=np.float32,
+        )
+    else:
+        local_xy = np.asarray(
+            [
+                rng.uniform(TEE_STEM_X_MIN, TEE_STEM_X_MAX),
+                rng.uniform(TEE_STEM_Y_MIN, TEE_STEM_Y_MAX),
+            ],
+            dtype=np.float32,
+        )
+    return ((_rotation_matrix(float(block_pose[2])) @ local_xy) + block_pose[:2]).astype(np.float32)
+
+
 def _rollout_probabilities() -> np.ndarray:
     ratios = np.asarray(RATIOS, dtype=np.float64)
     if ratios.shape != (len(ROLLOUT_MODES),):
@@ -265,6 +353,7 @@ def _mode_max_steps(args: argparse.Namespace, mode: str) -> int:
         "expert": args.max_steps_expert,
         "expert_plus_noise": args.max_steps_expert_noisy,
         "expert_edge_sample": args.max_steps_expert_edge_sample,
+        "biased_random": args.max_steps_biased_random,
     }
     return int(mapping[mode])
 
@@ -281,6 +370,56 @@ def _clip_action_to_space(actions: np.ndarray, action_space: gym.Space | None) -
     if high.shape != actions.shape[1:] or low.shape != actions.shape[1:]:
         return np.asarray(actions, dtype=np.float32)
     return np.clip(actions, low, high).astype(np.float32)
+
+
+def _sample_biased_random_actions(
+    raw_observations: dict[str, Any],
+    action_space: gym.Space | None,
+    rollout_modes: list[str],
+    active: np.ndarray,
+    episode_rngs: list[np.random.Generator],
+    *,
+    direction_kappa: float,
+    magnitude_min: float,
+    magnitude_max: float,
+    aim_mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    num_envs = len(rollout_modes)
+    env_actions = np.zeros((num_envs, 2), dtype=np.float32)
+    logged_actions = np.zeros((num_envs, 2), dtype=np.float32)
+    if "block_pose" not in raw_observations:
+        raise KeyError("biased_random rollout requires block_pose observations.")
+
+    agent_positions = np.asarray(raw_observations["agent_pos"], dtype=np.float32)
+    block_poses = np.asarray(raw_observations["block_pose"], dtype=np.float32)
+    for env_idx in range(num_envs):
+        if not active[env_idx] or rollout_modes[env_idx] != "biased_random":
+            continue
+        agent_xy = agent_positions[env_idx]
+        block_pose = block_poses[env_idx]
+        rng = episode_rngs[env_idx]
+        if aim_mode == "center":
+            aim_xy = block_pose[:2]
+        else:
+            aim_xy = _sample_point_on_t(block_pose, rng)
+        aim_delta = aim_xy - agent_xy
+        aim_angle = float(np.arctan2(aim_delta[1], aim_delta[0]))
+        sampled_angle = float(rng.vonmises(aim_angle, direction_kappa))
+        magnitude = float(rng.uniform(magnitude_min, magnitude_max))
+        target_xy = agent_xy + magnitude * np.asarray([np.cos(sampled_angle), np.sin(sampled_angle)], dtype=np.float32)
+        env_action = _clip_action_to_space_single(
+            _target_xy_to_env_action(action_space, agent_xy, target_xy),
+            action_space,
+        )
+        env_actions[env_idx] = env_action
+        if action_space is not None:
+            high = np.asarray(getattr(action_space, "high", None))
+            low = np.asarray(getattr(action_space, "low", None))
+            if high.shape == (2,) and low.shape == (2,) and np.all(high <= 1.0) and np.all(low >= -1.0):
+                logged_actions[env_idx] = env_action.copy()
+                continue
+        logged_actions[env_idx] = _policy_action_to_relative_action(target_xy, agent_xy)
+    return env_actions, logged_actions
 
 
 def _apply_expert_noise(
@@ -568,12 +707,21 @@ def main() -> None:
         raise ValueError("--max-steps-expert-noisy must be >= 1.")
     if args.max_steps_expert_edge_sample < 1:
         raise ValueError("--max-steps-expert-edge-sample must be >= 1.")
+    if args.max_steps_biased_random < 1:
+        raise ValueError("--max-steps-biased-random must be >= 1.")
     if args.expert_noise_std < 0.0:
         raise ValueError("--expert-noise-std must be >= 0.")
+    if args.biased_random_direction_kappa < 0.0:
+        raise ValueError("--biased-random-direction-kappa must be >= 0.")
+    if args.biased_random_magnitude_min < 0.0:
+        raise ValueError("--biased-random-magnitude-min must be >= 0.")
+    if args.biased_random_magnitude_max < args.biased_random_magnitude_min:
+        raise ValueError("--biased-random-magnitude-max must be >= --biased-random-magnitude-min.")
     if args.out.exists():
         raise FileExistsError(f"Output already exists: {args.out}")
 
-    bundle = load_expert_policy_bundle(args.model_dir, device=args.device)
+    uses_expert_policy = _rollout_probabilities()[:3].sum() > 0.0
+    bundle = load_expert_policy_bundle(args.model_dir, device=args.device) if uses_expert_policy else None
     writer = H5EpisodeWriter(
         args.out,
         pixel_compression=args.pixel_compression,
@@ -590,7 +738,8 @@ def main() -> None:
             while saved < args.num_episodes:
                 reset_seeds = [args.start_seed + attempts + env_idx for env_idx in range(args.num_envs)]
                 attempts += args.num_envs
-                bundle.policy.reset()
+                if bundle is not None:
+                    bundle.policy.reset()
                 raw_observations, _ = env.reset(seed=reset_seeds)
                 rollout_modes = _sample_rollout_modes(args, mode_rng, args.num_envs)
                 edge_sample_mask = np.asarray(
@@ -633,38 +782,56 @@ def main() -> None:
                     if step_idx % args.control_interval == 0:
                         env_actions.fill(0.0)
                         logged_actions.fill(0.0)
-                        expert_env_actions, expert_logged_actions = _select_expert_actions(
-                            bundle,
+                        if bundle is not None:
+                            expert_env_actions, expert_logged_actions = _select_expert_actions(
+                                bundle,
+                                raw_observations,
+                                action_space,
+                            )
+                            expert_mask = np.asarray(
+                                [active[idx] and rollout_modes[idx] == "expert" for idx in range(args.num_envs)],
+                                dtype=bool,
+                            )
+                            env_actions[expert_mask] = expert_env_actions[expert_mask]
+                            logged_actions[expert_mask] = expert_logged_actions[expert_mask]
+                            noisy_mask = np.asarray(
+                                [active[idx] and rollout_modes[idx] == "expert_plus_noise" for idx in range(args.num_envs)],
+                                dtype=bool,
+                            )
+                            noisy_indices = np.flatnonzero(noisy_mask)
+                            for env_idx in noisy_indices:
+                                noisy_env_action, noisy_logged_action = _apply_expert_noise(
+                                    expert_env_actions[env_idx],
+                                    np.asarray(raw_observations["agent_pos"][env_idx], dtype=np.float32),
+                                    action_space,
+                                    episode_rngs[env_idx],
+                                    args.expert_noise_std,
+                                )
+                                env_actions[env_idx] = noisy_env_action
+                                logged_actions[env_idx] = noisy_logged_action
+                            edge_mask = np.asarray(
+                                [active[idx] and rollout_modes[idx] == "expert_edge_sample" for idx in range(args.num_envs)],
+                                dtype=bool,
+                            )
+                            env_actions[edge_mask] = expert_env_actions[edge_mask]
+                            logged_actions[edge_mask] = expert_logged_actions[edge_mask]
+                        random_env_actions, random_logged_actions = _sample_biased_random_actions(
                             raw_observations,
                             action_space,
+                            rollout_modes,
+                            active,
+                            episode_rngs,
+                            direction_kappa=args.biased_random_direction_kappa,
+                            magnitude_min=args.biased_random_magnitude_min,
+                            magnitude_max=args.biased_random_magnitude_max,
+                            aim_mode=args.biased_random_aim_mode,
                         )
-                        expert_mask = np.asarray(
-                            [active[idx] and rollout_modes[idx] == "expert" for idx in range(args.num_envs)],
+                        random_mask = np.asarray(
+                            [active[idx] and rollout_modes[idx] == "biased_random" for idx in range(args.num_envs)],
                             dtype=bool,
                         )
-                        env_actions[expert_mask] = expert_env_actions[expert_mask]
-                        logged_actions[expert_mask] = expert_logged_actions[expert_mask]
-                        noisy_mask = np.asarray(
-                            [active[idx] and rollout_modes[idx] == "expert_plus_noise" for idx in range(args.num_envs)],
-                            dtype=bool,
-                        )
-                        noisy_indices = np.flatnonzero(noisy_mask)
-                        for env_idx in noisy_indices:
-                            noisy_env_action, noisy_logged_action = _apply_expert_noise(
-                                expert_env_actions[env_idx],
-                                np.asarray(raw_observations["agent_pos"][env_idx], dtype=np.float32),
-                                action_space,
-                                episode_rngs[env_idx],
-                                args.expert_noise_std,
-                            )
-                            env_actions[env_idx] = noisy_env_action
-                            logged_actions[env_idx] = noisy_logged_action
-                        edge_mask = np.asarray(
-                            [active[idx] and rollout_modes[idx] == "expert_edge_sample" for idx in range(args.num_envs)],
-                            dtype=bool,
-                        )
-                        env_actions[edge_mask] = expert_env_actions[edge_mask]
-                        logged_actions[edge_mask] = expert_logged_actions[edge_mask]
+                        env_actions[random_mask] = random_env_actions[random_mask]
+                        logged_actions[random_mask] = random_logged_actions[random_mask]
 
                     for env_idx in range(args.num_envs):
                         if not active[env_idx]:

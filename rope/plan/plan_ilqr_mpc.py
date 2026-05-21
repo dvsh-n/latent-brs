@@ -25,18 +25,18 @@ from rope.shared.lab_env import LabEnv, TaskState
 from rope.train.mlpdyn_train import LeWMRopeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "rope/data/test_data/rope_random_cubic_spline.h5"
-DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
 DEFAULT_OUT_DIR = "rope/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
-HORIZON = 25
+HORIZON = 15
 MAX_MPC_STEPS = 50
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.01
 VIDEO_FPS = 20
 EPISODE_IDX = None
-DISABLE_SHADOWS = False
+DISABLE_SHADOWS = True
 
 
 def parse_args() -> argparse.Namespace:
