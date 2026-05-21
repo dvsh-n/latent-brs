@@ -25,6 +25,8 @@ import h5py
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+import jax.numpy as jnp
+import jax
 
 from gpu_sls.mppi_planner import MPPIPlanner
 from pusht.plan.plan_ilqr_mpc import (
@@ -69,13 +71,13 @@ DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_embd_48"
 DEFAULT_OUT_DIR = "pusht/plan/mppi_mlpdyn"
 DEVICE = "auto"
 HORIZON = 65
-MAX_MPC_STEPS = 250
+MAX_MPC_STEPS = 350
 Q_TERMINAL = 10.0
 Q_STAGE = 0.5
 R_CONTROL = 0.001
 VIDEO_FPS = 10
 EPISODE_IDX = None
-MPPI_SAMPLES = 1024
+MPPI_SAMPLES = 2048
 MPPI_UPDATE_ITERS = 5
 MPPI_REWARD_WEIGHT = 20.0
 MPPI_NOISE_LEVEL = 0.35
