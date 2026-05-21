@@ -6,12 +6,16 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+if "MPLCONFIGDIR" not in os.environ:
+    mpl_config_dir = Path(tempfile.gettempdir()) / f"matplotlib-{os.getuid()}"
+    mpl_config_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(mpl_config_dir)
 
 import h5py
 import imageio.v2 as imageio
@@ -23,18 +27,24 @@ import json
 from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_4"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_noisy.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_sin"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "cuda"
 HORIZON = 20
 MAX_MPC_STEPS = 100
-Q_TERMINAL = 2.5
+Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.01
 VIDEO_FPS = 60
-EPISODE_IDX = 163
+EPISODE_IDX = None
+# DEFAULT_START_QPOS = np.array([0.146451935172081, -0.7491843104362488], dtype=np.float32)
+# DEFAULT_GOAL_QPOS = np.array([2.4196903705596924, -0.9535070657730103], dtype=np.float32)
+# DEFAULT_START_QPOS = np.array([0.1, -2.0], dtype=np.float32)
+# DEFAULT_GOAL_QPOS = np.array([2.42, -0.95], dtype=np.float32)
+DEFAULT_START_QPOS = None
+DEFAULT_GOAL_QPOS = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -279,6 +289,37 @@ def load_dataset_episode(
         }
 
 
+def resolve_start_goal_qpos(
+    *,
+    dataset_qpos: np.ndarray,
+    swap_start_goal: bool,
+    default_start_qpos: np.ndarray | None,
+    default_goal_qpos: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, int | None, int | None, str]:
+    if (default_start_qpos is None) != (default_goal_qpos is None):
+        raise ValueError("DEFAULT_START_QPOS and DEFAULT_GOAL_QPOS must both be set or both be None.")
+
+    if default_start_qpos is not None and default_goal_qpos is not None:
+        expected_shape = (int(dataset_qpos.shape[1]),)
+        start_qpos = np.asarray(default_start_qpos, dtype=np.float32)
+        goal_qpos = np.asarray(default_goal_qpos, dtype=np.float32)
+        if start_qpos.shape != expected_shape:
+            raise ValueError(f"DEFAULT_START_QPOS must have shape {expected_shape}, got {start_qpos.shape}.")
+        if goal_qpos.shape != expected_shape:
+            raise ValueError(f"DEFAULT_GOAL_QPOS must have shape {expected_shape}, got {goal_qpos.shape}.")
+        return start_qpos.copy(), goal_qpos.copy(), None, None, "fixed_qpos"
+
+    start_idx = -1 if swap_start_goal else 0
+    goal_idx = 0 if swap_start_goal else -1
+    return (
+        np.asarray(dataset_qpos[start_idx], dtype=np.float32).copy(),
+        np.asarray(dataset_qpos[goal_idx], dtype=np.float32).copy(),
+        int(start_idx),
+        int(goal_idx),
+        "dataset_episode",
+    )
+
+
 def make_render_env(
     *,
     seed: int,
@@ -340,6 +381,23 @@ def build_observation_from_env(
         goal_qpos = np.asarray(goal_obs[4:6], dtype=np.float32).copy()
         goal_delta = goal_qpos - qpos
         return np.concatenate((qpos, qvel, goal_qpos, goal_delta), axis=0).astype(np.float32)
+    raise ValueError(f"Unsupported observation dimension: {obs_dim}")
+
+
+def build_goal_observation(
+    env: DmControlGymEnv,
+    *,
+    goal_qpos: np.ndarray,
+    goal_qvel: np.ndarray,
+    obs_dim: int,
+) -> np.ndarray:
+    if obs_dim == 8:
+        goal_delta = np.zeros_like(goal_qpos, dtype=np.float32)
+        return np.concatenate((goal_qpos, goal_qvel, goal_qpos, goal_delta), axis=0).astype(np.float32)
+    if obs_dim == 6:
+        placeholder = np.zeros((8,), dtype=np.float32)
+        placeholder[4 : 4 + goal_qpos.shape[0]] = goal_qpos
+        return build_observation_from_env(env, obs_dim=obs_dim, goal_obs=placeholder)
     raise ValueError(f"Unsupported observation dimension: {obs_dim}")
 
 
@@ -643,33 +701,20 @@ def main() -> None:
     height = int(episode["height"])
     width = int(episode["width"])
 
-    run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
+    start_qpos, goal_qpos, start_idx, goal_idx, start_goal_source = resolve_start_goal_qpos(
+        dataset_qpos=qpos_np,
+        swap_start_goal=args.swap_start_goal,
+        default_start_qpos=DEFAULT_START_QPOS,
+        default_goal_qpos=DEFAULT_GOAL_QPOS,
+    )
+    run_name = (
+        f"{int(time.time())}_episode_custom"
+        if start_goal_source == "fixed_qpos"
+        else f"{int(time.time())}_episode_{episode_idx:05d}"
+    )
     out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    pixels = preprocess_pixels(
-        pixels_np,
-        img_size=img_size,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
-    )
-    true_latents = encode_frames(
-        model,
-        pixels,
-        device=device,
-        frame_batch_size=args.frame_batch_size,
-    )
-    start_idx = -1 if args.swap_start_goal else 0
-    goal_idx = 0 if args.swap_start_goal else -1
-    start_emb = true_latents[start_idx]
-    goal_emb = true_latents[goal_idx]
-    start_state = make_markov_state(start_emb)
-    goal_state = make_markov_state(goal_emb)
-    if int(start_state.numel()) != markov_state_dim:
-        raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {start_state.numel()}.")
-
-    save_rgb_image(out_dir / "start_image.png", pixels_np[start_idx])
-    save_rgb_image(out_dir / "goal_image.png", pixels_np[goal_idx])
+    zero_qvel = np.zeros_like(qvel_np[0], dtype=np.float32)
 
     env = make_render_env(
         seed=episode_seed,
@@ -678,11 +723,51 @@ def main() -> None:
         height=height,
         physics_freq_hz=physics_freq_hz,
     )
+    start_frame = reset_env_to_state(
+        env,
+        seed=episode_seed,
+        qpos=start_qpos,
+        qvel=zero_qvel,
+        height=height,
+        width=width,
+    )
+    goal_frame = reset_env_to_state(
+        env,
+        seed=episode_seed,
+        qpos=goal_qpos,
+        qvel=zero_qvel,
+        height=height,
+        width=width,
+    )
+    start_emb = encode_single_frame(
+        model,
+        start_frame,
+        device=device,
+        img_size=img_size,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+    )
+    goal_emb = encode_single_frame(
+        model,
+        goal_frame,
+        device=device,
+        img_size=img_size,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+    )
+    start_state = make_markov_state(start_emb)
+    goal_state = make_markov_state(goal_emb)
+    if int(start_state.numel()) != markov_state_dim:
+        raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {start_state.numel()}.")
+
+    save_rgb_image(out_dir / "start_image.png", start_frame)
+    save_rgb_image(out_dir / "goal_image.png", goal_frame)
+
     render_start = reset_env_to_state(
         env,
         seed=episode_seed,
-        qpos=qpos_np[start_idx],
-        qvel=qvel_np[start_idx],
+        qpos=start_qpos,
+        qvel=zero_qvel,
         height=height,
         width=width,
     )
@@ -712,7 +797,7 @@ def main() -> None:
     current_state = make_markov_state(current_emb)
     initial_current_state = current_state.detach().cpu().clone()
     goal_state_np = goal_state.detach().cpu().numpy().astype(np.float64)
-    goal_obs = obs_np[goal_idx].astype(np.float32)
+    goal_obs = build_goal_observation(env, goal_qpos=goal_qpos, goal_qvel=zero_qvel, obs_dim=int(obs_np.shape[1]))
     obs_dim = int(goal_obs.shape[0])
     current_obs = build_observation_from_env(env, obs_dim=obs_dim, goal_obs=goal_obs)
 
@@ -827,8 +912,9 @@ def main() -> None:
             "ilqr_regularization": float(args.ilqr_regularization),
             "seed": None if args.seed is None else int(args.seed),
             "swap_start_goal": bool(args.swap_start_goal),
-            "start_idx": int(start_idx),
-            "goal_idx": int(goal_idx),
+            "start_idx": None if start_idx is None else int(start_idx),
+            "goal_idx": None if goal_idx is None else int(goal_idx),
+            "start_goal_source": start_goal_source,
             "planned_steps": int(len(nominal_state_rollouts)),
             "executed_steps": int(len(executed_actions_raw)),
             "stop_reason": stop_reason,
@@ -843,6 +929,10 @@ def main() -> None:
         "planner_data": {
             "action_mean": action_mean,
             "action_std": action_std,
+            "start_qpos": start_qpos,
+            "goal_qpos": goal_qpos,
+            "start_qvel": zero_qvel,
+            "goal_qvel": zero_qvel,
             "goal_obs": goal_obs,
             "start_embedding": start_emb.detach().cpu(),
             "goal_embedding": goal_emb.detach().cpu(),

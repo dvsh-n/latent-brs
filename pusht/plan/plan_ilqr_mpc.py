@@ -31,7 +31,7 @@ from pusht.shared.pusht_env import (
 from pusht.train.mlpdyn_train import build_markov_state, required_markov_history
 
 DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_eval.h5"
-DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_2"
+DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_embd_48"
 DEFAULT_OUT_DIR = "pusht/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
@@ -41,7 +41,7 @@ Q_TERMINAL = 10.0
 Q_STAGE = 0.005
 R_CONTROL = 0.001
 VIDEO_FPS = 10
-EPISODE_IDX = 955 
+EPISODE_IDX = 8 
 CONTROL_MIN_NORM = -1.5
 CONTROL_MAX_NORM = 1.5
 ENV_ACTION_SCALE = 100.0
