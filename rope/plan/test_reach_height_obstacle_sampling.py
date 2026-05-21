@@ -20,12 +20,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 import mujoco
 import numpy as np
 import torch
 
 from rope.plan import plan_ilqr_mpc as planner
-from rope.shared.lab_env import LabEnv, TaskState
+from rope.shared.lab_env import BaseEnvConfig, LabEnv, TaskState
 
 DEFAULT_OUT_DIR = "rope/plan/reach_height_obstacle_sampling"
 DISABLE_SHADOWS = True
@@ -191,7 +192,7 @@ def render_state_batch(
     disable_shadows: bool,
 ) -> np.ndarray:
     camera_id = env.model.camera(camera_name).id
-    qvel = np.zeros((qpos_batch.shape[1],), dtype=np.float32)
+    qvel = np.zeros((env.model.nv,), dtype=np.float32)
     frames: list[np.ndarray] = []
     for state_vec, qpos, control in zip(task_states, qpos_batch, control_batch, strict=True):
         frame, _ = planner.reset_env_to_state(
@@ -206,6 +207,132 @@ def render_state_batch(
             disable_shadows=disable_shadows,
         )
         frames.append(frame.copy())
+    return np.stack(frames, axis=0)
+
+
+def project_world_to_image(
+    env: LabEnv,
+    camera_id: int,
+    world_points: np.ndarray,
+    *,
+    image_width: int,
+    image_height: int,
+) -> np.ndarray:
+    points = np.asarray(world_points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Expected points with shape [N, 3], got {points.shape}.")
+
+    cam_pos = env.data.cam_xpos[camera_id].astype(np.float64)
+    cam_rot = env.data.cam_xmat[camera_id].reshape(3, 3).astype(np.float64)
+    rel = points - cam_pos[None, :]
+    cam_points = rel @ cam_rot
+
+    depth = -cam_points[:, 2]
+    valid = depth > 1e-6
+    projected = np.full((points.shape[0], 2), np.nan, dtype=np.float64)
+    if not np.any(valid):
+        return projected
+
+    fovy = math.radians(float(env.model.cam_fovy[camera_id]))
+    aspect = float(image_width) / float(image_height)
+    tan_half_fovy = math.tan(0.5 * fovy)
+    x_ndc = cam_points[valid, 0] / (depth[valid] * tan_half_fovy * aspect)
+    y_ndc = cam_points[valid, 1] / (depth[valid] * tan_half_fovy)
+
+    projected[valid, 0] = (0.5 + 0.5 * x_ndc) * float(image_width)
+    projected[valid, 1] = (0.5 - 0.5 * y_ndc) * float(image_height)
+    return projected
+
+
+def overlay_proxy_rope(
+    frame: np.ndarray,
+    env: LabEnv,
+    *,
+    camera_id: int,
+) -> np.ndarray:
+    proxy_points = env.get_proxy_rope_points()
+    midpoint = env.get_proxy_rope_midpoint()[None, :]
+    pixel_points = project_world_to_image(
+        env,
+        camera_id,
+        proxy_points,
+        image_width=int(frame.shape[1]),
+        image_height=int(frame.shape[0]),
+    )
+    midpoint_px = project_world_to_image(
+        env,
+        camera_id,
+        midpoint,
+        image_width=int(frame.shape[1]),
+        image_height=int(frame.shape[0]),
+    )[0]
+
+    fig = plt.figure(figsize=(frame.shape[1] / 100.0, frame.shape[0] / 100.0), dpi=100)
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+    ax.imshow(frame)
+    valid = np.isfinite(pixel_points[:, 0]) & np.isfinite(pixel_points[:, 1])
+    if np.any(valid):
+        ax.plot(
+            pixel_points[valid, 0],
+            pixel_points[valid, 1],
+            color="#39d0ff",
+            linewidth=2.0,
+            alpha=0.9,
+        )
+        ax.scatter(
+            pixel_points[valid, 0],
+            pixel_points[valid, 1],
+            s=12.0,
+            c="#a5f3ff",
+            alpha=0.75,
+        )
+    if np.all(np.isfinite(midpoint_px)):
+        ax.scatter(
+            [midpoint_px[0]],
+            [midpoint_px[1]],
+            s=60.0,
+            c="#ff3ea5",
+            edgecolors="white",
+            linewidths=1.0,
+            alpha=0.95,
+        )
+    ax.set_axis_off()
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    width, height = canvas.get_width_height()
+    overlaid = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)[..., :3].copy()
+    plt.close(fig)
+    return overlaid
+
+
+def render_proxy_overlay_batch(
+    env: LabEnv,
+    renderer: mujoco.Renderer,
+    task_states: np.ndarray,
+    qpos_batch: np.ndarray,
+    control_batch: np.ndarray,
+    *,
+    camera_name: str,
+    elapsed_time: float,
+    disable_shadows: bool,
+) -> np.ndarray:
+    camera_id = env.model.camera(camera_name).id
+    qvel = np.zeros((env.model.nv,), dtype=np.float32)
+    frames: list[np.ndarray] = []
+    for state_vec, qpos, control in zip(task_states, qpos_batch, control_batch, strict=True):
+        frame, _ = planner.reset_env_to_state(
+            env,
+            renderer,
+            qpos=qpos,
+            qvel=qvel,
+            control=control,
+            task_target=np.asarray(state_vec, dtype=np.float32),
+            camera_id=camera_id,
+            elapsed_time=elapsed_time,
+            disable_shadows=disable_shadows,
+        )
+        frames.append(overlay_proxy_rope(frame.copy(), env, camera_id=camera_id))
     return np.stack(frames, axis=0)
 
 
@@ -292,6 +419,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env = LabEnv()
+    proxy_env = LabEnv(base_config=BaseEnvConfig(enable_proxy_rope=True))
     lower, upper = task_bounds_arrays(env)
     validate_obstacle_spec(lower, upper, args)
 
@@ -347,8 +475,38 @@ def main() -> None:
             disable_shadows=bool(args.disable_shadows),
         )
 
+    with mujoco.Renderer(proxy_env.model, height=int(args.height), width=int(args.width)) as proxy_renderer:
+        front_proxy_overlay_reps = render_proxy_overlay_batch(
+            proxy_env,
+            proxy_renderer,
+            rep_states,
+            rep_qpos,
+            rep_control,
+            camera_name="video_cam",
+            elapsed_time=0.0,
+            disable_shadows=bool(args.disable_shadows),
+        )
+        top_proxy_overlay_reps = render_proxy_overlay_batch(
+            proxy_env,
+            proxy_renderer,
+            rep_states,
+            rep_qpos,
+            rep_control,
+            camera_name="ceiling_cam",
+            elapsed_time=0.0,
+            disable_shadows=bool(args.disable_shadows),
+        )
+
     planner.save_rgb_image(out_dir / "front_obstacle_samples_grid.png", make_image_grid(front_obstacle_reps, columns=3))
     planner.save_rgb_image(out_dir / "top_obstacle_samples_grid.png", make_image_grid(top_obstacle_reps, columns=3))
+    planner.save_rgb_image(
+        out_dir / "front_obstacle_samples_proxy_overlay_grid.png",
+        make_image_grid(front_proxy_overlay_reps, columns=3),
+    )
+    planner.save_rgb_image(
+        out_dir / "top_obstacle_samples_proxy_overlay_grid.png",
+        make_image_grid(top_proxy_overlay_reps, columns=3),
+    )
 
     save_workspace_plot(
         out_path=out_dir / "workspace_samples.png",
@@ -373,7 +531,7 @@ def main() -> None:
             },
             "episode_data": {
                 "qpos": np.concatenate((obstacle_qpos, outside_qpos), axis=0),
-                "qvel": np.zeros((obstacle_qpos.shape[0] + outside_qpos.shape[0], obstacle_qpos.shape[1]), dtype=np.float32),
+                "qvel": np.zeros((obstacle_qpos.shape[0] + outside_qpos.shape[0], env.model.nv), dtype=np.float32),
                 "control": np.concatenate((obstacle_control, outside_control), axis=0),
                 "task_target": np.concatenate((obstacle_states, outside_states), axis=0).astype(np.float32),
                 "labels": np.concatenate(
@@ -424,6 +582,8 @@ def main() -> None:
     print(f"Saved workspace: {out_dir / 'workspace_samples.png'}")
     print(f"Saved front grid: {out_dir / 'front_obstacle_samples_grid.png'}")
     print(f"Saved top grid:   {out_dir / 'top_obstacle_samples_grid.png'}")
+    print(f"Saved front proxy overlay grid: {out_dir / 'front_obstacle_samples_proxy_overlay_grid.png'}")
+    print(f"Saved top proxy overlay grid:   {out_dir / 'top_obstacle_samples_proxy_overlay_grid.png'}")
     print(f"Saved payload:    {out_dir / 'obstacle_samples.pt'}")
     print(f"Saved summary:    {out_dir / 'summary.json'}")
 
