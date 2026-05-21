@@ -1,0 +1,25 @@
+# sls_config.yaml
+q_learned: 3.634624 # Calculated from the Target Error Model calibration
+
+# --- Model Registries ---
+source_model_dir: "reacher/models/mlpdyn_ft_4"
+target_model_dir: "reacher/models/mlpdyn_ft_7"
+translation_model_ckpt: "reacher/models/translate_4_to_7/last.ckpt"
+target_error_model_ckpt: "anutam_stuff/error_model/lightning_logs/version_8/checkpoints/best-error-model-epoch=2396.ckpt"
+
+# --- Data & Workspace Parameters ---
+dataset_path: "reacher/data/test_data_50hz/reacher_test.h5"
+out_dir: "reacher/plan/sls_mpc_cross_latent"
+device: "auto"
+horizon: 10            # SLS tracking horizon (N)
+max_mpc_steps: 150
+video_fps: 50
+episode_idx: 6588 
+seed: 42
+
+# --- Optimization Engine Adjustments ---
+mppi_samples: 512
+mppi_update_iter: 5
+mppi_reward_weight: 20.0
+mppi_noise_level: 0.35
+mppi_beta_filter: 0.7

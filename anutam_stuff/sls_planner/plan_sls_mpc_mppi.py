@@ -24,6 +24,7 @@ import pyrallis
 
 import jax
 import jax.numpy as jnp
+import equinox as eqx
 from jax import config, lax
 config.update("jax_default_matmul_precision", "highest")
 config.update("jax_enable_x64", True)
@@ -68,58 +69,80 @@ class PlanSLSConfig:
     mppi_beta_filter: float = 0.7
 
 
-# --- JAX / PyTorch Bridge & Rollout Utils ---
+# --- PyTorch to Native JAX / Equinox Bridge ---
 
-def build_jax_dynamics(torch_dynamics_net: torch.nn.Module, device: torch.device, state_dim: int, action_dim: int):
-    """Wraps a PyTorch MLP into a JAX-differentiable function."""
-    def _fwd_fn(x_np, u_np):
-        with torch.no_grad():
-            x_t = torch.from_numpy(np.array(x_np)).float().to(device)
-            u_t = torch.from_numpy(np.array(u_np)).float().to(device)
-            inp = torch.cat((x_t, u_t), dim=-1)
-            if inp.ndim == 1:
-                out = torch_dynamics_net(inp.unsqueeze(0)).squeeze(0)
-            else:
-                out = torch_dynamics_net(inp)
-            return np.asarray(out.cpu().numpy(), dtype=np.float64)
-
-    def _vjp_fn(x_np, u_np, g_np):
-        x_t = torch.from_numpy(np.array(x_np)).float().to(device).requires_grad_(True)
-        u_t = torch.from_numpy(np.array(u_np)).float().to(device).requires_grad_(True)
-        inp = torch.cat((x_t, u_t), dim=-1)
-        if inp.ndim == 1:
-            out = torch_dynamics_net(inp.unsqueeze(0)).squeeze(0)
+def build_equinox_mlp_from_pytorch(pt_model: torch.nn.Module, key: jax.Array, activation=jax.nn.gelu) -> eqx.Module:
+    """
+    Dynamically creates a native JAX Equinox MLP matching the PyTorch model's architecture.
+    Extracts weights (handling spectral norm) for zero-copy execution on the GPU.
+    """
+    pt_linears = [m for m in pt_model.modules() if isinstance(m, torch.nn.Linear)]
+    
+    layers = []
+    keys = jax.random.split(key, len(pt_linears))
+    for i, pt_layer in enumerate(pt_linears):
+        out_features, in_features = pt_layer.weight.shape
+        eqx_linear = eqx.nn.Linear(in_features, out_features, key=keys[i])
+        
+        # Transfer computed weights (this captures spectral_norm scaling)
+        w = jnp.array(pt_layer.weight.detach().cpu().numpy())
+        if pt_layer.bias is not None:
+            b = jnp.array(pt_layer.bias.detach().cpu().numpy())
         else:
-            out = torch_dynamics_net(inp)
-        g_t = torch.from_numpy(np.asarray(g_np)).float().to(device)
-        out.backward(g_t)
-        return np.asarray(x_t.grad.cpu().numpy(), dtype=np.float64), np.asarray(u_t.grad.cpu().numpy(), dtype=np.float64)
+            b = jnp.zeros(out_features)
+            
+        eqx_linear = eqx.tree_at(lambda l: (l.weight, l.bias), eqx_linear, (w, b))
+        layers.append(eqx_linear)
+        
+        # Add activation for all but the last layer
+        if i < len(pt_linears) - 1:
+            layers.append(activation)
+            
+    class JAXMLP(eqx.Module):
+        layers: list
+        def __call__(self, x):
+            for layer in self.layers:
+                x = layer(x)
+            return x
+            
+    return JAXMLP(layers)
 
-    @jax.custom_vjp
-    def jax_dynamics(x, u, t, parameter):
-        result_shape = jax.ShapeDtypeStruct((state_dim,), jnp.float64)
-        return jax.pure_callback(_fwd_fn, result_shape, x, u, vmap_method="sequential")
-
-    def jax_dynamics_fwd(x, u, t, parameter):
-        y = jax_dynamics(x, u, t, parameter)
-        return y, (x, u)
-
-    def jax_dynamics_bwd(res, g):
-        x, u = res
-        jac_x_shape = jax.ShapeDtypeStruct((state_dim,), jnp.float64)
-        jac_u_shape = jax.ShapeDtypeStruct((action_dim,), jnp.float64)
-        vjp_x, vjp_u = jax.pure_callback(_vjp_fn, (jac_x_shape, jac_u_shape), x, u, g, vmap_method="sequential")
-        return vjp_x, vjp_u, None, None
-
-    jax_dynamics.defvjp(jax_dynamics_fwd, jax_dynamics_bwd)
+def make_jax_dynamics(eqx_dyn_model):
+    """Wraps the Equinox MLP into the SLS expected (x, u, t, param) signature."""
+    def jax_dynamics(x, u, t=0.0, parameter=1.0):
+        inp = jnp.concatenate([x, u], axis=-1)
+        return eqx_dyn_model(inp)
     return jax_dynamics
 
+def make_jax_disturbance(eqx_error_model, q_learned, state_dim, diagonal):
+    """Wraps the Equinox Error model and handles the MGNLL matrix transformation natively in JAX."""
+    def _mgnll_forward(raw):
+        if diagonal:
+            return jnp.diag(jnp.exp(raw) + 1e-4)
+            
+        L = jnp.zeros((state_dim, state_dim))
+        tril_indices = jnp.tril_indices(state_dim)
+        L = L.at[tril_indices].set(raw)
+        
+        diag_idx = jnp.arange(state_dim)
+        L = L.at[diag_idx, diag_idx].set(jnp.exp(L[diag_idx, diag_idx]) + 1e-4)
+        return L
+
+    def dist_fn(X_seq, U_seq):
+        # Concatenate state and action sequences along the feature dimension
+        inp = jnp.concatenate([X_seq, U_seq], axis=-1)
+        # Vectorize the model and matrix transformation across the sequence length (Horizon)
+        raw_preds = jax.vmap(eqx_error_model)(inp)
+        L_mats = jax.vmap(_mgnll_forward)(raw_preds)
+        return q_learned * L_mats
+        
+    return dist_fn
+
+
+# --- MPPI Rollout Utils ---
 
 def make_mppi_rollout_and_eval(jax_dynamics_fn, state_dim, action_dim, horizon, W_state, goal_state):
-    """Creates rollout and evaluation hooks compatible with sampling planners."""
     def mppi_rollout_fn(state_cur, act_seqs, reach_config=None):
-        B = act_seqs.shape[0]
-        
         def single_sample_rollout(actions):
             def step(state, u):
                 next_state = jax_dynamics_fn(state, u, 0.0, 1.0)
@@ -127,39 +150,41 @@ def make_mppi_rollout_and_eval(jax_dynamics_fn, state_dim, action_dim, horizon, 
             _, states = lax.scan(step, state_cur, actions)
             return states
 
+        # Native JAX batching over samples
         state_seqs = jax.vmap(single_sample_rollout)(act_seqs)
         return state_seqs, {}
 
     def mppi_eval_fn(state_seqs, act_seqs, reach_config=None, aux=None, *args, **kwargs):
         delta = state_seqs - goal_state[None, None, :]
         stage_costs = jnp.sum(W_state[None, None, :] * (delta ** 2), axis=-1)
-        action_costs = 0.01 * jnp.sum(act_seqs ** 2, axis=-1)
+        action_costs = 0.1 * jnp.sum(act_seqs ** 2, axis=-1)
         total_costs = jnp.sum(stage_costs + action_costs, axis=-1)
         return {"rewards": -total_costs}
+        
+    # def mppi_eval_fn(state_seqs, act_seqs, reach_config=None, aux=None, *args, **kwargs):
+    #     # state_seqs shape: (Batch, Long_Horizon, StateDim)
+    #     B, H_long, _ = state_seqs.shape
+    #     delta = state_seqs - goal_state[None, None, :]
+        
+    #     # 1. Create a time-discounting vector gamma^t (e.g., gamma = 0.95)
+    #     gamma = 0.96
+    #     discount_factors = jnp.power(gamma, jnp.arange(H_long - 1)) # Shape: (H_long - 1,)
+        
+    #     # 2. Compute stage errors per step
+    #     per_step_stage_costs = jnp.sum(W_mppi_stage[None, None, :] * (delta[:, :-1, :] ** 2), axis=-1)
+    #     action_costs = 0.01 * jnp.sum(act_seqs ** 2, axis=-1)
+        
+    #     # 3. Apply discounting to stage costs and action costs
+    #     discounted_stage = jnp.sum(per_step_stage_costs * discount_factors[None, :], axis=-1)
+    #     discounted_actions = jnp.sum(action_costs[:, :-1] * discount_factors[None, :], axis=-1)
+        
+    #     # 4. Terminal cost at the very end of the 140 steps remains undiscounted
+    #     term_cost = jnp.sum(W_mppi_term[None, :] * (delta[:, -1, :] ** 2), axis=-1)
+        
+    #     total_costs = discounted_stage + discounted_actions + term_cost + action_costs[:, -1]
+    #     return {"rewards": -total_costs}
 
     return mppi_rollout_fn, mppi_eval_fn
-
-
-def build_jax_disturbance(error_model: torch.nn.Module, q_learned: float, device: torch.device, state_dim: int, action_dim: int):
-    """Wraps the Conformal MGNLL Error model into a JAX callable."""
-    def _dist_fn(X_prefix_np, U_prefix_np):
-        with torch.no_grad():
-            X_t = torch.from_numpy(np.array(X_prefix_np)).float().to(device)
-            U_t = torch.from_numpy(np.array(U_prefix_np)).float().to(device)
-            if X_t.ndim == 1:
-                X_t = X_t.unsqueeze(0)
-                U_t = U_t.unsqueeze(0)
-            model_input = torch.cat([X_t, U_t], dim=-1)
-            L = error_model(model_input) 
-            E = q_learned * L
-            return np.asarray(E.cpu().numpy(), dtype=np.float64)
-
-    def jax_disturbance(X_prefix, U_prefix):
-        T = X_prefix.shape[0]
-        result_shape = jax.ShapeDtypeStruct((T, state_dim, state_dim), jnp.float64)
-        return jax.pure_callback(_dist_fn, result_shape, X_prefix, U_prefix, vmap_method="sequential")
-        
-    return jax_disturbance
 
 # --- Cost and Constraints ---
 
@@ -290,7 +315,7 @@ def main():
     out_dir = cfg.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load Visual and Dynamics Model
+    # 1. Load PyTorch Visual and Dynamics Model
     model_dir = cfg.model_dir.expanduser().resolve()
     with open(model_dir / "config.json", "r") as f:
         config_dict = json.load(f)
@@ -302,12 +327,18 @@ def main():
     action_dim = config_dict.get("action_dim", 2)
     img_size = config_dict.get("img_size", 224)
 
-    # 2. Load Error Model
+    # 2. Load PyTorch Error Model
     error_model = MGNLLPredictor.load_from_checkpoint(cfg.error_model_ckpt).to(device).eval()
 
-    # 3. Build JAX Callables
-    dynamics = build_jax_dynamics(model.predictor.net, device, state_dim, action_dim)
-    disturbance = build_jax_disturbance(error_model, cfg.q_learned, device, state_dim, action_dim)
+    # 3. Create Native JAX Modules and callables
+    init_key = jax.random.PRNGKey(cfg.seed)
+    key_dyn, key_err = jax.random.split(init_key)
+    
+    eqx_dyn = build_equinox_mlp_from_pytorch(model.predictor.net, key_dyn)
+    eqx_err = build_equinox_mlp_from_pytorch(error_model.net, key_err)
+    
+    dynamics = make_jax_dynamics(eqx_dyn)
+    disturbance = make_jax_disturbance(eqx_err, cfg.q_learned, state_dim, error_model.diagonal)
 
     # 4. Data / Normalization Setup
     train_dataset_path = str(cfg.dataset_path.expanduser().resolve())
@@ -349,11 +380,13 @@ def main():
     goal_state = make_markov_state(true_latents[-1]).detach().cpu().numpy().astype(np.float64)
     goal_obs = obs_np[-1].astype(np.float32)
 
+    W_state_mppi = jnp.ones((state_dim,)) * 50.0
+    W_state_mppi = W_state_mppi.at[state_dim // 2 :].set(10.0)
     W_state = jnp.ones((state_dim,)) * 10.0
     W_state = W_state.at[state_dim // 2 :].set(1.0)
     W_term = jnp.ones((state_dim,)) * 0.1
     W_term = W_term.at[:state_dim // 2].set(4000.0)
-    cost = make_tracking_cost(action_weight=0.01, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state)
+    cost = make_tracking_cost(action_weight=0.1, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state)
 
     save_rgb_image(run_dir / "start_image.png", pixels_np[0])
     save_rgb_image(run_dir / "goal_image.png", pixels_np[-1])
@@ -377,7 +410,7 @@ def main():
     }
     
     mppi_rollout, mppi_eval = make_mppi_rollout_and_eval(
-        dynamics, state_dim, action_dim, cfg.horizon, W_state, goal_state
+        dynamics, state_dim, action_dim, cfg.horizon, W_state_mppi, goal_state
     )
     
     u_min, u_max = -500.0 * jnp.ones(action_dim), 500.0 * jnp.ones(action_dim)
@@ -389,7 +422,6 @@ def main():
         action_upper_lim=u_max
     )
 
-    # Clean standard JAX closure wrapper to maintain strict jax.jit tracking compatibility
     def standard_mppi_jit_wrapper(key, state, init_act):
         return mppi_planner.trajectory_optimization(key, state, init_act, skip=False)
 
@@ -401,7 +433,7 @@ def main():
         sls_primal_tol=1e-2,
         enable_fastsls=False,
         initialize_nominal=True,
-        warm_start=True, # Modified to use warmstarts from MPPI
+        warm_start=True,
         rti=True,
         R_bar=None,
         Q_bar=None,
@@ -412,7 +444,7 @@ def main():
     mpc_dt = 1.0 / physics_freq_hz
     mpc_cfg = MPCConfig(n=state_dim, nu=action_dim, N=cfg.horizon, W=W_state, u_ref=jnp.zeros(action_dim), dt=mpc_dt)
 
-    x_min, x_max = -1000.0 * jnp.ones(state_dim), 1000.0 * jnp.ones(state_dim)
+    x_min, x_max = -5.0 * jnp.ones(state_dim), 5.0 * jnp.ones(state_dim)
     constraints_all = combine_constraints(make_state_box_constraints(x_min, x_max), make_control_box_constraints(u_min, u_max))
 
     controller = GenericMPC(
@@ -454,7 +486,6 @@ def main():
         X_warmstart = jnp.concatenate([jnp.asarray(current_state)[None, :], X_mppi], axis=0) 
         X_ref = X_warmstart
 
-        # Seed solver memory footprint states
         controller.X_in = X_warmstart
         controller.U_in = U_mppi
 

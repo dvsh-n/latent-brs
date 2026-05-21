@@ -1,11 +1,13 @@
 # sls_config.yaml
-q_learned: 3.634624 # Update this with the value from conformal_config.json
-model_dir: "reacher/models/mlpdyn_ft_7"
-error_model_ckpt: "error_model/lightning_logs/version_8/checkpoints/best-error-model-epoch=2396.ckpt"
+q_learned: 4.150728 # Update this with the value from conformal_config.json
+# model_dir: "reacher/models/mlpdyn_ft_7"
+# error_model_ckpt: "anutam_stuff/error_model/lightning_logs/version_8/checkpoints/best-error-model-epoch=2396.ckpt"
+model_dir: "reacher/models/mlpdyn_ft_8"
+error_model_ckpt: "anutam_stuff/error_model/lightning_logs/version_12/checkpoints/best-error-model-epoch=1599.ckpt"
 dataset_path: "reacher/data/test_data_50hz/reacher_test.h5"
 out_dir: "reacher/plan/sls_mpc_conformal"
 device: "auto"
-horizon: 20
+horizon: 10
 max_mpc_steps: 400
 video_fps: 50
 episode_idx: 6588 # 6588  # 6560 6534 6588# Use a number (e.g. 5) or null for random

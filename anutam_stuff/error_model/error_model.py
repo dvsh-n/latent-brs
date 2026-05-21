@@ -107,3 +107,42 @@ class MGNLLPredictor(L.LightningModule):
                 "frequency": 1
             }
         }
+
+    # def configure_optimizers(self):
+        # optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        
+        # # 1. First phase: Cosine Annealing (Epochs 0 to 1999)
+        # scheduler1 = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        #     optimizer, T_0=50, T_mult=1, eta_min=1e-7
+        # )
+        
+        # # 2. Second phase: Custom Exponential Decay starting at 1e-5 (Epoch 2000+)
+        # # LambdaLR multiplies the *original* optimizer LR (self.hparams.lr) by its output.
+        # # We compute a multiplier that forces the LR to 1e-5, then apply exponential decay.
+        # target_start_lr = 2e-6
+        # gamma = 0.99
+        
+        # def lr_lambda(epoch):
+        #     # 'epoch' here resets to 0 when SequentialLR switches to this scheduler
+        #     # We need: original_lr * multiplier = target_start_lr * (gamma ** epoch)
+        #     # So: multiplier = (target_start_lr / original_lr) * (gamma ** epoch)
+        #     multiplier = (target_start_lr / self.hparams.lr) * (gamma ** epoch)
+        #     return multiplier
+
+        # scheduler2 = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        
+        # # 3. Sequence them together
+        # main_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        #     optimizer, 
+        #     schedulers=[scheduler1, scheduler2], 
+        #     milestones=[3200]
+        # )
+        
+        # return {
+        #     "optimizer": optimizer,
+        #     "lr_scheduler": {
+        #         "scheduler": main_scheduler,
+        #         "interval": "epoch", 
+        #         "frequency": 1
+        #     }
+        # }

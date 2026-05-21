@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone generator for 1-step prediction errors for OGBench MLP predictor."""
+"""Standalone generator for 1-step prediction errors for the Rope model."""
 
 import argparse
 import json
@@ -10,17 +10,16 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-# Keep only external imports for OGBench
-from ogbench_cube.train.mlpdyn_train import (
-    LeWMOGBenchCubeDataset,
+# Imports from your rope training framework as seen in mlpdyn_eval.py
+from rope.train.mlpdyn_train import (
+    LeWMRopeDataset,
     build_markov_state,
     preprocess_pixels,
     required_markov_history,
 )
 
-# --- Re-defined Constants from mlpdyn_eval to break circular import ---
-DEFAULT_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
-DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8"
+DEFAULT_DATASET_PATH = "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
@@ -34,7 +33,7 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
     return max(candidates, key=lambda item: item[0])[1]
 
 def load_episode_standalone(dataset_path, episode_idx, args):
-    dataset = LeWMOGBenchCubeDataset(
+    dataset = LeWMRopeDataset(
         dataset_path,
         markov_deriv=args.markov_deriv,
         num_preds=args.num_preds,
@@ -47,16 +46,16 @@ def load_episode_standalone(dataset_path, episode_idx, args):
         ep_len = int(h5["ep_len"][episode_idx])
         ep_offset = int(h5["ep_offset"][episode_idx])
         rows = np.arange(ep_offset, ep_offset + ep_len, dtype=np.int64)
-        
         pixels_np = np.asarray(h5["pixels"][rows], dtype=np.uint8)
         pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
+        
+        # Use the specific preprocessing pipeline from rope
         pixels = preprocess_pixels(pixels.unsqueeze(0), args.img_size)[0]
 
         actions = np.asarray(h5["action"][rows], dtype=np.float32)
         actions = (np.nan_to_num(actions, nan=0.0) - dataset.action_mean) / dataset.action_std
-        actions = torch.from_numpy(actions).float()
         
-    return pixels, actions
+    return pixels, torch.from_numpy(actions).float()
 
 @torch.no_grad()
 def extract_errors(model, pixels, actions, args, device):
@@ -69,32 +68,57 @@ def extract_errors(model, pixels, actions, args, device):
         latents.append(emb)
     true_latents = torch.cat(latents, dim=0)
 
-    history_len = required_markov_history(args.markov_deriv)
-    rollout_steps = (true_latents.shape[0] - 1 - (history_len - 1) * args.frameskip) // args.frameskip
-    
-    if rollout_steps < 1:
-        return None
-
+    rollout_steps = (true_latents.shape[0] - 1) // args.frameskip
     states, acts, targets = [], [], []
+    
+    embed_dim = true_latents.shape[-1]
+    history_len = required_markov_history(args.markov_deriv)
 
     for step in range(rollout_steps):
-        t_curr = step * args.frameskip + (history_len - 1) * args.frameskip
+        # Gather the history frames required up to this point
+        t_curr = step * args.frameskip
         
-        # Current State: build markov state dynamically using native OGBench logic
-        hist_indices = [t_curr - i * args.frameskip for i in range(history_len - 1, -1, -1)]
-        hist_z = true_latents[hist_indices] 
-        curr_state = build_markov_state(hist_z.unsqueeze(0), args.markov_deriv)[0]
+        # Emulate the evaluation script's warm-start / history padding logic
+        if t_curr == 0:
+            history = true_latents[:1]
+            if history_len > 1:
+                history = torch.cat((history[:1].repeat(history_len - 1, 1), history), dim=0)
+        else:
+            # Gather available historical context back to history_len
+            start_idx = max(0, t_curr - history_len + 1)
+            history = true_latents[start_idx : t_curr + 1]
+            if history.shape[0] < history_len:
+                padding_amt = history_len - history.shape[0]
+                history = torch.cat((history[:1].repeat(padding_amt, 1), history), dim=0)
+
+        # Build current Markov State [z_t, delta_z_t, ...]
+        curr_state = build_markov_state(history.unsqueeze(0), args.markov_deriv)[0]
         states.append(curr_state)
         
-        a_start = t_curr
-        acts.append(actions[a_start : a_start + args.frameskip].flatten())
+        # Grab actions across frameskip window
+        action_start = step * args.frameskip
+        action_stop = action_start + args.frameskip
+        acts.append(actions[action_start:action_stop].flatten())
         
-        # Target: Full Markov State
+        # Build TARGET Markov State for t + frameskip
         t_next = t_curr + args.frameskip
-        next_hist_indices = [t_next - i * args.frameskip for i in range(history_len - 1, -1, -1)]
-        next_hist_z = true_latents[next_hist_indices]
-        next_state = build_markov_state(next_hist_z.unsqueeze(0), args.markov_deriv)[0]
-        targets.append(next_state)
+        if t_next < true_latents.shape[0]:
+            start_idx_next = max(0, t_next - history_len + 1)
+            history_next = true_latents[start_idx_next : t_next + 1]
+            if history_next.shape[0] < history_len:
+                padding_amt = history_len - history_next.shape[0]
+                history_next = torch.cat((history_next[:1].repeat(padding_amt, 1), history_next), dim=0)
+            
+            next_state = build_markov_state(history_next.unsqueeze(0), args.markov_deriv)[0]
+            targets.append(next_state)
+        else:
+            # Handle edge case where target exceeds encoded timeline sequence
+            states.pop()
+            acts.pop()
+            break
+
+    if not states:
+        return None
 
     s_tsr = torch.stack(states).to(device)
     a_tsr = torch.stack(acts).to(device)
@@ -102,41 +126,37 @@ def extract_errors(model, pixels, actions, args, device):
     
     # Dynamics prediction f(s, a)
     act_emb = model.action_encoder(a_tsr.unsqueeze(1))
-    
-    # Extract the full dimensional state prediction
     pred_s = model.predict(s_tsr.unsqueeze(1), act_emb)[:, 0] 
     
-    # Error calculated directly in the n-dimensional derivative space
     return {"x_t": s_tsr.cpu(), "a_t": a_tsr.cpu(), "error": (target_tsr - pred_s).cpu()}
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
-    parser.add_argument("--out-file", type=Path, default="ogbench_cube/eval/ogbench_one_step_error_data_embed_8.pt")
-    parser.add_argument("--frame-batch-size", type=int, default=128)
+    parser.add_argument("--out-file", type=Path, default="rope/eval/rope_one_step_error_data.pt")
+    parser.add_argument("--frame-batch-size", type=int, default=32)
+    
+    # Command line overrides mimicking the config fields
+    parser.add_argument("--markov-deriv", type=int, default=1) 
+    parser.add_argument("--num-preds", type=int, default=1)
+    parser.add_argument("--frameskip", type=int, default=1)
+    parser.add_argument("--img-size", type=int, default=224)
+    parser.add_argument("--action-dim", type=int, default=5)
     args = parser.parse_args()
 
     with open(args.model_dir / "config.json") as f:
         config = json.load(f)
     
-    # --- FIXED: Config injection with robust fallbacks ---
-    defaults = {
-        "markov_deriv": 1,
-        "num_preds": 1,
-        "frameskip": 1,
-        "img_size": 224,
-        "action_dim": 5,
-    }
-    for k, fallback in defaults.items():
+    for k in ["markov_deriv", "num_preds", "frameskip", "img_size", "action_dim"]:
         val = config.get(k)
-        setattr(args, k, val if val is not None else fallback)
-    # -----------------------------------------------------
+        if val is not None:
+            setattr(args, k, val)
 
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
         device = torch.device("cpu")
 
@@ -145,8 +165,9 @@ def main():
     with h5py.File(args.dataset_path, "r") as h5:
         ep_len = h5["ep_len"][:]
         
-    history_len = required_markov_history(args.markov_deriv)
-    valid_indices = np.flatnonzero(ep_len - 1 - (history_len - 1 + args.num_preds) * args.frameskip >= 0)
+    num_steps = 1 + int(args.num_preds)
+    required_offset = max((num_steps - 1) * int(args.frameskip), int(args.num_preds) * int(args.frameskip))
+    valid_indices = np.flatnonzero(ep_len - 1 - required_offset >= 0)
 
     all_x, all_a, all_e = [], [], []
     for idx in tqdm(valid_indices, desc="Generating Errors"):
@@ -159,6 +180,7 @@ def main():
 
     torch.save({"x_t": torch.cat(all_x), "a_t": torch.cat(all_a), "error": torch.cat(all_e)}, args.out_file)
     print(f"Saved {len(torch.cat(all_x))} transitions to {args.out_file}")
+
 
 if __name__ == "__main__":
     main()

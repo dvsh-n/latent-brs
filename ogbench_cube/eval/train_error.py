@@ -1,6 +1,7 @@
 import torch
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.loggers import TensorBoardLogger
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -10,6 +11,7 @@ from conformal_prediction import conformal_calibration
 
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from pathlib import Path
 
 @torch.no_grad()
 def evaluate_clustered_coverage(model, dataloader, q_learned, L_fixed, q_fixed, n_clusters=30):
@@ -86,7 +88,7 @@ def plot_clustered_coverage(metrics, target_coverage):
     plt.ylabel("Empirical Coverage")
     plt.title("Conditional Coverage across State-Action Clusters")
     plt.legend()
-    plt.savefig("clustered_coverage.png")
+    plt.savefig("ogbench_cube/eval/clustered_coverage.png")
     print("Clustered coverage plot saved as 'clustered_coverage.png'")
 
 def calculate_fixed_baseline(dataloader, alpha):
@@ -182,7 +184,7 @@ def plot_ratio_distribution(ratios, alpha):
     plt.grid(True, alpha=0.3)
     
     # Save for PACE environment
-    plt.savefig("volume_ratio_distribution.png", dpi=300)
+    plt.savefig("ogbench_cube/eval/volume_ratio_distribution.png", dpi=300)
     print("\nDistribution plot saved as 'volume_ratio_distribution.png'")
 
 def plot_visualizations(ratios, cluster_metrics, alpha):
@@ -196,42 +198,54 @@ def plot_visualizations(ratios, cluster_metrics, alpha):
     plot_clustered_coverage(cluster_metrics, 1 - alpha)
 
 if __name__ == "__main__":
-    PATH = "lewm_one_step_error_data_rand_8-3.pt"
+    PATH = "ogbench_cube/eval/ogbench_one_step_error_data_embed_8.pt"
     ALPHA = 0.1
+    lightning_dir = Path("ogbench_cube/models/err_pred_logs")
 
     dm = ErrorDataModule(data_path=PATH, batch_size=4096)
     dm.setup() 
     
+    # model = MGNLLPredictor(
+    #     input_dim=dm.input_dim, state_dim=dm.state_dim, 
+    #     num_layers=3, hidden_dim=128, diagonal=False, 
+    #     lr=0.00025, reg_scale=10, dropout_prob=0.3, use_spectral_norm=False
+    # )
     model = MGNLLPredictor(
         input_dim=dm.input_dim, state_dim=dm.state_dim, 
-        num_layers=3, hidden_dim=128, diagonal=False, 
-        lr=0.0001, reg_scale=10, dropout_prob=0.3, use_spectral_norm=False
+        num_layers=2, hidden_dim=128, diagonal=False, 
+        lr=0.00025, reg_scale=10, dropout_prob=0.3, use_spectral_norm=False
+    )
+
+
+    # Configure Logger
+    logger = TensorBoardLogger(
+        save_dir=str(lightning_dir),
+        name="cube_experiment_embed_8"
     )
 
     # 1. Define Callbacks
-    # This ensures we save the version that had the lowest stable validation loss
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
         mode="min",
         save_top_k=1,
         filename="best-error-model-{epoch:02d}"
     )
-    # This lets you verify the "sawtooth" LR pattern in your logs
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
-    # 2. Update Trainer with callbacks
+    # 2. FIXED: Added logger and default_root_dir
     trainer = L.Trainer(
-        max_epochs=1600, 
+        max_epochs=6400, 
         accelerator="auto", 
         devices=1,
+        logger=logger,                        # <-- Explicitly pass your logger here
+        default_root_dir=lightning_dir,       # <-- Dictates backup path for checkpoint tracking
         callbacks=[checkpoint_callback, lr_monitor],
-        gradient_clip_val=1.0  # Still recommended for 48D stability
+        gradient_clip_val=1.0  
     )
     
     trainer.fit(model, datamodule=dm)
 
-    # 3. CRITICAL: Load the best model weights before Calibration
-    # Without this, you are calibrating on the 'last' model, not the 'best' model.
+    # 3. Load the best model weights before Calibration
     print(f"\nLoading best model from {checkpoint_callback.best_model_path}...")
     model = MGNLLPredictor.load_from_checkpoint(checkpoint_callback.best_model_path)
     model.to("cuda" if torch.cuda.is_available() else "cpu")
@@ -242,7 +256,7 @@ if __name__ == "__main__":
     q_learned = conformal_calibration(model, dm.calib_dataloader(), alpha=ALPHA)
     L_fixed, q_fixed = calculate_fixed_baseline(dm.calib_dataloader(), alpha=ALPHA)
     
-# 1. Perform Clustered/Conditional Coverage analysis
+    # 1. Perform Clustered/Conditional Coverage analysis
     cluster_metrics = evaluate_clustered_coverage(model, dm.val_dataloader(), q_learned, L_fixed, q_fixed)
 
     # 2. Perform Global Metric analysis
@@ -254,7 +268,7 @@ if __name__ == "__main__":
     # 3. Generate both plots at once
     plot_visualizations(all_ratios, cluster_metrics, ALPHA)
 
-    # 4. Print the final summary (You can remove the extra plot_ratio_distribution call below)
+    # 4. Print the final summary
     print(f"\n" + "="*45)
     print(f"HOLDOUT SET METRICS (Target Coverage: {1-ALPHA:.2f})")
     print(f"Learned Model Coverage:  {learned_cov:.4f}")

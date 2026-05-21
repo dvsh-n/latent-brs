@@ -15,7 +15,7 @@ from reacher.train.mlpdyn_train import LeWMReacherDataset
 
 # --- Re-defined Constants from mlpdyn_eval to break circular import ---
 DEFAULT_DATASET_PATH = "reacher/data/test_data_50hz_random/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_7"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_8_epoch3"
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
@@ -107,7 +107,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
-    parser.add_argument("--out-file", type=Path, default="lewm_one_step_error_data.pt")
+    parser.add_argument("--out-file", type=Path, default="lewm_one_step_error_data_rand_8-3.pt")
     parser.add_argument("--frame-batch-size", type=int, default=128)
     
     # Add these as command-line arguments so they have safe defaults

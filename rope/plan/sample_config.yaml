@@ -1,0 +1,14 @@
+# sls_config.yaml
+q_learned: 5.688706 # Update this with the value from conformal_config.json
+# model_dir: "reacher/models/mlpdyn_ft_7"
+# error_model_ckpt: "anutam_stuff/error_model/lightning_logs/version_8/checkpoints/best-error-model-epoch=2396.ckpt"
+model_dir: "rope/models/mlpdyn_noshadow_ft"
+error_model_ckpt: "rope/models/err_pred_logs/rope_experiment/version_7/checkpoints/best-error-model-epoch=3781.ckpt"
+dataset_path: "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
+out_dir: "rope/plan/sls_mpc_conformal"
+device: "auto"
+horizon: 10
+max_mpc_steps: 400
+video_fps: 50
+episode_idx: 999 # 6588  # 6560 6534 6588# Use a number (e.g. 5) or null for random
+seed: 42

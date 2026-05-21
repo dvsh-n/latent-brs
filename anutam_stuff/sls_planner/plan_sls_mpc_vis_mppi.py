@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Plan in Reacher pixel space using Conformal SLS MPC over a Markov-state PyTorch world model (GPU Optimized)."""
+"""Plan in Reacher pixel space using Conformal SLS MPC warmstarted by MPPI over a Markov-state world model (with Tube Visualization)."""
 
 import os
 import sys
 import re
 import time
 import json
-import concurrent.futures
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -27,7 +26,7 @@ import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-from jax import config
+from jax import config, lax
 config.update("jax_default_matmul_precision", "highest")
 config.update("jax_enable_x64", True)
 
@@ -38,6 +37,9 @@ from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.utils.constraint_utils import combine_constraints, make_state_box_constraints
 
+# MPPI planner imports
+from gpu_sls.mppi_planner import MPPIPlanner
+
 # Local reacher imports
 from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.mlpdyn_train import LeWMReacherDataset
@@ -47,33 +49,45 @@ from error_model import MGNLLPredictor
 # --- Configuration Dataclass ---
 @dataclass
 class PlanSLSConfig:
-    """Configuration for Conformal SLS MPC Planning"""
-    q_learned: float = field(default=0.0, metadata={"help": "Conformal quantile for the disturbance bound (required)."})
+    """Configuration for Conformal SLS MPC Planning with Visualizations"""
+    q_learned: float = field(default=0.0, metadata={"help": "Conformal quantile for the disturbance bound."})
     model_dir: Path = field(default=Path("reacher/models/mlpdyn_ft_1"))
     error_model_ckpt: Path = field(default=Path("reacher/models/error_model/best-error-model.ckpt"))
     dataset_path: Path = field(default=Path("reacher/data/test_data_50hz/reacher_test.h5"))
-    out_dir: Path = field(default=Path("reacher/plan/sls_mpc_conformal"))
+    out_dir: Path = field(default=Path("reacher/plan/sls_mpc_conformal_vis"))
     device: str = field(default="auto")
     horizon: int = field(default=35)
     max_mpc_steps: int = field(default=120)
     video_fps: int = field(default=60)
     episode_idx: Optional[int] = field(default=None)
     seed: int = field(default=42)
+    
+    # MPPI configuration fields
+    mppi_samples: int = 512
+    mppi_update_iter: int = 5
+    mppi_reward_weight: float = 20.0
+    mppi_noise_level: float = 0.15
+    mppi_beta_filter: float = 0.7
+
 
 # --- PyTorch to Native JAX / Equinox Bridge ---
 
 def build_equinox_mlp_from_pytorch(pt_model: torch.nn.Module, key: jax.Array, activation=jax.nn.gelu) -> eqx.Module:
-    """Extracts weights directly from PyTorch architectures into native, compile-safe Equinox modules."""
+    """Dynamically creates a native JAX Equinox MLP matching the PyTorch model."""
     pt_linears = [m for m in pt_model.modules() if isinstance(m, torch.nn.Linear)]
+    
     layers = []
     keys = jax.random.split(key, len(pt_linears))
     for i, pt_layer in enumerate(pt_linears):
         out_features, in_features = pt_layer.weight.shape
         eqx_linear = eqx.nn.Linear(in_features, out_features, key=keys[i])
+        
         w = jnp.array(pt_layer.weight.detach().cpu().numpy())
         b = jnp.array(pt_layer.bias.detach().cpu().numpy()) if pt_layer.bias is not None else jnp.zeros(out_features)
+            
         eqx_linear = eqx.tree_at(lambda l: (l.weight, l.bias), eqx_linear, (w, b))
         layers.append(eqx_linear)
+        
         if i < len(pt_linears) - 1:
             layers.append(activation)
             
@@ -83,6 +97,7 @@ def build_equinox_mlp_from_pytorch(pt_model: torch.nn.Module, key: jax.Array, ac
             for layer in self.layers:
                 x = layer(x)
             return x
+            
     return JAXMLP(layers)
 
 def make_jax_dynamics(eqx_dyn_model):
@@ -107,40 +122,67 @@ def make_jax_disturbance(eqx_error_model, q_learned, state_dim, diagonal):
         raw_preds = jax.vmap(eqx_error_model)(inp)
         L_mats = jax.vmap(_mgnll_forward)(raw_preds)
         return q_learned * L_mats
+        
     return dist_fn
 
-# --- Asynchronous Threaded Visualization Plotter ---
 
-def asynchronous_tube_plot(mpc_step, tube_data, state_dim, save_path):
-    """Draws tracking tube widths inside a separate worker thread to maximize GPU math throughput."""
-    n_cols = 6
-    n_rows = int(np.ceil(state_dim / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 2.2 * n_rows), sharex=True)
-    axes = axes.flatten()
-    horizon_axis = np.arange(tube_data.shape[0])
-    
-    for dim_idx in range(state_dim):
-        ax = axes[dim_idx]
-        ax.plot(horizon_axis, tube_data[:, dim_idx], color="tab:blue", linewidth=1.5)
-        ax.set_title(f"Dim {dim_idx}", fontsize=8)
-        ax.grid(True, linestyle="--", alpha=0.5)
-        ax.tick_params(axis="both", which="major", labelsize=8)
+# --- MPPI Rollout Utils ---
+
+def make_mppi_rollout_and_eval(jax_dynamics_fn, state_dim, action_dim, horizon, W_mppi_stage, W_mppi_term, goal_state):
+    def mppi_rollout_fn(state_cur, act_seqs, reach_config=None):
+        def single_sample_rollout(actions):
+            def step(state, u):
+                next_state = jax_dynamics_fn(state, u, 0.0, 1.0)
+                return next_state, next_state
+            _, states = lax.scan(step, state_cur, actions)
+            return states
+
+        state_seqs = jax.vmap(single_sample_rollout)(act_seqs)
+        return state_seqs, {}
+
+    def mppi_eval_fn(state_seqs, act_seqs, reach_config=None, aux=None, *args, **kwargs):
+        delta = state_seqs - goal_state[None, None, :]
         
-    for j in range(state_dim, len(axes)):
-        axes[j].axis("off")
+        # Split costs to enforce heavy terminal landing penalty for the global planner
+        stage_costs = jnp.sum(W_mppi_stage[None, None, :] * (delta[:, :-1, :] ** 2), axis=-1)
+        term_cost = jnp.sum(W_mppi_term[None, :] * (delta[:, -1, :] ** 2), axis=-1)
         
-    fig.suptitle(f"Projected Tube Widths Across Horizon (MPC Step {mpc_step})", fontsize=14)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120)
-    plt.close()
+        action_costs = 0.002 * jnp.sum(act_seqs ** 2, axis=-1)
+        total_costs = jnp.sum(stage_costs + action_costs[:, :-1], axis=-1) + term_cost + action_costs[:, -1]
+        
+        return {"rewards": -total_costs}
+
+    # def mppi_eval_fn(state_seqs, act_seqs, reach_config=None, aux=None, *args, **kwargs):
+    #     # state_seqs shape: (Batch, Long_Horizon, StateDim)
+    #     B, H_long, _ = state_seqs.shape
+    #     delta = state_seqs - goal_state[None, None, :]
+        
+    #     # 1. Create a time-discounting vector gamma^t (e.g., gamma = 0.95)
+    #     gamma = 0.96
+    #     discount_factors = jnp.power(gamma, jnp.arange(H_long - 1)) # Shape: (H_long - 1,)
+        
+    #     # 2. Compute stage errors per step
+    #     per_step_stage_costs = jnp.sum(W_mppi_stage[None, None, :] * (delta[:, :-1, :] ** 2), axis=-1)
+    #     action_costs = 0.01 * jnp.sum(act_seqs ** 2, axis=-1)
+        
+    #     # 3. Apply discounting to stage costs and action costs
+    #     discounted_stage = jnp.sum(per_step_stage_costs * discount_factors[None, :], axis=-1)
+    #     discounted_actions = jnp.sum(action_costs[:, :-1] * discount_factors[None, :], axis=-1)
+        
+    #     # 4. Terminal cost at the very end of the 140 steps remains undiscounted
+    #     term_cost = jnp.sum(W_mppi_term[None, :] * (delta[:, -1, :] ** 2), axis=-1)
+        
+    #     total_costs = discounted_stage + discounted_actions + term_cost + action_costs[:, -1]
+    #     return {"rewards": -total_costs}
+
+    return mppi_rollout_fn, mppi_eval_fn
 
 # --- Cost and Constraints ---
 
-def make_tracking_cost(action_weight: float = 0.1, horizon: int = 35, W_term: Optional[jnp.ndarray] = None, goal_state: Optional[jnp.ndarray] = None):
-    """Quadratic tracking cost with a terminal weight/reference branch using JAX primitives."""
-    def cost(W, reference, z, u, t):
+def make_tracking_cost(action_weight: float, horizon: int, W_term: jnp.ndarray, goal_state: jnp.ndarray, W_track: jnp.ndarray):
+    def cost(W_ignored, reference, z, u, t):
         is_not_terminal = (t < horizon)
-        active_W = jnp.where(is_not_terminal, W, W_term)
+        active_W = jnp.where(is_not_terminal, W_track, W_term)
         active_ref = jnp.where(is_not_terminal, reference[t], goal_state)
         dz = z - active_ref
         return jnp.sum(active_W * dz**2) + action_weight * jnp.sum(u**2)
@@ -152,19 +194,23 @@ def make_control_box_constraints(u_min, u_max):
         return jnp.concatenate([u - u_max, u_min - u], axis=0)
     return constraints
 
-# --- Setup Utilities ---
-
+# --- Setup Helpers ---
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
     candidates = []
     for path in model_dir.glob("*_epoch_*_object.ckpt"):
         match = pattern.match(path.name)
-        if match is not None: candidates.append((int(match.group(1)), path))
-    if not candidates: raise FileNotFoundError(f"No object checkpoints in {model_dir}")
+        if match is not None:
+            candidates.append((int(match.group(1)), path))
+    if not candidates:
+        raise FileNotFoundError(f"No object checkpoints matching '*_epoch_N_object.ckpt' found in {model_dir}")
     return max(candidates, key=lambda item: item[0])[1]
 
 def require_device(device_arg: str) -> torch.device:
-    if device_arg in {"auto", "gpu"}: device_arg = "cuda" if torch.cuda.is_available() else "cpu"
+    if device_arg == "auto":
+        device_arg = "cuda" if torch.cuda.is_available() else "cpu"
+    if device_arg.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
     return torch.device(device_arg)
 
 def hide_target(env: DmControlGymEnv) -> None:
@@ -183,12 +229,18 @@ def save_rgb_image(path: Path, image: np.ndarray) -> None:
 
 def save_rollout_video(frames: list[np.ndarray], out_dir: Path, fps: int) -> Path:
     mp4_path = out_dir / "rollout.mp4"
-    imageio.mimwrite(mp4_path, frames, fps=fps, quality=8, macro_block_size=1)
-    return mp4_path
+    gif_path = out_dir / "rollout.gif"
+    try:
+        imageio.mimwrite(mp4_path, frames, fps=fps, quality=8, macro_block_size=1)
+        return mp4_path
+    except Exception:
+        imageio.mimwrite(gif_path, frames, fps=fps)
+        return gif_path
 
 def preprocess_pixels(pixels: np.ndarray, img_size: int, pixel_mean: torch.Tensor, pixel_std: torch.Tensor) -> torch.Tensor:
     tensor = torch.from_numpy(np.ascontiguousarray(pixels))
-    if tensor.ndim == 3: tensor = tensor.unsqueeze(0)
+    if tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)
     tensor = tensor.permute(0, 3, 1, 2).float().div_(255.0)
     if tuple(tensor.shape[-2:]) != (img_size, img_size):
         tensor = torch.nn.functional.interpolate(tensor, size=(img_size, img_size), mode="bilinear", align_corners=False)
@@ -236,6 +288,12 @@ def reset_env_to_state(env: DmControlGymEnv, *, seed: int, qpos: np.ndarray, qve
     env._last_action = np.zeros_like(env.action_space.low, dtype=np.float32)
     return physics.render(height=height, width=width, camera_id=0)
 
+def shift_warmstart(X: jnp.ndarray, U: jnp.ndarray):
+    X_shift = jnp.concatenate([X[1:], X[-1:]], axis=0)
+    U_shift = jnp.concatenate([U[1:], U[-1:]], axis=0)
+    return X_shift, U_shift
+
+
 # --- Main Pipeline ---
 
 def main():
@@ -246,10 +304,8 @@ def main():
     device = require_device(cfg.device)
     out_dir = cfg.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    
-    vis_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
-    # 1. Load Visual and Dynamics Model
+    # 1. Load PyTorch Visual and Dynamics Model
     model_dir = cfg.model_dir.expanduser().resolve()
     with open(model_dir / "config.json", "r") as f:
         config_dict = json.load(f)
@@ -261,10 +317,10 @@ def main():
     action_dim = config_dict.get("action_dim", 2)
     img_size = config_dict.get("img_size", 224)
 
-    # 2. Load Error Model
+    # 2. Load PyTorch Error Model
     error_model = MGNLLPredictor.load_from_checkpoint(cfg.error_model_ckpt).to(device).eval()
 
-    # 3. Create Native JAX / Equinox Modules
+    # 3. Create Native JAX Modules
     init_key = jax.random.PRNGKey(cfg.seed)
     key_dyn, key_err = jax.random.split(init_key)
     
@@ -306,27 +362,65 @@ def main():
     run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
     run_dir = out_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    
     tube_plots_dir = run_dir / "tube_plots"
     tube_plots_dir.mkdir(parents=True, exist_ok=True)
 
-    # 5. Goal State Extraction
+    # 5. Goal State Extraction & Cost Structure
     pixels_t = preprocess_pixels(pixels_np, img_size=img_size, pixel_mean=pixel_mean, pixel_std=pixel_std)
     true_latents = encode_frames(model, pixels_t, device=device, frame_batch_size=32)
     start_state = make_markov_state(true_latents[0]).detach().cpu().numpy().astype(np.float64)
     goal_state = make_markov_state(true_latents[-1]).detach().cpu().numpy().astype(np.float64)
     goal_obs = obs_np[-1].astype(np.float32)
 
-    # State tracking weights (using format from mpc_neural.py)
-    W_state = jnp.ones((state_dim,))* 10.0
-    W_state = W_state.at[state_dim // 2 :].set(1.0) 
-    W_term = jnp.ones((state_dim,))*30.0   
-    W_term = W_term.at[:state_dim // 2].set(4000.0)  
-    cost = make_tracking_cost(action_weight=0.01, horizon=cfg.horizon, W_term=W_term, goal_state=goal_state) 
+    W_state_mppi = jnp.ones((state_dim,)) * 100.0
+    W_state_mppi = W_state_mppi.at[state_dim // 2 :].set(1.0)
+    W_state = jnp.ones((state_dim,)) * 10.0
+    W_state = W_state.at[state_dim // 2 :].set(1.0)
+    W_term = jnp.ones((state_dim,)) * 0.1
+    W_term = W_term.at[:state_dim // 2].set(4000.0)
+    cost = make_tracking_cost(action_weight=0.01, horizon=cfg.horizon, W_term=W_term, W_track=W_state, goal_state=goal_state)
 
     save_rgb_image(run_dir / "start_image.png", pixels_np[0])
     save_rgb_image(run_dir / "goal_image.png", pixels_np[-1])
 
-    # 6. SLS Configuration (RTI set to False to preserve structured tubes for visual diagnostics)
+    # 6. MPPI Planner Configuration
+    mppi_config_dict = {
+        "planning": {
+            "action_dim": action_dim,
+            "n_sample": cfg.mppi_samples,
+            "horizon": cfg.horizon * 4,
+            "n_update_iter": cfg.mppi_update_iter,
+            "use_last": True,
+            "reject_bad": False,
+            "mppi": {
+                "reward_weight": cfg.mppi_reward_weight,
+                "noise_level": cfg.mppi_noise_level,
+                "noise_decay": 1.0,
+                "beta_filter": cfg.mppi_beta_filter
+            }
+        }
+    }
+    
+    mppi_rollout, mppi_eval = make_mppi_rollout_and_eval(
+        dynamics, state_dim, action_dim, cfg.horizon, W_state_mppi, W_term, goal_state
+    )
+    
+    u_min, u_max = -500.0 * jnp.ones(action_dim), 500.0 * jnp.ones(action_dim)
+    mppi_planner = MPPIPlanner(
+        config=mppi_config_dict,
+        model_rollout_fn=mppi_rollout,
+        evaluate_traj_fn=mppi_eval,
+        action_lower_lim=u_min,
+        action_upper_lim=u_max
+    )
+
+    def standard_mppi_jit_wrapper(key, state, init_act):
+        return mppi_planner.trajectory_optimization(key, state, init_act, skip=False)
+
+    jit_mppi_trajopt = jax.jit(standard_mppi_jit_wrapper)
+
+    # 7. SLS Solver Configuration (RTI strictly False to compute full tubes)
     sls_cfg = SLSConfig(
         max_sls_iterations=1,
         sls_primal_tol=1e-2,
@@ -334,27 +428,29 @@ def main():
         max_initial_sqp_iterations=0,
         initialize_nominal=True,
         warm_start=True,
-        rti=False,
-        R_bar = None,
-        Q_bar = None,
+        rti=False, 
+        R_bar=None,
+        Q_bar=None,
     )
-    
     sqp_cfg = SQPConfig(max_sqp_iterations=3, warm_start=False, feas_tol=1e-2, step_tol=1e-4, line_search=False)
     admm_cfg = ADMMConfig(eps_abs=1e-2, eps_rel=1e-4, rho_max=1e2, max_iterations=200, rho_update_frequency=20, initial_rho=1.0)
+    
     mpc_dt = 1.0 / physics_freq_hz
     mpc_cfg = MPCConfig(n=state_dim, nu=action_dim, N=cfg.horizon, W=W_state, u_ref=jnp.zeros(action_dim), dt=mpc_dt)
 
-    u_min, u_max = -500.0 * jnp.ones(action_dim), 500.0 * jnp.ones(action_dim)
-    x_min, x_max = -1000.0 * jnp.ones(state_dim), 1000.0 * jnp.ones(state_dim)
+    x_min, x_max = -2.0 * jnp.ones(state_dim), 2.0 * jnp.ones(state_dim)
     constraints_all = combine_constraints(make_state_box_constraints(x_min, x_max), make_control_box_constraints(u_min, u_max))
 
     controller = GenericMPC(
-        sls_cfg, sqp_cfg, admm_cfg, config=mpc_cfg, dynamics=dynamics, constraints=constraints_all,
+        sls_cfg, sqp_cfg, admm_cfg,
+        config=mpc_cfg, dynamics=dynamics, constraints=constraints_all,
         obstacles=jnp.zeros((0, 3)), cost=cost, num_constraints=2 * action_dim + 2 * state_dim,
-        disturbance=disturbance, shift=1, X_in=jnp.zeros((mpc_cfg.N + 1, mpc_cfg.n), dtype=jnp.float64), U_in=jnp.zeros((mpc_cfg.N, mpc_cfg.nu), dtype=jnp.float64),
+        disturbance=disturbance, shift=1,
+        X_in=jnp.zeros((mpc_cfg.N + 1, mpc_cfg.n), dtype=jnp.float64),
+        U_in=jnp.zeros((mpc_cfg.N, mpc_cfg.nu), dtype=jnp.float64),
     )
 
-    # 7. Env Setup & MPC Loop
+    # 8. Env Setup & Receding Horizon MPC Loop
     env = make_render_env(seed=episode_seed, time_limit=time_limit, width=width, height=height, physics_freq_hz=physics_freq_hz)
     current_frame = reset_env_to_state(env, seed=episode_seed, qpos=qpos_np[0], qvel=qvel_np[0], height=height, width=width)
     
@@ -362,13 +458,41 @@ def main():
     current_state = make_markov_state(current_emb).detach().cpu().numpy().astype(np.float64)
 
     rollout_frames = [current_frame.copy()]
-    X_ref = jnp.tile(goal_state[None, :], (cfg.horizon + 1, 1))
+    
+    prev_U = jnp.zeros((cfg.horizon, action_dim), dtype=jnp.float64)
     prev_u0 = np.zeros(action_dim, dtype=np.float32)
+    jax_seed_key = jax.random.PRNGKey(cfg.seed)
 
     pbar = tqdm(range(cfg.max_mpc_steps), desc="SLS MPC Steps")
     for mpc_step in pbar:
+        jax_seed_key, subkey = jax.random.split(jax_seed_key)
+        
+        # 8a. MPPI Warmstart
+        # 8a. Query MPPI Trajectory Optimization for Warmstart Sequence
+        nominal_warmstart = jnp.concatenate([prev_U[1:], prev_U[-1:]], axis=0) # length: cfg.horizon
+
+        # Pad the remaining steps out to MPPI's long horizon by repeating the final action
+        padding_length = (cfg.horizon * 4) - cfg.horizon
+        padding_actions = jnp.tile(nominal_warmstart[-1:], (padding_length, 1))
+        init_act_seq = jnp.concatenate([nominal_warmstart, padding_actions], axis=0) # length: cfg.horizon * 4
+        mppi_res = jit_mppi_trajopt(subkey, jnp.asarray(current_state), init_act_seq)
+        
+        X_mppi_long = jnp.asarray(mppi_res["state_seq"])
+        U_mppi_long = jnp.asarray(mppi_res["act_seq"])
+        X_mppi = X_mppi_long[:cfg.horizon]
+        U_mppi = U_mppi_long[:cfg.horizon]
+        
+        X_warmstart = jnp.concatenate([jnp.asarray(current_state)[None, :], X_mppi], axis=0) 
+        X_ref = X_warmstart
+
+        controller.X_in = X_warmstart
+        controller.U_in = U_mppi
+
+        # 8b. Run SLS Refinement
         try:
-            u0, X_pred, U_pred, *solver_info = controller.run(x0=current_state, reference=X_ref, parameter=mpc_dt)
+            u0, X_pred, U_pred, *solver_info = controller.run(
+                x0=current_state, reference=X_ref, parameter=mpc_dt
+            )
             solver_status = "genericmpc"
         except Exception as e:
             print(f"\n[WARN] GenericMPC solve raised exception: {e}")
@@ -379,19 +503,41 @@ def main():
             print("\n[WARN] SLS Solver failed or returned NaN. Using fallback (previous action).")
             u0 = prev_u0
             solver_status = "fallback"
+            prev_X, prev_U = shift_warmstart(X_warmstart, U_mppi)
         else:
             prev_u0 = np.asarray(u0, dtype=np.float32)
+            prev_X, prev_U = shift_warmstart(X_pred, U_pred)
             
-            # Non-blocking, multi-threaded background visualization block
+            # --- Extract, Save, and Plot Project Tube Widths ---
             if len(solver_info) >= 3:
                 Phi_x = solver_info[2]
                 tube = np.asarray(jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1))
+                
                 np.save(tube_plots_dir / f"tube_widths_step_{mpc_step:03d}.npy", tube)
                 
-                plot_path = tube_plots_dir / f"tube_widths_step_{mpc_step:03d}.png"
-                vis_executor.submit(asynchronous_tube_plot, mpc_step, tube, state_dim, plot_path)
+                n_cols = 6
+                n_rows = int(np.ceil(state_dim / n_cols))
+                fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 2.2 * n_rows), sharex=True)
+                axes = np.atleast_1d(axes).flatten()
+                horizon_axis = np.arange(cfg.horizon + 1)
+                
+                for dim_idx in range(state_dim):
+                    ax = axes[dim_idx]
+                    ax.plot(horizon_axis, tube[:, dim_idx], color="tab:blue", linewidth=1.5)
+                    ax.set_title(f"Dim {dim_idx}", fontsize=8)
+                    ax.grid(True, linestyle="--", alpha=0.5)
+                    ax.tick_params(axis="both", which="major", labelsize=8)
+                
+                for dim_idx in range(state_dim, len(axes)):
+                    axes[dim_idx].axis("off")
+                
+                fig.suptitle(f"Projected Tube Widths Across Horizon (MPC Step {mpc_step})", fontsize=14)
+                plt.tight_layout()
+                plt.savefig(tube_plots_dir / f"tube_widths_step_{mpc_step:03d}.png", dpi=120)
+                plt.close()
+            # ----------------------------------------------------
         
-        # Apply Action
+        # 8c. Apply Action Step
         u0_norm = np.asarray(u0, dtype=np.float32)
         u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
         obs, _, terminated, truncated, _ = env.step(u0_raw)
@@ -399,7 +545,7 @@ def main():
         current_obs = np.asarray(obs, dtype=np.float32)
         current_frame = env._env.physics.render(height=height, width=width, camera_id=0)
         
-        # Next State encoding
+        # 8d. State Update
         next_emb = encode_single_frame(model, current_frame, device=device, img_size=img_size, pixel_mean=pixel_mean, pixel_std=pixel_std)
         current_state = make_markov_state(next_emb, current_emb).detach().cpu().numpy().astype(np.float64)
         current_emb = next_emb
@@ -408,13 +554,13 @@ def main():
         
         # Telemetry
         obs_err = float(np.linalg.norm(current_obs - goal_obs))
+        pos_latent_err = float(np.linalg.norm(current_state[:state_dim // 2] - goal_state[:state_dim // 2]))
         latent_err = float(np.linalg.norm(current_state - goal_state))
-        pbar.set_postfix(obs_err=f"{obs_err:.3f}", lat_err=f"{latent_err:.3f}", status=solver_status)
+        pbar.set_postfix(obs_err=f"{obs_err:.3f}", lat_err=f"{pos_latent_err:.3f}", status=solver_status)
 
-        if obs_err <= 0.05 or terminated or truncated:
+        if pos_latent_err <= 0.05 or terminated or truncated:
             break
 
-    vis_executor.shutdown(wait=False)
     if rollout_frames:
         save_rollout_video(rollout_frames, run_dir, fps=cfg.video_fps)
     env.close()
