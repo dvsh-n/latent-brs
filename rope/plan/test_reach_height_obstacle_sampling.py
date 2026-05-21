@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample rope task states from a reach-height obstacle set and its complement."""
+"""Sample rope task states using proxy midpoint height obstacle labels."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/codex_mplconfig")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -21,12 +21,13 @@ if str(REPO_ROOT) not in sys.path:
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+import imageio.v2 as imageio
 import mujoco
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
-from rope.plan import plan_ilqr_mpc as planner
-from rope.shared.lab_env import BaseEnvConfig, LabEnv, TaskState
+from rope.shared.lab_env import BaseEnvConfig, LabEnv, TABLE_TOP_Z, TaskState
 
 DEFAULT_OUT_DIR = "rope/plan/reach_height_obstacle_sampling"
 DISABLE_SHADOWS = True
@@ -36,8 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--obstacle-count", "--sample-count", dest="obstacle_count", type=int, default=256)
-    parser.add_argument("--outside-count", type=int, default=32)
+    parser.add_argument("--outside-count", type=int, default=64)
     parser.add_argument("--width", type=int, default=224)
     parser.add_argument("--height", type=int, default=224)
     parser.add_argument(
@@ -46,18 +46,23 @@ def parse_args() -> argparse.Namespace:
         default=DISABLE_SHADOWS,
         help="Disable shadows for the saved renders.",
     )
-
     parser.add_argument("--reach-min", type=float, default=0.02)
     parser.add_argument("--reach-max", type=float, default=0.18)
-    parser.add_argument("--min-height", type=float, default=1.26)
     parser.add_argument("--width-margin", type=float, default=0.03)
+    parser.add_argument("--width-steps", type=int, default=5)
+    parser.add_argument("--reach-steps", type=int, default=11)
+    parser.add_argument("--height-steps", type=int, default=11)
     parser.add_argument(
-        "--outside-in-band-frac",
-        "--outside-low-frac",
-        dest="outside_in_band_frac",
+        "--midpoint-clearance",
         type=float,
-        default=0.5,
-        help="Fraction of outside samples drawn within the reach band at heights >= min_height.",
+        default=0.15,
+        help="Desired rope midpoint clearance above the table before adding the model buffer.",
+    )
+    parser.add_argument(
+        "--midpoint-buffer",
+        type=float,
+        default=0.025,
+        help="Extra model-error buffer added to the desired midpoint clearance threshold.",
     )
     return parser.parse_args()
 
@@ -75,20 +80,17 @@ def task_bounds_arrays(env: LabEnv) -> tuple[np.ndarray, np.ndarray]:
     return lower, upper
 
 
-def validate_obstacle_spec(lower: np.ndarray, upper: np.ndarray, args: argparse.Namespace) -> None:
-    reach_min = float(args.reach_min)
-    reach_max = float(args.reach_max)
-    min_height = float(args.min_height)
-    if not (lower[0] <= reach_min < reach_max <= upper[0]):
+def validate_args(lower: np.ndarray, upper: np.ndarray, args: argparse.Namespace) -> None:
+    if not (lower[0] <= float(args.reach_min) < float(args.reach_max) <= upper[0]):
         raise ValueError(
-            f"Reach band [{reach_min}, {reach_max}] must lie within task reach bounds [{lower[0]}, {upper[0]}]."
+            f"Reach band [{args.reach_min}, {args.reach_max}] must lie within task reach bounds [{lower[0]}, {upper[0]}]."
         )
-    if not (lower[1] < min_height <= upper[1]):
-        raise ValueError(
-            f"Minimum height {min_height} must lie within task height bounds ({lower[1]}, {upper[1]}]."
-        )
-    if not (0.0 <= float(args.outside_in_band_frac) <= 1.0):
-        raise ValueError(f"outside_in_band_frac must be in [0, 1], got {args.outside_in_band_frac}.")
+    if int(args.width_steps) <= 0 or int(args.reach_steps) <= 0 or int(args.height_steps) <= 0:
+        raise ValueError("Grid step counts must all be positive.")
+    if int(args.outside_count) < 0:
+        raise ValueError(f"outside_count must be non-negative, got {args.outside_count}.")
+    if float(args.midpoint_clearance) < 0.0 or float(args.midpoint_buffer) < 0.0:
+        raise ValueError("Midpoint clearance and midpoint buffer must be non-negative.")
 
 
 def clipped_width_interval(lower: np.ndarray, upper: np.ndarray, margin: float) -> tuple[float, float]:
@@ -99,85 +101,165 @@ def clipped_width_interval(lower: np.ndarray, upper: np.ndarray, margin: float) 
     return lo, hi
 
 
-def sample_obstacle_states(
+def build_in_band_grid(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    *,
+    reach_min: float,
+    reach_max: float,
+    width_margin: float,
+    width_steps: int,
+    reach_steps: int,
+    height_steps: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    width_lo, width_hi = clipped_width_interval(lower, upper, width_margin)
+    width_values = np.linspace(width_lo, width_hi, num=width_steps, dtype=np.float64)
+    reach_values = np.linspace(reach_min, reach_max, num=reach_steps, dtype=np.float64)
+    height_values = np.linspace(float(upper[1]), float(lower[1]), num=height_steps, dtype=np.float64)
+
+    states: list[np.ndarray] = []
+    for width in width_values:
+        for reach in reach_values:
+            for height in height_values:
+                states.append(np.array([reach, height, width], dtype=np.float64))
+    return np.stack(states, axis=0), width_values, reach_values, height_values
+
+
+def sample_out_of_band_states(
     rng: np.random.Generator,
     lower: np.ndarray,
     upper: np.ndarray,
     *,
     reach_min: float,
     reach_max: float,
-    min_height: float,
     width_margin: float,
     count: int,
 ) -> np.ndarray:
+    if count == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+
     width_lo, width_hi = clipped_width_interval(lower, upper, width_margin)
-    height_hi = min_height
-    if height_hi <= lower[1]:
-        raise ValueError(
-            f"No feasible obstacle states: min_height={min_height} leaves no room above task height lower bound."
-        )
-    reach = rng.uniform(reach_min, reach_max, size=count)
-    height = rng.uniform(lower[1], height_hi, size=count)
+    left_width = max(reach_min - float(lower[0]), 0.0)
+    right_width = max(float(upper[0]) - reach_max, 0.0)
+    if left_width <= 1e-8 and right_width <= 1e-8:
+        raise ValueError("No feasible out-of-band states: reach obstacle covers the full task reach range.")
+
+    side_pick = rng.uniform(0.0, left_width + right_width, size=count)
+    reach = np.empty((count,), dtype=np.float64)
+    left_mask = side_pick < left_width
+    right_mask = ~left_mask
+    if np.any(left_mask):
+        reach[left_mask] = rng.uniform(float(lower[0]), reach_min, size=int(np.sum(left_mask)))
+    if np.any(right_mask):
+        reach[right_mask] = rng.uniform(reach_max, float(upper[0]), size=int(np.sum(right_mask)))
+
+    height = rng.uniform(float(lower[1]), float(upper[1]), size=count)
     width = rng.uniform(width_lo, width_hi, size=count)
     return np.stack((reach, height, width), axis=1).astype(np.float64)
 
 
-def sample_outside_states(
-    rng: np.random.Generator,
-    lower: np.ndarray,
-    upper: np.ndarray,
+def states_to_qpos_and_control(
+    env: LabEnv,
+    task_states: np.ndarray,
     *,
-    reach_min: float,
-    reach_max: float,
-    min_height: float,
-    width_margin: float,
-    count: int,
-    outside_in_band_frac: float,
-) -> np.ndarray:
-    width_lo, width_hi = clipped_width_interval(lower, upper, width_margin)
-    in_band_count = int(round(count * outside_in_band_frac))
-    out_of_band_count = count - in_band_count
-    pieces: list[np.ndarray] = []
-
-    height_lo = min_height
-    if in_band_count > 0:
-        reach = rng.uniform(reach_min, reach_max, size=in_band_count)
-        height = rng.uniform(height_lo, upper[1], size=in_band_count)
-        width = rng.uniform(width_lo, width_hi, size=in_band_count)
-        pieces.append(np.stack((reach, height, width), axis=1))
-
-    if out_of_band_count > 0:
-        left_width = max(reach_min - lower[0], 0.0)
-        right_width = max(upper[0] - reach_max, 0.0)
-        if left_width <= 1e-8 and right_width <= 1e-8:
-            raise ValueError("No feasible out-of-band outside states: reach obstacle covers the full task reach range.")
-        side_pick = rng.uniform(0.0, left_width + right_width, size=out_of_band_count)
-        reach = np.empty((out_of_band_count,), dtype=np.float64)
-        left_mask = side_pick < left_width
-        right_mask = ~left_mask
-        if np.any(left_mask):
-            reach[left_mask] = rng.uniform(lower[0], reach_min, size=int(np.sum(left_mask)))
-        if np.any(right_mask):
-            reach[right_mask] = rng.uniform(reach_max, upper[0], size=int(np.sum(right_mask)))
-        height = rng.uniform(lower[1], upper[1], size=out_of_band_count)
-        width = rng.uniform(width_lo, width_hi, size=out_of_band_count)
-        pieces.append(np.stack((reach, height, width), axis=1))
-
-    merged = np.concatenate(pieces, axis=0).astype(np.float64)
-    if merged.shape[0] != count:
-        raise RuntimeError(f"Outside sampler produced {merged.shape[0]} states, expected {count}.")
-    return merged
-
-
-def states_to_qpos_and_control(env: LabEnv, task_states: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    progress_desc: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if task_states.shape[0] == 0:
+        return (
+            np.zeros((0, env.model.nq), dtype=np.float32),
+            np.zeros((0, env.model.nu), dtype=np.float32),
+        )
     qpos_batch: list[np.ndarray] = []
     control_batch: list[np.ndarray] = []
-    for state_vec in task_states:
+    iterator = (
+        tqdm(task_states, desc=progress_desc, unit="state", leave=False)
+        if progress_desc is not None
+        else task_states
+    )
+    for state_vec in iterator:
         task_state = TaskState.from_array(state_vec)
         env.reset(task_state)
         qpos_batch.append(env.data.qpos.copy().astype(np.float32))
         control_batch.append(env.data.ctrl.copy().astype(np.float32))
     return np.stack(qpos_batch, axis=0), np.stack(control_batch, axis=0)
+
+
+def compute_proxy_midpoint_heights(
+    proxy_env: LabEnv,
+    task_states: np.ndarray,
+    *,
+    progress_desc: str | None = None,
+) -> np.ndarray:
+    midpoint_heights = np.zeros((task_states.shape[0],), dtype=np.float64)
+    iterator = (
+        tqdm(enumerate(task_states), total=task_states.shape[0], desc=progress_desc, unit="state")
+        if progress_desc is not None
+        else enumerate(task_states)
+    )
+    for index, state_vec in iterator:
+        proxy_env.reset(TaskState.from_array(state_vec))
+        midpoint_heights[index] = proxy_env.get_proxy_rope_midpoint_height()
+    return midpoint_heights
+
+
+def compute_lowest_height_reach_curve(
+    proxy_env: LabEnv,
+    *,
+    reach_values: np.ndarray,
+    width: float,
+    task_height: float,
+    progress_desc: str | None = None,
+) -> np.ndarray:
+    states = np.stack(
+        (
+            np.asarray(reach_values, dtype=np.float64),
+            np.full_like(reach_values, fill_value=task_height, dtype=np.float64),
+            np.full_like(reach_values, fill_value=width, dtype=np.float64),
+        ),
+        axis=1,
+    )
+    return compute_proxy_midpoint_heights(proxy_env, states, progress_desc=progress_desc)
+
+
+def save_rgb_image(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(path, np.ascontiguousarray(image))
+
+
+def render_rgb_frame(
+    renderer: mujoco.Renderer,
+    env: LabEnv,
+    camera_id: int,
+    *,
+    disable_shadows: bool = False,
+) -> np.ndarray:
+    renderer.update_scene(env.data, camera=camera_id)
+    if disable_shadows:
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+    return np.asarray(renderer.render(), dtype=np.uint8).copy()
+
+
+def reset_env_to_state(
+    env: LabEnv,
+    renderer: mujoco.Renderer,
+    *,
+    qpos: np.ndarray,
+    qvel: np.ndarray,
+    control: np.ndarray,
+    task_target: np.ndarray,
+    camera_id: int,
+    elapsed_time: float,
+    disable_shadows: bool,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    del elapsed_time
+    env.reset(TaskState.from_array(task_target))
+    env.data.qpos[: qpos.shape[0]] = np.asarray(qpos, dtype=np.float64)
+    env.data.qvel[: qvel.shape[0]] = np.asarray(qvel, dtype=np.float64)
+    env.joint_controller.set_target(np.asarray(control, dtype=np.float64))
+    env.task_controller.set_target(TaskState.from_array(task_target))
+    env.data.ctrl[:] = np.asarray(control, dtype=np.float64)
+    mujoco.mj_forward(env.model, env.data)
+    return render_rgb_frame(renderer, env, camera_id, disable_shadows=disable_shadows), {}
 
 
 def render_state_batch(
@@ -195,7 +277,7 @@ def render_state_batch(
     qvel = np.zeros((env.model.nv,), dtype=np.float32)
     frames: list[np.ndarray] = []
     for state_vec, qpos, control in zip(task_states, qpos_batch, control_batch, strict=True):
-        frame, _ = planner.reset_env_to_state(
+        frame, _ = reset_env_to_state(
             env,
             renderer,
             qpos=qpos,
@@ -249,6 +331,9 @@ def overlay_proxy_rope(
     env: LabEnv,
     *,
     camera_id: int,
+    midpoint_height: float,
+    midpoint_cutoff: float,
+    task_state: np.ndarray,
 ) -> np.ndarray:
     proxy_points = env.get_proxy_rope_points()
     midpoint = env.get_proxy_rope_midpoint()[None, :]
@@ -288,15 +373,31 @@ def overlay_proxy_rope(
             alpha=0.75,
         )
     if np.all(np.isfinite(midpoint_px)):
+        midpoint_color = "#d55e00" if midpoint_height < midpoint_cutoff else "#009e73"
         ax.scatter(
             [midpoint_px[0]],
             [midpoint_px[1]],
-            s=60.0,
-            c="#ff3ea5",
+            s=70.0,
+            c=midpoint_color,
             edgecolors="white",
-            linewidths=1.0,
+            linewidths=1.2,
             alpha=0.95,
         )
+    task_state = np.asarray(task_state, dtype=np.float64)
+    annotation = (
+        f"r={task_state[0]:.3f} h={task_state[1]:.3f} w={task_state[2]:.3f}\n"
+        f"mid z={midpoint_height:.3f} cutoff={midpoint_cutoff:.3f}"
+    )
+    ax.text(
+        8.0,
+        14.0,
+        annotation,
+        color="white",
+        fontsize=10.0,
+        va="top",
+        ha="left",
+        bbox={"facecolor": "black", "alpha": 0.55, "pad": 4.0, "edgecolor": "none"},
+    )
     ax.set_axis_off()
     canvas = FigureCanvasAgg(fig)
     canvas.draw()
@@ -312,16 +413,24 @@ def render_proxy_overlay_batch(
     task_states: np.ndarray,
     qpos_batch: np.ndarray,
     control_batch: np.ndarray,
+    midpoint_heights: np.ndarray,
     *,
     camera_name: str,
     elapsed_time: float,
     disable_shadows: bool,
+    midpoint_cutoff: float,
 ) -> np.ndarray:
     camera_id = env.model.camera(camera_name).id
     qvel = np.zeros((env.model.nv,), dtype=np.float32)
     frames: list[np.ndarray] = []
-    for state_vec, qpos, control in zip(task_states, qpos_batch, control_batch, strict=True):
-        frame, _ = planner.reset_env_to_state(
+    for state_vec, qpos, control, midpoint_height in zip(
+        task_states,
+        qpos_batch,
+        control_batch,
+        midpoint_heights,
+        strict=True,
+    ):
+        frame, _ = reset_env_to_state(
             env,
             renderer,
             qpos=qpos,
@@ -332,7 +441,16 @@ def render_proxy_overlay_batch(
             elapsed_time=elapsed_time,
             disable_shadows=disable_shadows,
         )
-        frames.append(overlay_proxy_rope(frame.copy(), env, camera_id=camera_id))
+        frames.append(
+            overlay_proxy_rope(
+                frame.copy(),
+                env,
+                camera_id=camera_id,
+                midpoint_height=float(midpoint_height),
+                midpoint_cutoff=float(midpoint_cutoff),
+                task_state=state_vec,
+            )
+        )
     return np.stack(frames, axis=0)
 
 
@@ -350,67 +468,174 @@ def make_image_grid(images: np.ndarray, *, columns: int) -> np.ndarray:
     return grid
 
 
-def representative_indices(count: int) -> np.ndarray:
-    if count <= 0:
-        return np.zeros((0,), dtype=np.int64)
-    if count <= 9:
-        return np.arange(count, dtype=np.int64)
-    return np.linspace(0, count - 1, num=9, dtype=np.int64)
+def choose_representative_indices(
+    midpoint_heights: np.ndarray,
+    labels: np.ndarray,
+    midpoint_cutoff: float,
+    *,
+    count: int = 9,
+) -> np.ndarray:
+    total = midpoint_heights.shape[0]
+    if total <= count:
+        return np.arange(total, dtype=np.int64)
+
+    chosen: list[int] = []
+    signed_distance = midpoint_heights - midpoint_cutoff
+    obstacle_idx = np.flatnonzero(labels == 1)
+    safe_idx = np.flatnonzero(labels == 0)
+
+    for pool in (
+        obstacle_idx[np.argsort(np.abs(signed_distance[obstacle_idx]))],
+        safe_idx[np.argsort(np.abs(signed_distance[safe_idx]))],
+        np.argsort(midpoint_heights),
+        np.argsort(-midpoint_heights),
+    ):
+        for index in pool:
+            int_index = int(index)
+            if int_index not in chosen:
+                chosen.append(int_index)
+            if len(chosen) >= count:
+                return np.array(chosen, dtype=np.int64)
+
+    return np.array(chosen[:count], dtype=np.int64)
 
 
-def save_workspace_plot(
+def save_midpoint_slice_plot(
     *,
     out_path: Path,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    reach_min: float,
-    reach_max: float,
-    min_height: float,
-    obstacle_states: np.ndarray,
-    outside_states: np.ndarray,
+    width_values: np.ndarray,
+    reach_values: np.ndarray,
+    height_values: np.ndarray,
+    midpoint_grid: np.ndarray,
+    label_grid: np.ndarray,
+    midpoint_cutoff: float,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(7.0, 5.5), dpi=160)
-    obstacle_rect = plt.Rectangle(
-        (reach_min, float(lower[1])),
-        reach_max - reach_min,
-        min_height - float(lower[1]),
-        facecolor="#f5d8c2",
-        edgecolor="#b24700",
-        linewidth=2.0,
-        alpha=0.55,
-        label="obstacle region",
-    )
-    ax.add_patch(obstacle_rect)
+    columns = min(3, int(width_values.shape[0]))
+    rows = int(math.ceil(float(width_values.shape[0]) / float(columns)))
+    fig, axes = plt.subplots(rows, columns, figsize=(5.5 * columns, 4.2 * rows), dpi=160, squeeze=False)
 
-    ax.scatter(
-        outside_states[:, 0],
-        outside_states[:, 1],
-        s=22,
-        c="#0072b2",
-        alpha=0.55,
-        label="outside samples",
-    )
-    ax.scatter(
-        obstacle_states[:, 0],
-        obstacle_states[:, 1],
-        s=24,
-        c="#d55e00",
-        alpha=0.55,
-        label="obstacle samples",
-    )
+    reach_mesh, height_mesh = np.meshgrid(reach_values, height_values, indexing="xy")
+    height_desc = height_values
+    midpoint_min = float(np.min(midpoint_grid))
+    midpoint_max = float(np.max(midpoint_grid))
+    image_handles = []
 
-    ax.set_xlim(float(lower[0]), float(upper[0]))
-    ax.set_ylim(float(lower[1]), float(upper[1]))
-    ax.grid(alpha=0.2)
-    ax.set_xlabel("reach")
-    ax.set_ylabel("height")
-    ax.set_title("Reach-height obstacle region and sampled states")
-    ax.legend(loc="best")
-    fig.tight_layout()
+    for width_index, width_value in enumerate(width_values):
+        row = width_index // columns
+        col = width_index % columns
+        ax = axes[row][col]
+        image = midpoint_grid[width_index].T
+        obstacle_mask = label_grid[width_index].T.astype(float)
+        handle = ax.imshow(
+            image,
+            extent=[float(reach_values[0]), float(reach_values[-1]), float(height_desc[-1]), float(height_desc[0])],
+            origin="upper",
+            aspect="auto",
+            vmin=midpoint_min,
+            vmax=midpoint_max,
+            cmap="viridis",
+        )
+        image_handles.append(handle)
+        ax.contour(
+            reach_mesh,
+            height_mesh,
+            obstacle_mask,
+            levels=[0.5],
+            colors=["#d55e00"],
+            linewidths=2.0,
+        )
+        ax.set_title(f"width={width_value:.3f}")
+        ax.set_xlabel("reach")
+        ax.set_ylabel("height")
+        ax.grid(alpha=0.15)
+
+    for empty_index in range(width_values.shape[0], rows * columns):
+        row = empty_index // columns
+        col = empty_index % columns
+        axes[row][col].set_axis_off()
+
+    cbar = fig.colorbar(image_handles[0], ax=axes, shrink=0.92)
+    cbar.set_label("proxy midpoint height")
+    fig.suptitle(f"In-band midpoint height slices with obstacle contour at z < {midpoint_cutoff:.3f}", y=0.995)
+    fig.subplots_adjust(left=0.06, right=0.93, bottom=0.08, top=0.92, wspace=0.28, hspace=0.32)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)
 
+
+def save_min_height_diagnostic_plot(
+    *,
+    out_path: Path,
+    reach_values: np.ndarray,
+    line_reach_values: np.ndarray,
+    obstacle_reach_min: float,
+    obstacle_reach_max: float,
+    in_band_states: np.ndarray,
+    midpoint_heights: np.ndarray,
+    labels: np.ndarray,
+    min_height_curve: np.ndarray,
+    midpoint_target: float,
+    midpoint_cutoff: float,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7.0, 4.6), dpi=160)
+    obstacle_band = plt.Rectangle(
+        (obstacle_reach_min, TABLE_TOP_Z),
+        obstacle_reach_max - obstacle_reach_min,
+        midpoint_target - TABLE_TOP_Z,
+        facecolor="#f5d8c2",
+        edgecolor="none",
+        alpha=0.65,
+        label="obstacle band",
+    )
+    buffer_band = plt.Rectangle(
+        (obstacle_reach_min, midpoint_target),
+        obstacle_reach_max - obstacle_reach_min,
+        midpoint_cutoff - midpoint_target,
+        facecolor="#ffe599",
+        edgecolor="none",
+        alpha=0.8,
+        label="buffer band",
+    )
+    ax.add_patch(obstacle_band)
+    ax.add_patch(buffer_band)
+    line_handle = ax.plot(
+        line_reach_values,
+        min_height_curve,
+        color="#0072b2",
+        linewidth=2.0,
+        label="midpoint z at min task height",
+    )[0]
+    ax.axhline(TABLE_TOP_Z, color="#444444", linestyle="--", linewidth=1.5, label="table top")
+    obstacle_mask = labels == 1
+    safe_mask = ~obstacle_mask
+    safe_handle = ax.scatter(
+        in_band_states[safe_mask, 0],
+        midpoint_heights[safe_mask],
+        s=24.0,
+        c="#009e73",
+        alpha=0.7,
+        edgecolors="none",
+        label="safe samples",
+    )
+    obstacle_handle = ax.scatter(
+        in_band_states[obstacle_mask, 0],
+        midpoint_heights[obstacle_mask],
+        s=28.0,
+        c="#d55e00",
+        alpha=0.85,
+        edgecolors="none",
+        label="obstacle samples",
+    )
+    ax.set_title("Reach vs proxy midpoint height")
+    ax.set_xlabel("reach")
+    ax.set_ylabel("proxy midpoint height")
+    ax.set_xlim(float(reach_values[0]), float(reach_values[-1]))
+    ax.grid(alpha=0.2)
+    ax.legend(handles=[line_handle, obstacle_handle, safe_handle, obstacle_band, buffer_band], loc="best")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
 
 def main() -> None:
     args = parse_args()
@@ -421,102 +646,153 @@ def main() -> None:
     env = LabEnv()
     proxy_env = LabEnv(base_config=BaseEnvConfig(enable_proxy_rope=True))
     lower, upper = task_bounds_arrays(env)
-    validate_obstacle_spec(lower, upper, args)
+    validate_args(lower, upper, args)
 
-    obstacle_states = sample_obstacle_states(
-        rng,
+    in_band_states, width_values, reach_values, height_values = build_in_band_grid(
         lower,
         upper,
         reach_min=float(args.reach_min),
         reach_max=float(args.reach_max),
-        min_height=float(args.min_height),
         width_margin=float(args.width_margin),
-        count=int(args.obstacle_count),
+        width_steps=int(args.width_steps),
+        reach_steps=int(args.reach_steps),
+        height_steps=int(args.height_steps),
     )
-    outside_states = sample_outside_states(
+    midpoint_heights = compute_proxy_midpoint_heights(
+        proxy_env,
+        in_band_states,
+        progress_desc="Classifying in-band midpoint heights",
+    )
+
+    midpoint_grid = midpoint_heights.reshape(
+        int(args.width_steps),
+        int(args.reach_steps),
+        int(args.height_steps),
+    )
+    midpoint_target = float(TABLE_TOP_Z + float(args.midpoint_clearance))
+    midpoint_cutoff = float(midpoint_target + float(args.midpoint_buffer))
+    in_band_labels = (midpoint_heights < midpoint_cutoff).astype(np.int64)
+    label_grid = in_band_labels.reshape(
+        int(args.width_steps),
+        int(args.reach_steps),
+        int(args.height_steps),
+    )
+    diagnostic_reach_values = np.linspace(float(lower[0]), float(upper[0]), num=161, dtype=np.float64)
+    smallest_width_min_height_curve = compute_lowest_height_reach_curve(
+        proxy_env,
+        reach_values=diagnostic_reach_values,
+        width=float(width_values[0]),
+        task_height=float(lower[1]),
+        progress_desc="Tracing min-height reach curve",
+    )
+    smallest_width_midpoint_at_lowest_height = midpoint_grid[0, :, -1].copy()
+    diagnostic_min_midpoint = float(np.min(smallest_width_min_height_curve))
+    diagnostic_min_clearance = float(diagnostic_min_midpoint - TABLE_TOP_Z)
+
+    obstacle_states = in_band_states[in_band_labels == 1]
+    safe_in_band_states = in_band_states[in_band_labels == 0]
+    out_of_band_states = sample_out_of_band_states(
         rng,
         lower,
         upper,
         reach_min=float(args.reach_min),
         reach_max=float(args.reach_max),
-        min_height=float(args.min_height),
         width_margin=float(args.width_margin),
         count=int(args.outside_count),
-        outside_in_band_frac=float(args.outside_in_band_frac),
+    )
+    outside_states = np.concatenate((safe_in_band_states, out_of_band_states), axis=0)
+
+    obstacle_qpos, obstacle_control = states_to_qpos_and_control(
+        env,
+        obstacle_states,
+        progress_desc="Packing obstacle states",
+    )
+    outside_qpos, outside_control = states_to_qpos_and_control(
+        env,
+        outside_states,
+        progress_desc="Packing non-obstacle states",
     )
 
-    obstacle_qpos, obstacle_control = states_to_qpos_and_control(env, obstacle_states)
-    outside_qpos, outside_control = states_to_qpos_and_control(env, outside_states)
-
-    rep_idx = representative_indices(obstacle_states.shape[0])
-    rep_states = obstacle_states[rep_idx]
-    rep_qpos = obstacle_qpos[rep_idx]
-    rep_control = obstacle_control[rep_idx]
+    representative_idx = choose_representative_indices(midpoint_heights, in_band_labels, midpoint_cutoff, count=9)
+    representative_states = in_band_states[representative_idx]
+    representative_midpoint_heights = midpoint_heights[representative_idx]
+    representative_qpos, representative_control = states_to_qpos_and_control(
+        env,
+        representative_states,
+        progress_desc="Packing representative states",
+    )
 
     with mujoco.Renderer(env.model, height=int(args.height), width=int(args.width)) as renderer:
-        front_obstacle_reps = render_state_batch(
+        front_representatives = render_state_batch(
             env,
             renderer,
-            rep_states,
-            rep_qpos,
-            rep_control,
+            representative_states,
+            representative_qpos,
+            representative_control,
             camera_name="video_cam",
             elapsed_time=0.0,
             disable_shadows=bool(args.disable_shadows),
         )
-        top_obstacle_reps = render_state_batch(
+        top_representatives = render_state_batch(
             env,
             renderer,
-            rep_states,
-            rep_qpos,
-            rep_control,
+            representative_states,
+            representative_qpos,
+            representative_control,
             camera_name="ceiling_cam",
             elapsed_time=0.0,
             disable_shadows=bool(args.disable_shadows),
         )
 
     with mujoco.Renderer(proxy_env.model, height=int(args.height), width=int(args.width)) as proxy_renderer:
-        front_proxy_overlay_reps = render_proxy_overlay_batch(
+        front_proxy_overlay_representatives = render_proxy_overlay_batch(
             proxy_env,
             proxy_renderer,
-            rep_states,
-            rep_qpos,
-            rep_control,
+            representative_states,
+            representative_qpos,
+            representative_control,
+            representative_midpoint_heights,
             camera_name="video_cam",
             elapsed_time=0.0,
             disable_shadows=bool(args.disable_shadows),
+            midpoint_cutoff=midpoint_cutoff,
         )
-        top_proxy_overlay_reps = render_proxy_overlay_batch(
+        top_proxy_overlay_representatives = render_proxy_overlay_batch(
             proxy_env,
             proxy_renderer,
-            rep_states,
-            rep_qpos,
-            rep_control,
+            representative_states,
+            representative_qpos,
+            representative_control,
+            representative_midpoint_heights,
             camera_name="ceiling_cam",
             elapsed_time=0.0,
             disable_shadows=bool(args.disable_shadows),
+            midpoint_cutoff=midpoint_cutoff,
         )
 
-    planner.save_rgb_image(out_dir / "front_obstacle_samples_grid.png", make_image_grid(front_obstacle_reps, columns=3))
-    planner.save_rgb_image(out_dir / "top_obstacle_samples_grid.png", make_image_grid(top_obstacle_reps, columns=3))
-    planner.save_rgb_image(
-        out_dir / "front_obstacle_samples_proxy_overlay_grid.png",
-        make_image_grid(front_proxy_overlay_reps, columns=3),
+    save_rgb_image(out_dir / "front_representative_states_grid.png", make_image_grid(front_representatives, columns=3))
+    save_rgb_image(out_dir / "top_representative_states_grid.png", make_image_grid(top_representatives, columns=3))
+    save_rgb_image(
+        out_dir / "front_representative_proxy_overlay_grid.png",
+        make_image_grid(front_proxy_overlay_representatives, columns=3),
     )
-    planner.save_rgb_image(
-        out_dir / "top_obstacle_samples_proxy_overlay_grid.png",
-        make_image_grid(top_proxy_overlay_reps, columns=3),
+    save_rgb_image(
+        out_dir / "top_representative_proxy_overlay_grid.png",
+        make_image_grid(top_proxy_overlay_representatives, columns=3),
     )
 
-    save_workspace_plot(
-        out_path=out_dir / "workspace_samples.png",
-        lower=lower,
-        upper=upper,
-        reach_min=float(args.reach_min),
-        reach_max=float(args.reach_max),
-        min_height=float(args.min_height),
-        obstacle_states=obstacle_states,
-        outside_states=outside_states,
+    save_min_height_diagnostic_plot(
+        out_path=out_dir / "smallest_width_lowest_height_diagnostic.png",
+        reach_values=np.array([float(lower[0]), float(upper[0])], dtype=np.float64),
+        line_reach_values=diagnostic_reach_values,
+        obstacle_reach_min=float(args.reach_min),
+        obstacle_reach_max=float(args.reach_max),
+        in_band_states=in_band_states,
+        midpoint_heights=midpoint_heights,
+        labels=in_band_labels,
+        min_height_curve=smallest_width_min_height_curve,
+        midpoint_target=midpoint_target,
+        midpoint_cutoff=midpoint_cutoff,
     )
 
     torch.save(
@@ -526,8 +802,10 @@ def main() -> None:
                 "width": int(args.width),
                 "height": int(args.height),
                 "disable_shadows": bool(args.disable_shadows),
+                "in_band_grid_count": int(in_band_states.shape[0]),
                 "obstacle_count_valid": int(obstacle_states.shape[0]),
-                "outside_count_valid": int(outside_states.shape[0]),
+                "safe_in_band_count_valid": int(safe_in_band_states.shape[0]),
+                "out_of_band_count_valid": int(out_of_band_states.shape[0]),
             },
             "episode_data": {
                 "qpos": np.concatenate((obstacle_qpos, outside_qpos), axis=0),
@@ -543,14 +821,23 @@ def main() -> None:
                 ),
             },
             "planner_data": {
+                "in_band_task_states": in_band_states.astype(np.float32),
+                "in_band_midpoint_heights": midpoint_heights.astype(np.float32),
+                "in_band_labels": in_band_labels.astype(np.int64),
+                "width_values": width_values.astype(np.float32),
+                "reach_values": reach_values.astype(np.float32),
+                "height_values_descending": height_values.astype(np.float32),
                 "obstacle_task_states": obstacle_states.astype(np.float32),
                 "obstacle_qpos": obstacle_qpos.astype(np.float32),
                 "obstacle_control": obstacle_control.astype(np.float32),
                 "outside_task_states": outside_states.astype(np.float32),
                 "outside_qpos": outside_qpos.astype(np.float32),
                 "outside_control": outside_control.astype(np.float32),
+                "out_of_band_task_states": out_of_band_states.astype(np.float32),
                 "reach_band": np.array([float(args.reach_min), float(args.reach_max)], dtype=np.float32),
-                "min_height": float(args.min_height),
+                "table_top_z": float(TABLE_TOP_Z),
+                "midpoint_target": float(midpoint_target),
+                "midpoint_cutoff": float(midpoint_cutoff),
             },
         },
         out_dir / "obstacle_samples.pt",
@@ -560,30 +847,61 @@ def main() -> None:
         out_dir / "summary.json",
         {
             "seed": int(args.seed),
-            "obstacle_count_requested": int(args.obstacle_count),
-            "obstacle_count_valid": int(obstacle_states.shape[0]),
-            "outside_count_requested": int(args.outside_count),
-            "outside_count_valid": int(outside_states.shape[0]),
-            "outside_in_band_frac": float(args.outside_in_band_frac),
+            "grid": {
+                "width_steps": int(args.width_steps),
+                "reach_steps": int(args.reach_steps),
+                "height_steps": int(args.height_steps),
+                "in_band_grid_count": int(in_band_states.shape[0]),
+            },
+            "counts": {
+                "obstacle_count_valid": int(obstacle_states.shape[0]),
+                "safe_in_band_count_valid": int(safe_in_band_states.shape[0]),
+                "out_of_band_count_requested": int(args.outside_count),
+                "out_of_band_count_valid": int(out_of_band_states.shape[0]),
+                "outside_count_valid": int(outside_states.shape[0]),
+            },
             "reach_min": float(args.reach_min),
             "reach_max": float(args.reach_max),
-            "min_height": float(args.min_height),
             "width_margin": float(args.width_margin),
             "task_lower": lower.tolist(),
             "task_upper": upper.tolist(),
-            "obstacle_min_height_observed": float(np.min(obstacle_states[:, 1])) if obstacle_states.size > 0 else None,
-            "obstacle_max_height_observed": float(np.max(obstacle_states[:, 1])) if obstacle_states.size > 0 else None,
-            "outside_min_height_observed": float(np.min(outside_states[:, 1])) if outside_states.size > 0 else None,
-            "outside_max_height_observed": float(np.max(outside_states[:, 1])) if outside_states.size > 0 else None,
-            "outside_task_states": outside_states.tolist(),
+            "table_top_z": float(TABLE_TOP_Z),
+            "midpoint_clearance": float(args.midpoint_clearance),
+            "midpoint_buffer": float(args.midpoint_buffer),
+            "midpoint_target": float(midpoint_target),
+            "midpoint_cutoff": float(midpoint_cutoff),
+            "diagnostics": {
+                "smallest_sampled_width": float(width_values[0]),
+                "smallest_width_lowest_height_midpoint_min": diagnostic_min_midpoint,
+                "smallest_width_lowest_height_midpoint_max": float(np.max(smallest_width_min_height_curve)),
+                "smallest_width_lowest_height_clearance_min": diagnostic_min_clearance,
+            },
+            "midpoint_height_stats": {
+                "in_band_min": float(np.min(midpoint_heights)),
+                "in_band_max": float(np.max(midpoint_heights)),
+                "obstacle_midpoint_min": float(np.min(midpoint_heights[in_band_labels == 1]))
+                if np.any(in_band_labels == 1)
+                else None,
+                "obstacle_midpoint_max": float(np.max(midpoint_heights[in_band_labels == 1]))
+                if np.any(in_band_labels == 1)
+                else None,
+                "safe_midpoint_min": float(np.min(midpoint_heights[in_band_labels == 0]))
+                if np.any(in_band_labels == 0)
+                else None,
+                "safe_midpoint_max": float(np.max(midpoint_heights[in_band_labels == 0]))
+                if np.any(in_band_labels == 0)
+                else None,
+            },
+            "representative_states": representative_states.tolist(),
+            "representative_midpoint_heights": representative_midpoint_heights.tolist(),
         },
     )
 
-    print(f"Saved workspace: {out_dir / 'workspace_samples.png'}")
-    print(f"Saved front grid: {out_dir / 'front_obstacle_samples_grid.png'}")
-    print(f"Saved top grid:   {out_dir / 'top_obstacle_samples_grid.png'}")
-    print(f"Saved front proxy overlay grid: {out_dir / 'front_obstacle_samples_proxy_overlay_grid.png'}")
-    print(f"Saved top proxy overlay grid:   {out_dir / 'top_obstacle_samples_proxy_overlay_grid.png'}")
+    print(f"Saved min-height diagnostic: {out_dir / 'smallest_width_lowest_height_diagnostic.png'}")
+    print(f"Saved front grid: {out_dir / 'front_representative_states_grid.png'}")
+    print(f"Saved top grid:   {out_dir / 'top_representative_states_grid.png'}")
+    print(f"Saved front proxy overlay grid: {out_dir / 'front_representative_proxy_overlay_grid.png'}")
+    print(f"Saved top proxy overlay grid:   {out_dir / 'top_representative_proxy_overlay_grid.png'}")
     print(f"Saved payload:    {out_dir / 'obstacle_samples.pt'}")
     print(f"Saved summary:    {out_dir / 'summary.json'}")
 
