@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def log_progress(message: str) -> None:
-    print(f"[obstacle_net_v3] {message}", flush=True)
+    print(f"[obstacle_net] {message}", flush=True)
 
 
 def save_json(path: Path, payload: dict[str, Any]) -> None:
@@ -765,7 +765,7 @@ def save_workspace_plot(
 
 
 @dataclass
-class ObstacleNetV3Config:
+class ObstacleNetConfig:
     model_dir: str
     checkpoint_path: str
     background_dataset_path: str
@@ -821,8 +821,8 @@ def build_run_config(
     checkpoint_path: Path,
     background_dataset_path: Path,
     embed_dim: int,
-) -> ObstacleNetV3Config:
-    return ObstacleNetV3Config(
+) -> ObstacleNetConfig:
+    return ObstacleNetConfig(
         model_dir=str(model_dir),
         checkpoint_path=str(checkpoint_path),
         background_dataset_path=str(background_dataset_path),
@@ -856,16 +856,16 @@ def build_run_config(
     )
 
 
-def cache_key_for_config(config: ObstacleNetV3Config) -> str:
+def cache_key_for_config(config: ObstacleNetConfig) -> str:
     payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def infer_cache_dir(out_root: Path, config: ObstacleNetV3Config) -> Path:
+def infer_cache_dir(out_root: Path, config: ObstacleNetConfig) -> Path:
     return out_root / cache_key_for_config(config)
 
 
-def artifact_paths(out_root: Path, config: ObstacleNetV3Config) -> ArtifactPaths:
+def artifact_paths(out_root: Path, config: ObstacleNetConfig) -> ArtifactPaths:
     cache_dir = infer_cache_dir(out_root, config)
     return ArtifactPaths(
         cache_dir=cache_dir,
@@ -1680,7 +1680,7 @@ def main() -> None:
     }
     save_json(paths.summary, summary)
 
-    log_progress("Obstacle net v3 complete.")
+    log_progress("Obstacle net complete.")
     print(f"Cache dir:  {paths.cache_dir}")
     print(f"Model path: {paths.model}")
     print(f"Train acc:  {train_eval['accuracy']:.4f}")
