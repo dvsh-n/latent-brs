@@ -3,12 +3,21 @@
 
 import argparse
 import json
+import os
 import torch
 import h5py
 import re
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
+
+import gymnasium
+import mujoco
+import ogbench.manipspace  # noqa: F401
+from ogbench.manipspace import lie
 
 # Keep only external imports for OGBench
 from ogbench_cube.train.mlpdyn_train import (
@@ -22,6 +31,49 @@ from ogbench_cube.train.mlpdyn_train import (
 DEFAULT_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
 DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8"
 
+def hide_target_cube(env: gymnasium.Env) -> None:
+    for geom_ids in env.unwrapped._cube_target_geom_ids_list:
+        for gid in geom_ids:
+            env.unwrapped._model.geom(gid).rgba[3] = 0.0
+
+def restore_target_pose(env: gymnasium.Env, target_block_pos: np.ndarray, target_block_yaw: float) -> None:
+    unwrapped = env.unwrapped
+    unwrapped._target_block = 0
+    target_mocap_id = unwrapped._cube_target_mocap_ids[0]
+    unwrapped._data.mocap_pos[target_mocap_id] = np.asarray(target_block_pos, dtype=np.float64)
+    unwrapped._data.mocap_quat[target_mocap_id] = np.asarray(
+        lie.SO3.from_z_radians(float(target_block_yaw)).wxyz,
+        dtype=np.float64,
+    )
+    hide_target_cube(env)
+
+def render_episode_without_target_cube(
+    env: gymnasium.Env,
+    *,
+    seed: int,
+    qpos: np.ndarray,
+    qvel: np.ndarray,
+    target_block_pos: np.ndarray,
+    target_block_yaw: np.ndarray,
+    camera: str,
+) -> np.ndarray:
+    env.reset(seed=seed)
+    frames = []
+    for step in range(qpos.shape[0]):
+        env.unwrapped._data.qpos[: qpos.shape[1]] = np.asarray(qpos[step], dtype=np.float64)
+        env.unwrapped._data.qvel[: qvel.shape[1]] = np.asarray(qvel[step], dtype=np.float64)
+        restore_target_pose(
+            env,
+            target_block_pos=target_block_pos[step],
+            target_block_yaw=float(np.asarray(target_block_yaw[step]).reshape(-1)[0]),
+        )
+        env.unwrapped.pre_step()
+        mujoco.mj_forward(env.unwrapped._model, env.unwrapped._data)
+        env.unwrapped.post_step()
+        hide_target_cube(env)
+        frames.append(np.asarray(env.unwrapped.render(camera=camera), dtype=np.uint8))
+    return np.stack(frames, axis=0)
+
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
     candidates = []
@@ -33,22 +85,21 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
         raise FileNotFoundError(f"No checkpoints found in {model_dir}")
     return max(candidates, key=lambda item: item[0])[1]
 
-def load_episode_standalone(dataset_path, episode_idx, args):
-    dataset = LeWMOGBenchCubeDataset(
-        dataset_path,
-        markov_deriv=args.markov_deriv,
-        num_preds=args.num_preds,
-        frameskip=args.frameskip,
-        img_size=args.img_size,
-        action_dim=args.action_dim,
-    )
-
+def load_episode_standalone(dataset_path, episode_idx, args, dataset, env, camera):
     with h5py.File(dataset_path, "r") as h5:
         ep_len = int(h5["ep_len"][episode_idx])
         ep_offset = int(h5["ep_offset"][episode_idx])
         rows = np.arange(ep_offset, ep_offset + ep_len, dtype=np.int64)
-        
-        pixels_np = np.asarray(h5["pixels"][rows], dtype=np.uint8)
+
+        pixels_np = render_episode_without_target_cube(
+            env,
+            seed=int(h5["episode_seed"][episode_idx]) if "episode_seed" in h5 else 0,
+            qpos=np.asarray(h5["qpos"][rows], dtype=np.float32),
+            qvel=np.asarray(h5["qvel"][rows], dtype=np.float32),
+            target_block_pos=np.asarray(h5["target_block_pos"][rows], dtype=np.float32),
+            target_block_yaw=np.asarray(h5["target_block_yaw"][rows], dtype=np.float32),
+            camera=camera,
+        )
         pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
         pixels = preprocess_pixels(pixels.unsqueeze(0), args.img_size)[0]
 
@@ -144,18 +195,35 @@ def main():
     
     with h5py.File(args.dataset_path, "r") as h5:
         ep_len = h5["ep_len"][:]
+        env_name = str(h5.attrs.get("env_name", "cube-single-v0"))
+        camera = str(h5.attrs.get("camera", "front_pixels"))
+        width = int(h5["pixels"].shape[2])
+        height = int(h5["pixels"].shape[1])
         
     history_len = required_markov_history(args.markov_deriv)
     valid_indices = np.flatnonzero(ep_len - 1 - (history_len - 1 + args.num_preds) * args.frameskip >= 0)
 
+    dataset = LeWMOGBenchCubeDataset(
+        str(args.dataset_path),
+        markov_deriv=args.markov_deriv,
+        num_preds=args.num_preds,
+        frameskip=args.frameskip,
+        img_size=args.img_size,
+        action_dim=args.action_dim,
+    )
+    env = gymnasium.make(env_name, terminate_at_goal=False, mode="data_collection", width=width, height=height)
+
     all_x, all_a, all_e = [], [], []
-    for idx in tqdm(valid_indices, desc="Generating Errors"):
-        px, act = load_episode_standalone(args.dataset_path, idx, args)
-        data = extract_errors(model, px, act, args, device)
-        if data is not None:
-            all_x.append(data["x_t"])
-            all_a.append(data["a_t"])
-            all_e.append(data["error"])
+    try:
+        for idx in tqdm(valid_indices, desc="Generating Errors"):
+            px, act = load_episode_standalone(args.dataset_path, idx, args, dataset, env, camera)
+            data = extract_errors(model, px, act, args, device)
+            if data is not None:
+                all_x.append(data["x_t"])
+                all_a.append(data["a_t"])
+                all_e.append(data["error"])
+    finally:
+        env.close()
 
     torch.save({"x_t": torch.cat(all_x), "a_t": torch.cat(all_a), "error": torch.cat(all_e)}, args.out_file)
     print(f"Saved {len(torch.cat(all_x))} transitions to {args.out_file}")

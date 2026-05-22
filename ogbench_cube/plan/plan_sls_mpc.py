@@ -12,13 +12,18 @@ from typing import Optional
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
+# if "MPLCONFIGDIR" not in os.environ:
+#     mpl_config_dir = Path("/tmp/codex_mplconfig")
+#     mpl_config_dir.mkdir(parents=True, exist_ok=True)
+#     os.environ["MPLCONFIGDIR"] = str(mpl_config_dir)
+# os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import gymnasium
 import h5py
 import imageio.v2 as imageio
+import mujoco
 import numpy as np
 import torch
-import mujoco
 from tqdm.auto import tqdm
 import pyrallis
 
@@ -62,12 +67,6 @@ class PlanSLSOGBenchConfig:
 
 # --- Helper Utilities ---
 
-def hide_target_cube(env) -> None:
-    """Zeroes out the alpha transparency channel for the target block visual geoms."""
-    for geom_ids in env.unwrapped._cube_target_geom_ids_list:
-        for gid in geom_ids:
-            env.unwrapped._model.geom(gid).rgba[3] = 0.0
-
 def make_control_box_constraints(u_min, u_max):
     u_min, u_max = jnp.asarray(u_min), jnp.asarray(u_max)
     return lambda x, u, t: jnp.concatenate([u - u_max, u_min - u], axis=0)
@@ -93,6 +92,46 @@ def cube_is_grasped(info, contact_thresh, align_thresh) -> bool:
     gripper_contact = float(np.asarray(info["proprio/gripper_contact"], dtype=np.float32)[0])
     block_alignment = float(np.linalg.norm(block_pos - effector_pos))
     return bool(gripper_contact >= contact_thresh and block_alignment <= align_thresh)
+
+def restore_target_pose(env: gymnasium.Env, target_block_pos: np.ndarray, target_block_yaw: float) -> None:
+    unwrapped = env.unwrapped
+    unwrapped._target_block = 0
+    target_mocap_id = unwrapped._cube_target_mocap_ids[0]
+    unwrapped._data.mocap_pos[target_mocap_id] = np.asarray(target_block_pos, dtype=np.float64)
+    unwrapped._data.mocap_quat[target_mocap_id] = np.asarray(
+        lie.SO3.from_z_radians(float(target_block_yaw)).wxyz,
+        dtype=np.float64,
+    )
+    hide_target_cube(env)
+
+def hide_target_cube(env: gymnasium.Env) -> None:
+    for geom_ids in env.unwrapped._cube_target_geom_ids_list:
+        for gid in geom_ids:
+            env.unwrapped._model.geom(gid).rgba[3] = 0.0
+
+def render_without_target_cube(env: gymnasium.Env, camera: str) -> np.ndarray:
+    hide_target_cube(env)
+    return np.asarray(env.unwrapped.render(camera=camera), dtype=np.uint8)
+
+def reset_env_to_state(
+    env: gymnasium.Env,
+    *,
+    seed: int,
+    qpos: np.ndarray,
+    qvel: np.ndarray,
+    target_block_pos: np.ndarray,
+    target_block_yaw: float,
+    camera: str,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    env.reset(seed=seed)
+    unwrapped = env.unwrapped
+    unwrapped._data.qpos[:qpos.shape[0]] = np.asarray(qpos, dtype=np.float64)
+    unwrapped._data.qvel[:qvel.shape[0]] = np.asarray(qvel, dtype=np.float64)
+    restore_target_pose(env, target_block_pos, target_block_yaw)
+    unwrapped.pre_step()
+    mujoco.mj_forward(unwrapped._model, unwrapped._data)
+    unwrapped.post_step()
+    return render_without_target_cube(env, camera), unwrapped.get_step_info()
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch[_=](\d+).*\.ckpt$")
@@ -200,40 +239,33 @@ def main():
         rows = np.arange(int(h5["ep_offset"][episode_idx]), int(h5["ep_offset"][episode_idx]) + int(h5["ep_len"][episode_idx]))
         qpos_init, qvel_init = h5["qpos"][rows[0]], h5["qvel"][rows[0]]
         qpos_goal, qvel_goal = h5["qpos"][rows[-1]], h5["qvel"][rows[-1]]
-        
-        target_pos_goal = np.asarray(h5["target_block_pos"][rows[-1]], dtype=np.float32)
-        target_yaw_goal = float(np.asarray(h5["target_block_yaw"][rows[-1]]).reshape(-1)[0])
+        target_block_pos_init = h5["target_block_pos"][rows[0]]
+        target_block_yaw_init = float(h5["target_block_yaw"][rows[0], 0])
+        target_block_pos_goal = h5["target_block_pos"][rows[-1]]
+        target_block_yaw_goal = float(h5["target_block_yaw"][rows[-1], 0])
 
     env = gymnasium.make("cube-single-v0", terminate_at_goal=False, mode="data_collection", width=config_dict.get("width", 256), height=config_dict.get("height", 256))
     oracle = LocalCubePlanOracle(env=env, segment_dt=0.4, noise=0.0, noise_smoothing=0.5)
 
-    # --- Fetch goal image sequence & propagate physics before capturing frame ---
-    env.reset(seed=cfg.seed)
-    hide_target_cube(env)
-    
-    # Sync target body orientations before evaluating visual render boundaries
-    env.unwrapped._target_block = 0
-    target_mocap_id = env.unwrapped._cube_target_mocap_ids[0]
-    env.unwrapped._data.mocap_pos[target_mocap_id] = np.asarray(target_pos_goal, dtype=np.float64)
-    env.unwrapped._data.mocap_quat[target_mocap_id] = np.asarray(lie.SO3.from_z_radians(float(target_yaw_goal)).wxyz, dtype=np.float64)
-    
-    env.unwrapped._data.qpos[:qpos_goal.shape[0]] = qpos_goal.astype(np.float64)
-    env.unwrapped._data.qvel[:qvel_goal.shape[0]] = qvel_goal.astype(np.float64)
-    env.unwrapped.pre_step()
-    mujoco.mj_forward(env.unwrapped._model, env.unwrapped._data)  # Force visual state sync
-    env.unwrapped.post_step()
-    goal_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)
+    goal_frame, _ = reset_env_to_state(
+        env,
+        seed=cfg.seed,
+        qpos=qpos_goal,
+        qvel=qvel_goal,
+        target_block_pos=target_block_pos_goal,
+        target_block_yaw=target_block_yaw_goal,
+        camera="front_pixels",
+    )
 
-    # --- Fetch initial image sequence & propagate physics before capturing frame ---
-    env.reset(seed=cfg.seed)
-    hide_target_cube(env)
-    env.unwrapped._data.qpos[:qpos_init.shape[0]] = qpos_init.astype(np.float64)
-    env.unwrapped._data.qvel[:qvel_init.shape[0]] = qvel_init.astype(np.float64)
-    env.unwrapped.pre_step()
-    mujoco.mj_forward(env.unwrapped._model, env.unwrapped._data)  # Force visual state sync
-    env.unwrapped.post_step()
-    current_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)
-    current_info = env.unwrapped.get_step_info()
+    current_frame, current_info = reset_env_to_state(
+        env,
+        seed=cfg.seed,
+        qpos=qpos_init,
+        qvel=qvel_init,
+        target_block_pos=target_block_pos_init,
+        target_block_yaw=target_block_yaw_init,
+        camera="front_pixels",
+    )
 
     goal_emb = encode_single_frame(model, goal_frame, device, img_size, pixel_mean, pixel_std)
     goal_state = torch.cat([goal_emb, torch.zeros_like(goal_emb)], dim=-1).cpu().numpy().astype(np.float64)
@@ -252,7 +284,7 @@ def main():
         
         raw_action = np.asarray(oracle.select_action(None, current_info), dtype=np.float32)
         _, _, _, _, current_info = env.step(raw_action)
-        current_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)
+        current_frame = render_without_target_cube(env, "front_pixels")
         rollout_frames.append(current_frame.copy())
 
     if not grasped:
@@ -308,7 +340,7 @@ def main():
         u_raw = ((np.asarray(u0, dtype=np.float32) * action_std.flatten()) + action_mean.flatten()).astype(np.float32)
         _, _, _, _, current_info = env.step(u_raw)
         
-        current_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)
+        current_frame = render_without_target_cube(env, "front_pixels")
         rollout_frames.append(current_frame.copy())
 
         next_emb = encode_single_frame(model, current_frame, device, img_size, pixel_mean, pixel_std)
