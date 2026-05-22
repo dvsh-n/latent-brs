@@ -13,10 +13,11 @@ from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/codex_mplconfig")
 
 import h5py
 import imageio.v2 as imageio
+import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
 import torch
@@ -27,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rope.shared.lab_env import LabEnv, TaskState
+from rope.shared.lab_env import BaseEnvConfig, LabEnv, TaskState
 from rope.train.mlpdyn_train import LeWMRopeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "rope/data/test_data_noshadow.h5"
@@ -36,9 +37,9 @@ DEFAULT_OUT_DIR = "rope/plan/sqp_mpc_obs"
 DEFAULT_OBSTACLE_MODEL_PATH = "rope/plan/obs_net/da270d7d1050f110/model.pt"
 
 DEVICE = "auto"
-HORIZON = 30
+HORIZON = 15
 MAX_MPC_STEPS = 50
-Q_TERMINAL = 500.0
+Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.01
 VIDEO_FPS = 20
@@ -72,18 +73,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-max-iters", type=int, default=15)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
-    parser.add_argument("--sqp-max-iters", type=int, default=8)
+    parser.add_argument("--sqp-max-iters", type=int, default=10)
     parser.add_argument("--sqp-tol", type=float, default=1e-3)
     parser.add_argument("--u-min", type=float, default=-2.0)
     parser.add_argument("--u-max", type=float, default=2.0)
-    parser.add_argument("--du-trust", type=float, default=0.5)
-    parser.add_argument("--dx-trust", type=float, default=1.0)
+    parser.add_argument("--du-trust", type=float, default=5.0)
+    parser.add_argument("--dx-trust", type=float, default=5.0)
     parser.add_argument("--obstacle-margin", type=float, default=0.0)
-    parser.add_argument("--obstacle-slack-linear", type=float, default=1_000.0)
-    parser.add_argument("--obstacle-slack-quadratic", type=float, default=10_000.0)
+    parser.add_argument("--obstacle-slack-linear", type=float, default=10.0)
+    parser.add_argument("--obstacle-slack-quadratic", type=float, default=100.0)
     parser.add_argument("--qp-admm-iters", type=int, default=250)
     parser.add_argument("--qp-admm-rho", type=float, default=1.0)
     parser.add_argument("--qp-admm-tol", type=float, default=1e-4)
+    parser.add_argument(
+        "--use-dataset-endpoints",
+        action="store_true",
+        help="Use the selected dataset episode start/goal instead of sampling safe task-space endpoints.",
+    )
+    parser.add_argument("--safe-endpoint-min-distance", type=float, default=0.05)
+    parser.add_argument("--safe-endpoint-max-attempts", type=int, default=100_000)
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -218,6 +226,169 @@ def normalized_to_raw_action(action_norm: np.ndarray, action_mean: np.ndarray, a
     return (action_norm * action_std.reshape(-1) + action_mean.reshape(-1)).astype(np.float32)
 
 
+def metadata_array(metadata: dict[str, object], key: str) -> np.ndarray:
+    if key not in metadata:
+        raise KeyError(f"Obstacle model metadata is missing {key!r}; regenerate the obstacle model artifact.")
+    value = np.asarray(metadata[key], dtype=np.float64)
+    if value.shape != (3,):
+        raise ValueError(f"Expected obstacle metadata {key!r} with shape (3,), got {value.shape}.")
+    return value
+
+
+def endpoint_boxes_from_metadata(metadata: dict[str, object]) -> list[dict[str, object]]:
+    raw_boxes = metadata.get("endpoint_sampling_boxes")
+    if raw_boxes is None:
+        lower = metadata_array(metadata, "task_lower")
+        upper = metadata_array(metadata, "task_upper")
+        obstacle_reach_arr = np.asarray(metadata.get("obstacle_reach"), dtype=np.float64)
+        if obstacle_reach_arr.shape != (2,):
+            raise ValueError("Obstacle model metadata must contain obstacle_reach with shape (2,).")
+        raw_boxes = [
+            {
+                "name": "reach_below_obstacle",
+                "lower": lower,
+                "upper": np.array([obstacle_reach_arr[0], upper[1], upper[2]], dtype=np.float64),
+            },
+            {
+                "name": "reach_above_obstacle",
+                "lower": np.array([obstacle_reach_arr[1], lower[1], lower[2]], dtype=np.float64),
+                "upper": upper,
+            },
+        ]
+
+    boxes: list[dict[str, object]] = []
+    for index, raw_box in enumerate(raw_boxes):
+        if not isinstance(raw_box, dict):
+            raise ValueError(f"Endpoint sampling box {index} is not a dictionary.")
+        lower = np.asarray(raw_box.get("lower"), dtype=np.float64)
+        upper = np.asarray(raw_box.get("upper"), dtype=np.float64)
+        if lower.shape != (3,) or upper.shape != (3,):
+            raise ValueError(f"Endpoint sampling box {index} must have lower/upper shape (3,).")
+        span = upper - lower
+        if np.any(span < 0.0):
+            raise ValueError(f"Endpoint sampling box {index} has upper below lower.")
+        volume = float(np.prod(span))
+        if volume <= 0.0:
+            continue
+        boxes.append(
+            {
+                "name": str(raw_box.get("name", f"box_{index}")),
+                "lower": lower,
+                "upper": upper,
+                "volume": volume,
+            }
+        )
+    if not boxes:
+        raise ValueError("Obstacle metadata did not provide any non-empty endpoint sampling boxes.")
+    return boxes
+
+
+def sample_task_state_from_boxes(
+    rng: np.random.Generator,
+    *,
+    boxes: list[dict[str, object]],
+) -> np.ndarray:
+    volumes = np.asarray([float(box["volume"]) for box in boxes], dtype=np.float64)
+    probabilities = volumes / float(np.sum(volumes))
+    box = boxes[int(rng.choice(len(boxes), p=probabilities))]
+    lower = np.asarray(box["lower"], dtype=np.float64)
+    upper = np.asarray(box["upper"], dtype=np.float64)
+    return rng.uniform(lower, upper).astype(np.float32)
+
+
+def sample_safe_task_endpoints(
+    obstacle: ConformalObstacleConstraint,
+    rng: np.random.Generator,
+    *,
+    min_distance: float,
+    max_attempts: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    metadata = obstacle.source_metadata
+    if not isinstance(metadata, dict):
+        raise ValueError("Obstacle model source metadata is not a dictionary; regenerate the obstacle model artifact.")
+    boxes = endpoint_boxes_from_metadata(metadata)
+
+    start = sample_task_state_from_boxes(rng, boxes=boxes)
+    goal = sample_task_state_from_boxes(rng, boxes=boxes)
+    attempts = 1
+    while float(np.linalg.norm(goal - start)) < float(min_distance):
+        if attempts >= int(max_attempts):
+            raise RuntimeError("Could not sample safe start/goal endpoints separated by the requested distance.")
+        goal = sample_task_state_from_boxes(rng, boxes=boxes)
+        attempts += 1
+
+    sampling_info: dict[str, object] = {
+        "rule": str(metadata.get("endpoint_sampling_rule", "sample start and goal only outside obstacle reach")),
+        "boxes": [
+            {
+                "name": str(box["name"]),
+                "lower": np.asarray(box["lower"], dtype=np.float32).tolist(),
+                "upper": np.asarray(box["upper"], dtype=np.float32).tolist(),
+                "volume": float(box["volume"]),
+            }
+            for box in boxes
+        ],
+        "min_start_goal_distance": float(min_distance),
+        "goal_resample_attempts": int(attempts),
+    }
+    return start, goal, sampling_info
+
+
+def proxy_rope_low_heights_for_task_states(task_states: np.ndarray) -> np.ndarray:
+    proxy_env = LabEnv(base_config=BaseEnvConfig(enable_proxy_rope=True))
+    states = np.asarray(task_states, dtype=np.float64)
+    low_heights = np.zeros((states.shape[0],), dtype=np.float64)
+    for index, state in enumerate(states):
+        proxy_env.reset(TaskState.from_array(state))
+        points = proxy_env.get_proxy_rope_points()
+        low_heights[index] = float(np.min(points[:, 2]))
+    return low_heights
+
+
+def save_planner_proxy_rope_diagnostic(
+    out_path: Path,
+    task_states: np.ndarray,
+    low_rope_height: np.ndarray,
+    *,
+    obstacle_reach: tuple[float, float] | None,
+    low_rope_cutoff: float | None,
+) -> None:
+    states = np.asarray(task_states, dtype=np.float64)
+    heights = np.asarray(low_rope_height, dtype=np.float64)
+    steps = np.arange(states.shape[0], dtype=np.int64)
+    fig, ax = plt.subplots(figsize=(7.5, 5.5), dpi=180)
+    if obstacle_reach is not None:
+        ax.axvspan(obstacle_reach[0], obstacle_reach[1], color="#d55e00", alpha=0.08, label="obstacle reach interval")
+    if low_rope_cutoff is not None:
+        ax.axhline(low_rope_cutoff, color="#4d4d4d", linestyle="--", linewidth=1.2, label="clearance threshold")
+    ax.plot(states[:, 0], heights, color="#4d4d4d", linewidth=1.0, alpha=0.55, zorder=1)
+    scatter = ax.scatter(
+        states[:, 0],
+        heights,
+        c=steps,
+        cmap="viridis",
+        s=34.0,
+        alpha=0.9,
+        edgecolors="white",
+        linewidths=0.35,
+        label="executed planner states",
+        zorder=2,
+    )
+    ax.scatter(states[0, 0], heights[0], marker="o", s=72.0, c="#0072b2", edgecolors="black", linewidths=0.5, label="start")
+    ax.scatter(states[-1, 0], heights[-1], marker="*", s=120.0, c="#cc79a7", edgecolors="black", linewidths=0.5, label="final")
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("executed step")
+    ax.set_title("Planner trajectory by reach and proxy rope low height")
+    ax.set_xlabel("reach")
+    ax.set_ylabel("proxy rope low height")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def load_dataset_episode(
     dataset_path: Path,
     episode_idx: int,
@@ -323,6 +494,22 @@ def reset_env_to_state(
     return frame, info
 
 
+def reset_env_to_task_target(
+    env: LabEnv,
+    renderer: mujoco.Renderer,
+    *,
+    task_target: np.ndarray,
+    camera_id: int,
+    elapsed_time: float,
+    disable_shadows: bool,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    env.reset(TaskState.from_array(task_target))
+    mujoco.mj_forward(env.model, env.data)
+    frame = render_rgb_frame(renderer, env, camera_id, disable_shadows=disable_shadows)
+    info = extract_step_info(env, elapsed_time=elapsed_time)
+    return frame, info
+
+
 def step_env_with_action(
     env: LabEnv,
     renderer: mujoco.Renderer,
@@ -368,6 +555,7 @@ class ConformalObstacleConstraint:
         artifact = torch.load(artifact_path, map_location=device, weights_only=False)
         self.input_dim = int(artifact["input_dim"])
         self.threshold = float(artifact["conformal_safe_score_threshold"])
+        self.source_metadata = artifact.get("source_metadata", {})
         self.feature_mean = torch.as_tensor(artifact["feature_mean"], dtype=torch.float32, device=device)
         self.feature_std = torch.as_tensor(artifact["feature_std"], dtype=torch.float32, device=device).clamp_min(1e-6)
         self.model = ObstacleMLP(
@@ -386,6 +574,12 @@ class ConformalObstacleConstraint:
         score = self.model((z - self.feature_mean) / self.feature_std)
         grad = torch.autograd.grad(score, z)[0]
         return float(score.detach().cpu().item()), grad.detach().cpu().numpy().astype(np.float64)
+
+    @torch.no_grad()
+    def score(self, x_np: np.ndarray) -> float:
+        z = torch.as_tensor(x_np[: self.input_dim], dtype=torch.float32, device=self.device)
+        score = self.model((z - self.feature_mean) / self.feature_std)
+        return float(score.detach().cpu().item())
 
 
 class MarkovDynamicsTorch:
@@ -691,7 +885,7 @@ class SQPObstacleMPCSolver:
         a_seq: np.ndarray,
         b_seq: np.ndarray,
         x_goal: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | bool | int]]:
         nx, nu, n_h = self.state_dim, self.action_dim, self.horizon
         n_du = n_h * nu
         total = n_du + n_h
@@ -778,7 +972,11 @@ class SQPObstacleMPCSolver:
         projection = np.clip(a_mat @ y, lower_arr, upper_arr)
         dual = np.zeros_like(projection)
         converged = False
-        for _ in range(self.qp_admm_iters):
+        primal_res = float("inf")
+        dual_res = float("inf")
+        admm_iterations = 0
+        for admm_iteration in range(self.qp_admm_iters):
+            admm_iterations = admm_iteration + 1
             y = solve_lhs(-g + rho * a_mat.T @ (projection - dual))
             ay = a_mat @ y
             prev_projection = projection
@@ -806,9 +1004,31 @@ class SQPObstacleMPCSolver:
             dx[t] = dx_flat[(t - 1) * nx : t * nx]
         for t in range(n_h):
             du[t] = du_flat[du_slice(t)]
-        return dx, du, slack, converged
+        diagnostics: dict[str, float | bool | int] = {
+            "qp_converged": bool(converged),
+            "qp_iterations": int(admm_iterations),
+            "qp_primal_residual": float(primal_res),
+            "qp_dual_residual": float(dual_res),
+            "qp_max_linearized_violation": float(np.max(np.maximum(lower_arr - a_mat @ y, 0.0))),
+            "qp_max_slack_raw": float(np.max(y[n_du:])) if n_h > 0 else 0.0,
+        }
+        return dx, du, slack, diagnostics
 
-    def solve(self, x0_np: np.ndarray, x_goal_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, int, float, float, bool]:
+    def _obstacle_scores(self, x_traj_np: np.ndarray) -> np.ndarray:
+        return np.asarray([self.obstacle.score(x_traj_np[t]) for t in range(1, x_traj_np.shape[0])], dtype=np.float64)
+
+    def _obstacle_violation_sum(self, x_traj_np: np.ndarray) -> float:
+        if x_traj_np.shape[0] <= 1:
+            return 0.0
+        scores = self._obstacle_scores(x_traj_np)
+        threshold = self.obstacle.threshold + self.obstacle_margin
+        return float(np.sum(np.maximum(threshold - scores, 0.0)))
+
+    def solve(
+        self,
+        x0_np: np.ndarray,
+        x_goal_np: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float, int, float, float, bool, list[dict[str, float | bool | int | str]]]:
         x0 = torch.tensor(x0_np, dtype=torch.float32, device=self.device)
         x_goal = torch.tensor(x_goal_np, dtype=torch.float32, device=self.device)
         u_seq = self._make_initial_action_guess()
@@ -817,9 +1037,14 @@ class SQPObstacleMPCSolver:
         t0 = time.perf_counter()
         accepted_any = False
         max_slack = 0.0
+        iteration_logs: list[dict[str, float | bool | int | str]] = []
 
         x_traj = self._rollout(x0, u_seq)
         current_cost = float(self._trajectory_cost(x_traj, u_seq, x_goal).item())
+        current_traj_np = x_traj.detach().cpu().numpy().astype(np.float64)
+        current_violation = self._obstacle_violation_sum(current_traj_np)
+        merit_penalty = max(1.0, self.obstacle_slack_linear)
+        current_merit = current_cost + merit_penalty * current_violation
         iterations = 0
 
         for iteration in range(self.max_iters):
@@ -827,12 +1052,27 @@ class SQPObstacleMPCSolver:
             a_seq, b_seq = self._linearize_dynamics(x_traj, u_seq)
             x_bar = x_traj.detach().cpu().numpy().astype(np.float64)
             u_bar = u_seq.detach().cpu().numpy().astype(np.float64)
-            dx, du, slack, qp_ok = self._solve_linearized_qp(x_bar, u_bar, a_seq, b_seq, x_goal_np)
+            x_bar_scores = self._obstacle_scores(x_bar)
+            dx, du, slack, qp_info = self._solve_linearized_qp(x_bar, u_bar, a_seq, b_seq, x_goal_np)
             max_slack = float(np.max(slack)) if slack.size else 0.0
-            if not qp_ok and not np.all(np.isfinite(du)):
+            step_norm = float(max(np.max(np.abs(dx)), np.max(np.abs(du)))) if np.all(np.isfinite(du)) else float("inf")
+            iter_log: dict[str, float | bool | int | str] = {
+                "iteration": int(iteration),
+                "cost_before": float(current_cost),
+                "merit_before": float(current_merit),
+                "obstacle_violation_before": float(current_violation),
+                "obstacle_score_min_before": float(np.min(x_bar_scores)) if x_bar_scores.size else 0.0,
+                "obstacle_score_max_before": float(np.max(x_bar_scores)) if x_bar_scores.size else 0.0,
+                "step_norm": float(step_norm),
+                "max_slack": float(max_slack),
+                **qp_info,
+            }
+            if not bool(qp_info["qp_converged"]) or not np.all(np.isfinite(du)):
+                iter_log["accepted"] = False
+                iter_log["reject_reason"] = "qp_failed"
+                iteration_logs.append(iter_log)
                 break
 
-            step_norm = float(max(np.max(np.abs(dx)), np.max(np.abs(du))))
             accepted = False
             candidate_best = None
             for alpha in (1.0, 0.5, 0.25, 0.1):
@@ -842,17 +1082,38 @@ class SQPObstacleMPCSolver:
                 candidate_cost = float(self._trajectory_cost(x_candidate, u_candidate, x_goal).item())
                 if not np.isfinite(candidate_cost):
                     continue
-                if candidate_best is None or candidate_cost < candidate_best[2]:
-                    candidate_best = (u_candidate, x_candidate, candidate_cost)
-                if candidate_cost <= current_cost + 1e-6:
+                candidate_traj_np = x_candidate.detach().cpu().numpy().astype(np.float64)
+                candidate_violation = self._obstacle_violation_sum(candidate_traj_np)
+                candidate_merit = candidate_cost + merit_penalty * candidate_violation
+                if candidate_best is None or candidate_merit < candidate_best[4]:
+                    candidate_best = (u_candidate, x_candidate, candidate_cost, candidate_violation, candidate_merit, alpha)
+                if candidate_merit <= current_merit + 1e-6:
                     break
 
             if candidate_best is None:
+                iter_log["accepted"] = False
+                iter_log["reject_reason"] = "no_finite_candidate"
+                iteration_logs.append(iter_log)
                 break
-            u_seq, x_traj, candidate_cost = candidate_best
-            accepted = candidate_cost <= current_cost + 1e-6
+            u_candidate, x_candidate, candidate_cost, candidate_violation, candidate_merit, alpha = candidate_best
+            accepted = candidate_merit <= current_merit + 1e-6
+            iter_log["alpha"] = float(alpha)
+            iter_log["cost_after"] = float(candidate_cost)
+            iter_log["merit_after"] = float(candidate_merit)
+            iter_log["obstacle_violation_after"] = float(candidate_violation)
+            iter_log["accepted"] = bool(accepted)
+            if not accepted:
+                iter_log["reject_reason"] = "line_search_failed"
+                iteration_logs.append(iter_log)
+                break
+
+            u_seq = u_candidate
+            x_traj = x_candidate
             current_cost = candidate_cost
+            current_violation = candidate_violation
+            current_merit = candidate_merit
             accepted_any = accepted_any or accepted
+            iteration_logs.append(iter_log)
             if step_norm <= self.tol:
                 break
 
@@ -867,6 +1128,7 @@ class SQPObstacleMPCSolver:
             current_cost,
             max_slack,
             accepted_any,
+            iteration_logs,
         )
 
 
@@ -949,47 +1211,87 @@ def main() -> None:
     time_np = np.asarray(episode["time"], dtype=np.float32)
     dataset_pixels_np = np.asarray(episode["pixels"], dtype=np.uint8)
 
-    run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
+    endpoint_source = "dataset_episode" if args.use_dataset_endpoints else "sampled_safe_task_space"
+    run_name = f"{int(time.time())}_{endpoint_source}_episode_{episode_idx:05d}"
     out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env = LabEnv()
     camera_id = env.model.camera(camera).id
+    obstacle_constraint = ConformalObstacleConstraint(args.obstacle_model.expanduser().resolve(), device)
+    sampled_start_task_target: np.ndarray | None = None
+    sampled_goal_task_target: np.ndarray | None = None
+    endpoint_sampling_info: dict[str, object] | None = None
+    if not args.use_dataset_endpoints:
+        sampled_start_task_target, sampled_goal_task_target, endpoint_sampling_info = sample_safe_task_endpoints(
+            obstacle_constraint,
+            rng,
+            min_distance=float(args.safe_endpoint_min_distance),
+            max_attempts=int(args.safe_endpoint_max_attempts),
+        )
 
     with mujoco.Renderer(env.model, height=height, width=width) as renderer:
-        start_frame, start_info = reset_env_to_state(
-            env,
-            renderer,
-            qpos=qpos_np[0],
-            qvel=qvel_np[0],
-            control=control_np[0],
-            task_target=task_target_np[0],
-            camera_id=camera_id,
-            elapsed_time=float(time_np[0, 0]),
-            disable_shadows=args.disable_shadows,
-        )
-        goal_frame, goal_info = reset_env_to_state(
-            env,
-            renderer,
-            qpos=qpos_np[-1],
-            qvel=qvel_np[-1],
-            control=control_np[-1],
-            task_target=task_target_np[-1],
-            camera_id=camera_id,
-            elapsed_time=float(time_np[-1, 0]),
-            disable_shadows=args.disable_shadows,
-        )
-        current_frame, current_info = reset_env_to_state(
-            env,
-            renderer,
-            qpos=qpos_np[0],
-            qvel=qvel_np[0],
-            control=control_np[0],
-            task_target=task_target_np[0],
-            camera_id=camera_id,
-            elapsed_time=float(time_np[0, 0]),
-            disable_shadows=args.disable_shadows,
-        )
+        if args.use_dataset_endpoints:
+            start_frame, start_info = reset_env_to_state(
+                env,
+                renderer,
+                qpos=qpos_np[0],
+                qvel=qvel_np[0],
+                control=control_np[0],
+                task_target=task_target_np[0],
+                camera_id=camera_id,
+                elapsed_time=float(time_np[0, 0]),
+                disable_shadows=args.disable_shadows,
+            )
+            goal_frame, goal_info = reset_env_to_state(
+                env,
+                renderer,
+                qpos=qpos_np[-1],
+                qvel=qvel_np[-1],
+                control=control_np[-1],
+                task_target=task_target_np[-1],
+                camera_id=camera_id,
+                elapsed_time=float(time_np[-1, 0]),
+                disable_shadows=args.disable_shadows,
+            )
+            current_frame, current_info = reset_env_to_state(
+                env,
+                renderer,
+                qpos=qpos_np[0],
+                qvel=qvel_np[0],
+                control=control_np[0],
+                task_target=task_target_np[0],
+                camera_id=camera_id,
+                elapsed_time=float(time_np[0, 0]),
+                disable_shadows=args.disable_shadows,
+            )
+        else:
+            if sampled_start_task_target is None or sampled_goal_task_target is None:
+                raise RuntimeError("Safe endpoint sampling did not produce start and goal task targets.")
+            start_frame, start_info = reset_env_to_task_target(
+                env,
+                renderer,
+                task_target=sampled_start_task_target,
+                camera_id=camera_id,
+                elapsed_time=0.0,
+                disable_shadows=args.disable_shadows,
+            )
+            goal_frame, goal_info = reset_env_to_task_target(
+                env,
+                renderer,
+                task_target=sampled_goal_task_target,
+                camera_id=camera_id,
+                elapsed_time=0.0,
+                disable_shadows=args.disable_shadows,
+            )
+            current_frame, current_info = reset_env_to_task_target(
+                env,
+                renderer,
+                task_target=sampled_start_task_target,
+                camera_id=camera_id,
+                elapsed_time=0.0,
+                disable_shadows=args.disable_shadows,
+            )
 
         goal_emb = encode_single_frame(
             model,
@@ -1015,24 +1317,25 @@ def main() -> None:
         if int(current_state.numel()) != markov_state_dim:
             raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {current_state.numel()}.")
 
-        dataset_pixels = preprocess_pixels(
-            dataset_pixels_np,
-            img_size=img_size,
-            pixel_mean=pixel_mean,
-            pixel_std=pixel_std,
-        )
-        true_latents = encode_frames(
-            model,
-            dataset_pixels,
-            device=device,
-            frame_batch_size=args.frame_batch_size,
-        )
+        true_latents = None
+        if args.use_dataset_endpoints:
+            dataset_pixels = preprocess_pixels(
+                dataset_pixels_np,
+                img_size=img_size,
+                pixel_mean=pixel_mean,
+                pixel_std=pixel_std,
+            )
+            true_latents = encode_frames(
+                model,
+                dataset_pixels,
+                device=device,
+                frame_batch_size=args.frame_batch_size,
+            )
 
         save_rgb_image(out_dir / "start_image.png", start_frame)
         save_rgb_image(out_dir / "goal_image.png", goal_frame)
 
         dynamics = MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
-        obstacle_constraint = ConformalObstacleConstraint(args.obstacle_model.expanduser().resolve(), device)
         if obstacle_constraint.input_dim > markov_state_dim:
             raise ValueError(
                 f"Obstacle input dim {obstacle_constraint.input_dim} is larger than state dim {markov_state_dim}."
@@ -1068,6 +1371,7 @@ def main() -> None:
         rollout_frames = [current_frame.copy()]
         executed_actions_raw: list[np.ndarray] = []
         executed_actions_norm: list[np.ndarray] = []
+        executed_task_targets: list[np.ndarray] = [np.asarray(current_info["task_target"], dtype=np.float32).copy()]
         latent_goal_distances = [float(torch.linalg.vector_norm(current_state - goal_state).item())]
         embedding_goal_distances = [float(torch.linalg.vector_norm(current_emb - goal_emb).item())]
         task_target_distances = [float(np.linalg.norm(np.asarray(current_info["task_target"]) - goal_task_target))]
@@ -1079,6 +1383,12 @@ def main() -> None:
         sqp_costs: list[float] = []
         obstacle_slacks: list[float] = []
         solver_accepted: list[bool] = []
+        sqp_diagnostics: list[list[dict[str, float | bool | int | str]]] = []
+        initial_obstacle_state_np = current_state.detach().cpu().numpy().astype(np.float64)
+        executed_obstacle_scores: list[float] = [float(obstacle_constraint.score(initial_obstacle_state_np))]
+        executed_obstacle_violations: list[float] = [
+            float(max(obstacle_constraint.threshold + float(args.obstacle_margin) - executed_obstacle_scores[-1], 0.0))
+        ]
         stop_reason = "max_mpc_steps"
         success = bool(task_target_distances[-1] <= goal_tolerance)
         interrupted = False
@@ -1089,7 +1399,7 @@ def main() -> None:
                 pbar = tqdm(range(args.max_mpc_steps), desc="MPC Steps")
                 for step_idx in pbar:
                     current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
-                    _, u_plan, solve_time, n_iters, plan_cost, max_slack, accepted = mpc_solver.solve(
+                    _, u_plan, solve_time, n_iters, plan_cost, max_slack, accepted, solve_diagnostics = mpc_solver.solve(
                         current_state_np,
                         goal_state_np,
                     )
@@ -1098,6 +1408,7 @@ def main() -> None:
                     sqp_costs.append(float(plan_cost))
                     obstacle_slacks.append(float(max_slack))
                     solver_accepted.append(bool(accepted))
+                    sqp_diagnostics.append(solve_diagnostics)
 
                     u0_norm = u_plan[0].astype(np.float32)
                     u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
@@ -1125,9 +1436,15 @@ def main() -> None:
                     current_history = current_history[-history_len:]
                     current_state = make_markov_state(current_history, markov_deriv)
                     current_emb = next_emb
+                    current_state_np_after = current_state.detach().cpu().numpy().astype(np.float64)
+                    obstacle_score = float(obstacle_constraint.score(current_state_np_after))
+                    obstacle_violation = float(
+                        max(obstacle_constraint.threshold + float(args.obstacle_margin) - obstacle_score, 0.0)
+                    )
 
                     executed_actions_norm.append(u0_norm.copy())
                     executed_actions_raw.append(u0_raw.copy())
+                    executed_task_targets.append(np.asarray(current_info["task_target"], dtype=np.float32).copy())
                     rollout_frames.append(current_frame.copy())
                     latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
                     embedding_goal_distance = float(torch.linalg.vector_norm(current_emb - goal_emb).item())
@@ -1141,11 +1458,14 @@ def main() -> None:
                     left_attachment_distances.append(left_attachment_distance)
                     right_attachment_distances.append(right_attachment_distance)
                     rope_length_errors.append(rope_length_error)
+                    executed_obstacle_scores.append(obstacle_score)
+                    executed_obstacle_violations.append(obstacle_violation)
 
                     pbar.set_postfix(
                         solve_ms=f"{solve_times_ms[-1]:.1f}",
                         iters=f"{sqp_iterations[-1]}",
                         slack=f"{obstacle_slacks[-1]:.3g}",
+                        obs=f"{obstacle_score:.3g}",
                         latent_goal=f"{latent_goal_distance:.3f}",
                         task_goal=f"{task_target_distance:.4f}",
                     )
@@ -1166,17 +1486,53 @@ def main() -> None:
                 pbar.close()
 
         final_info = current_info
+        executed_task_targets_np = np.stack(executed_task_targets, axis=0).astype(np.float32)
+        proxy_low_rope_heights = proxy_rope_low_heights_for_task_states(executed_task_targets_np)
+        source_metadata = obstacle_constraint.source_metadata if isinstance(obstacle_constraint.source_metadata, dict) else {}
+        obstacle_reach_for_plot: tuple[float, float] | None = None
+        obstacle_reach_arr = np.asarray(source_metadata.get("obstacle_reach"), dtype=np.float64)
+        if obstacle_reach_arr.shape == (2,):
+            obstacle_reach_for_plot = (float(obstacle_reach_arr[0]), float(obstacle_reach_arr[1]))
+        low_rope_cutoff_for_plot = (
+            float(source_metadata["low_rope_cutoff"]) if "low_rope_cutoff" in source_metadata else None
+        )
+        proxy_plot_path = out_dir / "planner_proxy_rope_reach_height.png"
+        save_planner_proxy_rope_diagnostic(
+            proxy_plot_path,
+            executed_task_targets_np,
+            proxy_low_rope_heights,
+            obstacle_reach=obstacle_reach_for_plot,
+            low_rope_cutoff=low_rope_cutoff_for_plot,
+        )
         metrics = {
             "episode_idx": int(episode_idx),
             "episode_seed": episode_seed,
             "checkpoint": str(checkpoint_path),
             "dataset_path": str(dataset_path),
+            "endpoint_source": endpoint_source,
+            "endpoint_sampling": endpoint_sampling_info,
             "camera": camera,
             "disable_shadows": bool(args.disable_shadows),
             "mode": str(episode["mode"]),
             "img_size": img_size,
             "horizon": int(args.horizon),
             "solver": "nominal_sqp_conformal_obstacle",
+            "solver_settings": {
+                "q_terminal": float(args.q_terminal),
+                "q_stage": float(args.q_stage),
+                "r_control": float(args.r_control),
+                "sqp_max_iters": int(args.sqp_max_iters),
+                "sqp_tol": float(args.sqp_tol),
+                "u_min": float(args.u_min),
+                "u_max": float(args.u_max),
+                "du_trust": float(args.du_trust),
+                "dx_trust": float(args.dx_trust),
+                "obstacle_slack_linear": float(args.obstacle_slack_linear),
+                "obstacle_slack_quadratic": float(args.obstacle_slack_quadratic),
+                "qp_admm_iters": int(args.qp_admm_iters),
+                "qp_admm_rho": float(args.qp_admm_rho),
+                "qp_admm_tol": float(args.qp_admm_tol),
+            },
             "obstacle_model": str(args.obstacle_model.expanduser().resolve()),
             "obstacle_threshold": float(obstacle_constraint.threshold),
             "obstacle_margin": float(args.obstacle_margin),
@@ -1199,7 +1555,13 @@ def main() -> None:
             "rope_length_error_initial": float(rope_length_errors[0]),
             "rope_length_error_final": float(rope_length_errors[-1]),
             "goal_task_target": goal_task_target.tolist(),
+            "start_task_target": np.asarray(start_info["task_target"], dtype=np.float32).tolist(),
+            "sampled_start_task_target": sampled_start_task_target.tolist() if sampled_start_task_target is not None else None,
+            "sampled_goal_task_target": sampled_goal_task_target.tolist() if sampled_goal_task_target is not None else None,
             "final_task_target": np.asarray(final_info["task_target"], dtype=np.float32).tolist(),
+            "executed_task_targets": executed_task_targets_np.tolist(),
+            "proxy_low_rope_heights": proxy_low_rope_heights.astype(np.float32).tolist(),
+            "proxy_rope_diagnostic_plot": str(proxy_plot_path),
             "goal_left_attachment_pos": goal_left_pos.tolist(),
             "goal_right_attachment_pos": goal_right_pos.tolist(),
             "final_left_attachment_pos": np.asarray(final_info["left_attachment_pos"], dtype=np.float32).tolist(),
@@ -1214,6 +1576,9 @@ def main() -> None:
             "sqp_costs": sqp_costs,
             "obstacle_slacks": obstacle_slacks,
             "solver_accepted": solver_accepted,
+            "sqp_diagnostics": sqp_diagnostics,
+            "executed_obstacle_scores": executed_obstacle_scores,
+            "executed_obstacle_violations": executed_obstacle_violations,
             "latent_goal_distances": latent_goal_distances,
             "embedding_goal_distances": embedding_goal_distances,
             "task_target_distances": task_target_distances,
@@ -1222,9 +1587,21 @@ def main() -> None:
             "rope_length_errors": rope_length_errors,
             "executed_actions_raw": [action.tolist() for action in executed_actions_raw],
             "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
-            "dataset_start_pixel_l2": float(np.linalg.norm(start_frame.astype(np.float32) - dataset_pixels_np[0].astype(np.float32))),
-            "dataset_goal_pixel_l2": float(np.linalg.norm(goal_frame.astype(np.float32) - dataset_pixels_np[-1].astype(np.float32))),
-            "dataset_goal_latent_distance": float(torch.linalg.vector_norm(true_latents[-1] - goal_emb).item()),
+            "dataset_start_pixel_l2": (
+                float(np.linalg.norm(start_frame.astype(np.float32) - dataset_pixels_np[0].astype(np.float32)))
+                if args.use_dataset_endpoints
+                else None
+            ),
+            "dataset_goal_pixel_l2": (
+                float(np.linalg.norm(goal_frame.astype(np.float32) - dataset_pixels_np[-1].astype(np.float32)))
+                if args.use_dataset_endpoints
+                else None
+            ),
+            "dataset_goal_latent_distance": (
+                float(torch.linalg.vector_norm(true_latents[-1] - goal_emb).item())
+                if true_latents is not None
+                else None
+            ),
         }
 
     metrics_path = out_dir / "metrics.json"

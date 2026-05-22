@@ -70,7 +70,7 @@ from pusht.train.mlpdyn_train import required_markov_history
 DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_embd_48"
 DEFAULT_OUT_DIR = "pusht/plan/mppi_mlpdyn"
 DEVICE = "auto"
-HORIZON = 65
+HORIZON = 45
 MAX_MPC_STEPS = 350
 Q_TERMINAL = 10.0
 Q_STAGE = 0.5

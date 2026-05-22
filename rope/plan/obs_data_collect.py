@@ -106,6 +106,41 @@ def obstacle_reach_bounds(lower: np.ndarray, upper: np.ndarray, args: argparse.N
     return reach_lower, reach_upper
 
 
+def endpoint_sampling_boxes(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    obstacle_reach: tuple[float, float],
+) -> list[dict[str, np.ndarray | str]]:
+    boxes: list[dict[str, np.ndarray | str]] = []
+    left_upper = upper.copy()
+    left_upper[0] = min(float(left_upper[0]), float(obstacle_reach[0]))
+    if float(left_upper[0]) > float(lower[0]):
+        boxes.append(
+            {
+                "name": "reach_below_obstacle",
+                "lower": lower.astype(np.float32),
+                "upper": left_upper.astype(np.float32),
+            }
+        )
+
+    right_lower = lower.copy()
+    right_lower[0] = max(float(right_lower[0]), float(obstacle_reach[1]))
+    if float(upper[0]) > float(right_lower[0]):
+        boxes.append(
+            {
+                "name": "reach_above_obstacle",
+                "lower": right_lower.astype(np.float32),
+                "upper": upper.astype(np.float32),
+            }
+        )
+
+    if not boxes:
+        raise ValueError(
+            "Obstacle reach interval covers the full task reach range; no outside-reach endpoint sampling box exists."
+        )
+    return boxes
+
+
 def validate_args(lower: np.ndarray, upper: np.ndarray, args: argparse.Namespace, env: LabEnv) -> None:
     if int(args.samples_per_class) <= 0:
         raise ValueError("Samples per class must be positive.")
@@ -409,6 +444,7 @@ def main() -> None:
     validate_args(lower, upper, args, env)
 
     reach_bounds = obstacle_reach_bounds(lower, upper, args)
+    endpoint_boxes = endpoint_sampling_boxes(lower, upper, reach_bounds)
     width_values = np.linspace(float(lower[2]), float(upper[2]), num=int(args.width_steps), dtype=np.float64)
     sag_drop_values = compute_width_sag_profile(
         width_values,
@@ -493,6 +529,8 @@ def main() -> None:
                 "obstacle_reach": np.array(reach_bounds, dtype=np.float32),
                 "task_lower": lower.astype(np.float32),
                 "task_upper": upper.astype(np.float32),
+                "endpoint_sampling_rule": "sample start and goal only outside the obstacle reach interval",
+                "endpoint_sampling_boxes": endpoint_boxes,
                 "samples_per_class": int(args.samples_per_class),
                 "sag_width_steps": int(args.width_steps),
                 "balanced_total_count": int(balanced["task_target"].shape[0]),
@@ -540,6 +578,15 @@ def main() -> None:
             "task_lower": lower.tolist(),
             "task_upper": upper.tolist(),
             "obstacle_reach": list(reach_bounds),
+            "endpoint_sampling_rule": "sample start and goal only outside the obstacle reach interval",
+            "endpoint_sampling_boxes": [
+                {
+                    "name": str(box["name"]),
+                    "lower": np.asarray(box["lower"], dtype=np.float64).tolist(),
+                    "upper": np.asarray(box["upper"], dtype=np.float64).tolist(),
+                }
+                for box in endpoint_boxes
+            ],
             "low_rope_target": float(low_rope_target),
             "low_rope_cutoff": float(low_rope_cutoff),
             "sag_drop_min": float(np.min(sag_drop_values)),
