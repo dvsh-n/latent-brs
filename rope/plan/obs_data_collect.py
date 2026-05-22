@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect a balanced rope obstacle image dataset from dense task-space samples."""
+"""Collect a balanced rope obstacle image dataset from a reach-gated low-rope-height rule."""
 
 from __future__ import annotations
 
@@ -32,6 +32,9 @@ DEFAULT_CAMERA = "video_cam"
 DISABLE_SHADOWS = True
 TRAIN_FRACTION = 0.9
 DIAGNOSTIC_PLOT_NAME = "balanced_obstacle_dataset_reach_height.png"
+DEFAULT_SAMPLES_PER_CLASS = 8192
+DEFAULT_OBSTACLE_REACH_LOWER = 0.05
+DEFAULT_OBSTACLE_REACH_UPPER = 0.15
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,20 +50,38 @@ def parse_args() -> argparse.Namespace:
         default=DISABLE_SHADOWS,
         help="Disable shadows for saved renders.",
     )
-    parser.add_argument("--reach-steps", type=int, default=41)
-    parser.add_argument("--height-steps", type=int, default=41)
-    parser.add_argument("--width-steps", type=int, default=11)
+    parser.add_argument("--samples-per-class", type=int, default=DEFAULT_SAMPLES_PER_CLASS)
+    parser.add_argument(
+        "--obstacle-reach-lower",
+        type=float,
+        default=DEFAULT_OBSTACLE_REACH_LOWER,
+        help="Minimum reach coordinate where the low-rope-height obstacle is active.",
+    )
+    parser.add_argument(
+        "--obstacle-reach-upper",
+        type=float,
+        default=DEFAULT_OBSTACLE_REACH_UPPER,
+        help="Maximum reach coordinate where the low-rope-height obstacle is active.",
+    )
+    parser.add_argument(
+        "--width-steps",
+        type=int,
+        default=41,
+        help="Number of widths used to estimate the width-dependent sag profile.",
+    )
+    parser.add_argument("--reach-steps", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--height-steps", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--midpoint-clearance",
         type=float,
         default=0.15,
-        help="Desired rope midpoint clearance above the table before adding the model buffer.",
+        help="Minimum allowed low-rope clearance above the table.",
     )
     parser.add_argument(
         "--midpoint-buffer",
         type=float,
         default=0.025,
-        help="Extra model-error buffer added to the midpoint clearance threshold.",
+        help="Extra clearance margin for proxy/model error.",
     )
     return parser.parse_args()
 
@@ -78,38 +99,41 @@ def task_bounds_arrays(env: LabEnv) -> tuple[np.ndarray, np.ndarray]:
     return lower, upper
 
 
-def validate_args(lower: np.ndarray, upper: np.ndarray, args: argparse.Namespace, env: LabEnv) -> None:
+def obstacle_reach_bounds(lower: np.ndarray, upper: np.ndarray, args: argparse.Namespace) -> tuple[float, float]:
     del lower, upper
-    if int(args.reach_steps) <= 0 or int(args.height_steps) <= 0 or int(args.width_steps) <= 0:
-        raise ValueError("Grid step counts must all be positive.")
+    reach_lower = float(args.obstacle_reach_lower)
+    reach_upper = float(args.obstacle_reach_upper)
+    return reach_lower, reach_upper
+
+
+def validate_args(lower: np.ndarray, upper: np.ndarray, args: argparse.Namespace, env: LabEnv) -> None:
+    if int(args.samples_per_class) <= 0:
+        raise ValueError("Samples per class must be positive.")
+    if int(args.width_steps) <= 1:
+        raise ValueError("Width steps must be greater than one.")
     if int(args.width) <= 0 or int(args.height) <= 0:
         raise ValueError("Render width and height must both be positive.")
     if float(args.midpoint_clearance) < 0.0 or float(args.midpoint_buffer) < 0.0:
-        raise ValueError("Midpoint clearance and midpoint buffer must be non-negative.")
+        raise ValueError("Low-rope clearance and proxy/model-error buffer must be non-negative.")
+    reach_lower, reach_upper = obstacle_reach_bounds(lower, upper, args)
+    if not (float(lower[0]) <= reach_lower <= reach_upper <= float(upper[0])):
+        raise ValueError(
+            f"Obstacle reach bounds [{reach_lower}, {reach_upper}] must lie inside task reach bounds "
+            f"[{float(lower[0])}, {float(upper[0])}]."
+        )
     try:
         env.model.camera(str(args.camera)).id
     except KeyError as exc:
         raise ValueError(f"Unknown camera {args.camera!r}.") from exc
 
 
-def build_dense_task_grid(
+def sample_uniform_task_states(
     lower: np.ndarray,
     upper: np.ndarray,
-    *,
-    reach_steps: int,
-    height_steps: int,
-    width_steps: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    reach_values = np.linspace(float(lower[0]), float(upper[0]), num=reach_steps, dtype=np.float64)
-    height_values = np.linspace(float(upper[1]), float(lower[1]), num=height_steps, dtype=np.float64)
-    width_values = np.linspace(float(lower[2]), float(upper[2]), num=width_steps, dtype=np.float64)
-
-    states: list[np.ndarray] = []
-    for width in width_values:
-        for reach in reach_values:
-            for height in height_values:
-                states.append(np.array([reach, height, width], dtype=np.float64))
-    return np.stack(states, axis=0), reach_values, height_values, width_values
+    count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    return rng.uniform(lower, upper, size=(count, 3)).astype(np.float64)
 
 
 def states_to_qpos_and_control(
@@ -134,22 +158,100 @@ def states_to_qpos_and_control(
     return np.stack(qpos_batch, axis=0), np.stack(control_batch, axis=0)
 
 
-def compute_proxy_midpoint_heights(
-    task_states: np.ndarray,
+def compute_width_sag_profile(
+    width_values: np.ndarray,
     *,
     progress_desc: str | None = None,
 ) -> np.ndarray:
     proxy_env = LabEnv(base_config=BaseEnvConfig(enable_proxy_rope=True))
-    midpoint_heights = np.zeros((task_states.shape[0],), dtype=np.float64)
+    reach = 0.5 * (float(proxy_env.task_bounds.reach[0]) + float(proxy_env.task_bounds.reach[1]))
+    height = float(proxy_env.task_bounds.height[1])
+    sag_drop = np.zeros((width_values.shape[0],), dtype=np.float64)
     iterator = (
-        tqdm(enumerate(task_states), total=task_states.shape[0], desc=progress_desc, unit="state")
+        tqdm(enumerate(width_values), total=width_values.shape[0], desc=progress_desc, unit="width")
         if progress_desc
-        else enumerate(task_states)
+        else enumerate(width_values)
     )
-    for index, state_vec in iterator:
-        proxy_env.reset(TaskState.from_array(state_vec))
-        midpoint_heights[index] = proxy_env.get_proxy_rope_midpoint_height()
-    return midpoint_heights
+    for index, width in iterator:
+        proxy_env.reset(TaskState(reach=reach, height=height, width=float(width)))
+        points = proxy_env.get_proxy_rope_points()
+        endpoint_height = 0.5 * (float(points[0, 2]) + float(points[-1, 2]))
+        sag_drop[index] = max(0.0, endpoint_height - float(np.min(points[:, 2])))
+    return sag_drop
+
+
+def interpolate_sag_drop(widths: np.ndarray, width_values: np.ndarray, sag_drop_values: np.ndarray) -> np.ndarray:
+    return np.interp(
+        np.asarray(widths, dtype=np.float64),
+        np.asarray(width_values, dtype=np.float64),
+        np.asarray(sag_drop_values, dtype=np.float64),
+    )
+
+
+def estimate_low_rope_height(
+    states: np.ndarray,
+    width_values: np.ndarray,
+    sag_drop_values: np.ndarray,
+) -> np.ndarray:
+    sag_drop = interpolate_sag_drop(states[:, 2], width_values, sag_drop_values)
+    return np.asarray(states[:, 1], dtype=np.float64) - sag_drop
+
+
+def classify_obstacle_states(
+    states: np.ndarray,
+    *,
+    obstacle_reach: tuple[float, float],
+    low_rope_cutoff: float,
+    width_values: np.ndarray,
+    sag_drop_values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    low_rope_height = estimate_low_rope_height(states, width_values, sag_drop_values)
+    sag_drop = interpolate_sag_drop(states[:, 2], width_values, sag_drop_values)
+    in_reach = (states[:, 0] >= obstacle_reach[0]) & (states[:, 0] <= obstacle_reach[1])
+    labels = (in_reach & (low_rope_height <= low_rope_cutoff)).astype(np.int64)
+    return labels, low_rope_height, sag_drop
+
+
+def sample_labeled_task_states(
+    label: int,
+    count: int,
+    *,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    obstacle_reach: tuple[float, float],
+    low_rope_cutoff: float,
+    width_values: np.ndarray,
+    sag_drop_values: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    states: list[np.ndarray] = []
+    low_heights: list[np.ndarray] = []
+    sag_drops: list[np.ndarray] = []
+    attempts = 0
+    chunk_size = max(4096, 2 * count)
+    while sum(batch.shape[0] for batch in states) < count:
+        attempts += chunk_size
+        candidates = sample_uniform_task_states(lower, upper, chunk_size, rng)
+        candidate_labels, candidate_low, candidate_sag = classify_obstacle_states(
+            candidates,
+            obstacle_reach=obstacle_reach,
+            low_rope_cutoff=low_rope_cutoff,
+            width_values=width_values,
+            sag_drop_values=sag_drop_values,
+        )
+        keep = candidate_labels == int(label)
+        if np.any(keep):
+            states.append(candidates[keep])
+            low_heights.append(candidate_low[keep])
+            sag_drops.append(candidate_sag[keep])
+        if attempts > 10_000_000 and not states:
+            class_name = "obstacle" if label == 1 else "non-obstacle"
+            raise RuntimeError(f"Could not sample any {class_name} states with the configured reach/height rule.")
+
+    sampled_states = np.concatenate(states, axis=0)[:count]
+    sampled_low = np.concatenate(low_heights, axis=0)[:count]
+    sampled_sag = np.concatenate(sag_drops, axis=0)[:count]
+    return sampled_states, sampled_low, sampled_sag
 
 
 def render_rgb_frame(
@@ -208,28 +310,25 @@ def split_indices(indices: np.ndarray, rng: np.random.Generator, train_fraction:
     return shuffled[:train_count], shuffled[train_count:]
 
 
-def build_balanced_dataset(
-    states: np.ndarray,
-    midpoint_heights: np.ndarray,
-    midpoint_cutoff: float,
+def build_balanced_dataset_from_samples(
+    obstacle_states: np.ndarray,
+    obstacle_low_rope_height: np.ndarray,
+    obstacle_sag_drop: np.ndarray,
+    non_obstacle_states: np.ndarray,
+    non_obstacle_low_rope_height: np.ndarray,
+    non_obstacle_sag_drop: np.ndarray,
     rng: np.random.Generator,
 ) -> dict[str, np.ndarray]:
-    labels = (midpoint_heights < midpoint_cutoff).astype(np.int64)
-    obstacle_idx = np.flatnonzero(labels == 1)
-    non_obstacle_idx = np.flatnonzero(labels == 0)
-    if obstacle_idx.size == 0:
-        raise ValueError("Dense sampling produced zero obstacle states.")
-    if non_obstacle_idx.size < obstacle_idx.size:
-        raise ValueError(
-            f"Need at least as many non-obstacle states as obstacle states for balancing, got "
-            f"{non_obstacle_idx.size} non-obstacle and {obstacle_idx.size} obstacle."
-        )
-
-    sampled_non_obstacle_idx = rng.choice(non_obstacle_idx, size=obstacle_idx.size, replace=False)
-    selected_idx = np.concatenate((obstacle_idx, sampled_non_obstacle_idx), axis=0)
-    selected_labels = labels[selected_idx]
-    selected_midpoint_heights = midpoint_heights[selected_idx]
-    selected_states = states[selected_idx].astype(np.float32)
+    selected_states = np.concatenate((obstacle_states, non_obstacle_states), axis=0).astype(np.float32)
+    selected_labels = np.concatenate(
+        (
+            np.ones((obstacle_states.shape[0],), dtype=np.int64),
+            np.zeros((non_obstacle_states.shape[0],), dtype=np.int64),
+        ),
+        axis=0,
+    )
+    selected_low_rope_height = np.concatenate((obstacle_low_rope_height, non_obstacle_low_rope_height), axis=0)
+    selected_sag_drop = np.concatenate((obstacle_sag_drop, non_obstacle_sag_drop), axis=0)
 
     obstacle_local_idx = np.flatnonzero(selected_labels == 1)
     non_obstacle_local_idx = np.flatnonzero(selected_labels == 0)
@@ -241,13 +340,12 @@ def build_balanced_dataset(
     rng.shuffle(cal_idx)
 
     return {
-        "selected_idx": selected_idx.astype(np.int64),
         "task_target": selected_states,
         "label": selected_labels.astype(np.int64),
-        "midpoint_height": selected_midpoint_heights.astype(np.float32),
+        "low_rope_height": selected_low_rope_height.astype(np.float32),
+        "sag_drop": selected_sag_drop.astype(np.float32),
         "train_idx": train_idx.astype(np.int64),
         "calibration_idx": cal_idx.astype(np.int64),
-        "all_labels": labels.astype(np.int64),
     }
 
 
@@ -260,58 +358,38 @@ def save_balanced_dataset_diagnostic(
     out_path: Path,
     task_states: np.ndarray,
     labels: np.ndarray,
-    train_idx: np.ndarray,
-    calibration_idx: np.ndarray,
+    low_rope_height: np.ndarray,
+    *,
+    obstacle_reach: tuple[float, float],
+    low_rope_cutoff: float,
 ) -> None:
     fig, ax = plt.subplots(figsize=(7.5, 5.5), dpi=180)
     obstacle_mask = labels == 1
     safe_mask = ~obstacle_mask
-    train_mask = np.zeros((labels.shape[0],), dtype=bool)
-    cal_mask = np.zeros((labels.shape[0],), dtype=bool)
-    train_mask[train_idx] = True
-    cal_mask[calibration_idx] = True
 
     ax.scatter(
-        task_states[safe_mask & train_mask, 0],
-        task_states[safe_mask & train_mask, 1],
+        task_states[safe_mask, 0],
+        low_rope_height[safe_mask],
         s=18.0,
         c="#009e73",
         alpha=0.7,
         edgecolors="none",
-        label="train non-obstacle",
+        label="non-obstacle",
     )
     ax.scatter(
-        task_states[obstacle_mask & train_mask, 0],
-        task_states[obstacle_mask & train_mask, 1],
+        task_states[obstacle_mask, 0],
+        low_rope_height[obstacle_mask],
         s=18.0,
         c="#d55e00",
         alpha=0.75,
         edgecolors="none",
-        label="train obstacle",
+        label="obstacle",
     )
-    ax.scatter(
-        task_states[safe_mask & cal_mask, 0],
-        task_states[safe_mask & cal_mask, 1],
-        s=42.0,
-        marker="x",
-        c="#0072b2",
-        alpha=0.9,
-        linewidths=1.2,
-        label="calibration non-obstacle",
-    )
-    ax.scatter(
-        task_states[obstacle_mask & cal_mask, 0],
-        task_states[obstacle_mask & cal_mask, 1],
-        s=42.0,
-        marker="x",
-        c="#7a0019",
-        alpha=0.9,
-        linewidths=1.2,
-        label="calibration obstacle",
-    )
-    ax.set_title("Balanced 2N obstacle dataset in reach-height space")
+    ax.axvspan(obstacle_reach[0], obstacle_reach[1], color="#d55e00", alpha=0.08, label="obstacle reach interval")
+    ax.axhline(low_rope_cutoff, color="#4d4d4d", linestyle="--", linewidth=1.2, label="clearance threshold")
+    ax.set_title("Balanced obstacle dataset by reach and estimated low-rope height")
     ax.set_xlabel("reach")
-    ax.set_ylabel("height")
+    ax.set_ylabel("estimated low-rope height")
     ax.grid(alpha=0.2)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -330,26 +408,53 @@ def main() -> None:
     lower, upper = task_bounds_arrays(env)
     validate_args(lower, upper, args, env)
 
-    dense_states, reach_values, height_values, width_values = build_dense_task_grid(
-        lower,
-        upper,
-        reach_steps=int(args.reach_steps),
-        height_steps=int(args.height_steps),
-        width_steps=int(args.width_steps),
-    )
-    midpoint_heights = compute_proxy_midpoint_heights(
-        dense_states,
-        progress_desc="Classifying dense task grid",
+    reach_bounds = obstacle_reach_bounds(lower, upper, args)
+    width_values = np.linspace(float(lower[2]), float(upper[2]), num=int(args.width_steps), dtype=np.float64)
+    sag_drop_values = compute_width_sag_profile(
+        width_values,
+        progress_desc="Estimating width-dependent rope sag",
     )
 
-    midpoint_target = float(TABLE_TOP_Z + float(args.midpoint_clearance))
-    midpoint_cutoff = float(midpoint_target + float(args.midpoint_buffer))
-    balanced = build_balanced_dataset(dense_states, midpoint_heights, midpoint_cutoff, rng)
+    low_rope_target = float(TABLE_TOP_Z + float(args.midpoint_clearance))
+    low_rope_cutoff = float(low_rope_target + float(args.midpoint_buffer))
+
+    obstacle_states, obstacle_low_rope_height, obstacle_sag_drop = sample_labeled_task_states(
+        1,
+        int(args.samples_per_class),
+        lower=lower,
+        upper=upper,
+        obstacle_reach=reach_bounds,
+        low_rope_cutoff=low_rope_cutoff,
+        width_values=width_values,
+        sag_drop_values=sag_drop_values,
+        rng=rng,
+    )
+    non_obstacle_states, non_obstacle_low_rope_height, non_obstacle_sag_drop = sample_labeled_task_states(
+        0,
+        int(args.samples_per_class),
+        lower=lower,
+        upper=upper,
+        obstacle_reach=reach_bounds,
+        low_rope_cutoff=low_rope_cutoff,
+        width_values=width_values,
+        sag_drop_values=sag_drop_values,
+        rng=rng,
+    )
+
+    balanced = build_balanced_dataset_from_samples(
+        obstacle_states,
+        obstacle_low_rope_height,
+        obstacle_sag_drop,
+        non_obstacle_states,
+        non_obstacle_low_rope_height,
+        non_obstacle_sag_drop,
+        rng,
+    )
 
     dataset_states = balanced["task_target"].astype(np.float64)
     dataset_qpos, dataset_control = states_to_qpos_and_control(
         dataset_states,
-        progress_desc="Packing balanced dataset states",
+        progress_desc="Solving IK for sampled states",
     )
     dataset_pixels = render_dataset_images(
         dataset_states,
@@ -365,8 +470,9 @@ def main() -> None:
         out_dir / DIAGNOSTIC_PLOT_NAME,
         balanced["task_target"],
         balanced["label"],
-        balanced["train_idx"],
-        balanced["calibration_idx"],
+        balanced["low_rope_height"],
+        obstacle_reach=reach_bounds,
+        low_rope_cutoff=low_rope_cutoff,
     )
 
     torch.save(
@@ -380,38 +486,32 @@ def main() -> None:
                 "train_fraction": float(TRAIN_FRACTION),
                 "calibration_fraction": float(1.0 - TRAIN_FRACTION),
                 "table_top_z": float(TABLE_TOP_Z),
-                "midpoint_clearance": float(args.midpoint_clearance),
-                "midpoint_buffer": float(args.midpoint_buffer),
-                "midpoint_target": float(midpoint_target),
-                "midpoint_cutoff": float(midpoint_cutoff),
+                "low_rope_clearance": float(args.midpoint_clearance),
+                "model_error_buffer": float(args.midpoint_buffer),
+                "low_rope_target": float(low_rope_target),
+                "low_rope_cutoff": float(low_rope_cutoff),
+                "obstacle_reach": np.array(reach_bounds, dtype=np.float32),
                 "task_lower": lower.astype(np.float32),
                 "task_upper": upper.astype(np.float32),
-                "grid_shape": np.array(
-                    [int(args.width_steps), int(args.reach_steps), int(args.height_steps)],
-                    dtype=np.int64,
-                ),
-                "dense_grid_count": int(dense_states.shape[0]),
-                "obstacle_count_dense": int(np.sum(balanced["all_labels"] == 1)),
-                "non_obstacle_count_dense": int(np.sum(balanced["all_labels"] == 0)),
+                "samples_per_class": int(args.samples_per_class),
+                "sag_width_steps": int(args.width_steps),
                 "balanced_total_count": int(balanced["task_target"].shape[0]),
             },
             "dataset": {
                 "pixels": dataset_pixels.astype(np.uint8),
                 "task_target": balanced["task_target"].astype(np.float32),
                 "label": balanced["label"].astype(np.int64),
-                "midpoint_height": balanced["midpoint_height"].astype(np.float32),
+                "low_rope_height": balanced["low_rope_height"].astype(np.float32),
+                "midpoint_height": balanced["low_rope_height"].astype(np.float32),
+                "sag_drop": balanced["sag_drop"].astype(np.float32),
                 "qpos": dataset_qpos.astype(np.float32),
                 "control": dataset_control.astype(np.float32),
                 "train_idx": balanced["train_idx"].astype(np.int64),
                 "calibration_idx": balanced["calibration_idx"].astype(np.int64),
             },
-            "dense_grid": {
-                "task_target": dense_states.astype(np.float32),
-                "midpoint_height": midpoint_heights.astype(np.float32),
-                "label": balanced["all_labels"].astype(np.int64),
-                "reach_values": reach_values.astype(np.float32),
-                "height_values_descending": height_values.astype(np.float32),
+            "sag_profile": {
                 "width_values": width_values.astype(np.float32),
+                "sag_drop": sag_drop_values.astype(np.float32),
             },
         },
         out_dir / "obstacle_classifier_data.pt",
@@ -422,15 +522,11 @@ def main() -> None:
         {
             "out_dir": str(out_dir),
             "camera": str(args.camera),
-            "grid": {
-                "reach_steps": int(args.reach_steps),
-                "height_steps": int(args.height_steps),
+            "sampling": {
+                "samples_per_class": int(args.samples_per_class),
                 "width_steps": int(args.width_steps),
-                "dense_grid_count": int(dense_states.shape[0]),
             },
             "counts": {
-                "dense_obstacle_count": int(np.sum(balanced["all_labels"] == 1)),
-                "dense_non_obstacle_count": int(np.sum(balanced["all_labels"] == 0)),
                 "balanced_obstacle_count": int(np.sum(balanced["label"] == 1)),
                 "balanced_non_obstacle_count": int(np.sum(balanced["label"] == 0)),
                 "balanced_total_count": int(balanced["label"].shape[0]),
@@ -443,8 +539,11 @@ def main() -> None:
             },
             "task_lower": lower.tolist(),
             "task_upper": upper.tolist(),
-            "midpoint_target": float(midpoint_target),
-            "midpoint_cutoff": float(midpoint_cutoff),
+            "obstacle_reach": list(reach_bounds),
+            "low_rope_target": float(low_rope_target),
+            "low_rope_cutoff": float(low_rope_cutoff),
+            "sag_drop_min": float(np.min(sag_drop_values)),
+            "sag_drop_max": float(np.max(sag_drop_values)),
         },
     )
 

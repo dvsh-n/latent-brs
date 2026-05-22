@@ -28,7 +28,7 @@ from ogbench_cube.data.ogbench_cube_data_gen import LocalCubePlanOracle
 from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
-DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_1"
+DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8"
 DEFAULT_OUT_DIR = "ogbench_cube/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
