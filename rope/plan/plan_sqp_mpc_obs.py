@@ -283,17 +283,24 @@ def endpoint_boxes_from_metadata(metadata: dict[str, object]) -> list[dict[str, 
     return boxes
 
 
-def sample_task_state_from_boxes(
-    rng: np.random.Generator,
-    *,
-    boxes: list[dict[str, object]],
-) -> np.ndarray:
-    volumes = np.asarray([float(box["volume"]) for box in boxes], dtype=np.float64)
-    probabilities = volumes / float(np.sum(volumes))
-    box = boxes[int(rng.choice(len(boxes), p=probabilities))]
+def sample_task_state_from_box(rng: np.random.Generator, box: dict[str, object]) -> np.ndarray:
     lower = np.asarray(box["lower"], dtype=np.float64)
     upper = np.asarray(box["upper"], dtype=np.float64)
     return rng.uniform(lower, upper).astype(np.float32)
+
+
+def endpoint_crossing_boxes(boxes: list[dict[str, object]]) -> tuple[dict[str, object], dict[str, object]]:
+    if len(boxes) < 2:
+        raise ValueError("Forced obstacle crossing requires endpoint sampling boxes on both sides of the obstacle.")
+    sorted_boxes = sorted(
+        boxes,
+        key=lambda box: float(0.5 * (np.asarray(box["lower"], dtype=np.float64)[0] + np.asarray(box["upper"], dtype=np.float64)[0])),
+    )
+    low_reach_box = sorted_boxes[0]
+    high_reach_box = sorted_boxes[-1]
+    if str(low_reach_box["name"]) == str(high_reach_box["name"]):
+        raise ValueError("Forced obstacle crossing could not identify distinct low/high reach endpoint boxes.")
+    return low_reach_box, high_reach_box
 
 
 def sample_safe_task_endpoints(
@@ -308,17 +315,23 @@ def sample_safe_task_endpoints(
         raise ValueError("Obstacle model source metadata is not a dictionary; regenerate the obstacle model artifact.")
     boxes = endpoint_boxes_from_metadata(metadata)
 
-    start = sample_task_state_from_boxes(rng, boxes=boxes)
-    goal = sample_task_state_from_boxes(rng, boxes=boxes)
+    low_reach_box, high_reach_box = endpoint_crossing_boxes(boxes)
+    start_box = low_reach_box
+    goal_box = high_reach_box
+    if bool(rng.integers(0, 2)):
+        start_box, goal_box = goal_box, start_box
+    start = sample_task_state_from_box(rng, start_box)
+    goal = sample_task_state_from_box(rng, goal_box)
     attempts = 1
     while float(np.linalg.norm(goal - start)) < float(min_distance):
         if attempts >= int(max_attempts):
             raise RuntimeError("Could not sample safe start/goal endpoints separated by the requested distance.")
-        goal = sample_task_state_from_boxes(rng, boxes=boxes)
+        start = sample_task_state_from_box(rng, start_box)
+        goal = sample_task_state_from_box(rng, goal_box)
         attempts += 1
 
     sampling_info: dict[str, object] = {
-        "rule": str(metadata.get("endpoint_sampling_rule", "sample start and goal only outside obstacle reach")),
+        "rule": "force obstacle crossing by sampling start and goal on opposite sides of the obstacle reach interval",
         "boxes": [
             {
                 "name": str(box["name"]),
@@ -328,6 +341,8 @@ def sample_safe_task_endpoints(
             }
             for box in boxes
         ],
+        "start_box": str(start_box["name"]),
+        "goal_box": str(goal_box["name"]),
         "min_start_goal_distance": float(min_distance),
         "goal_resample_attempts": int(attempts),
     }
@@ -350,14 +365,37 @@ def save_planner_proxy_rope_diagnostic(
     task_states: np.ndarray,
     low_rope_height: np.ndarray,
     *,
+    goal_task_state: np.ndarray,
+    goal_low_rope_height: float,
+    task_reach_bounds: tuple[float, float] | None,
     obstacle_reach: tuple[float, float] | None,
     low_rope_cutoff: float | None,
 ) -> None:
     states = np.asarray(task_states, dtype=np.float64)
     heights = np.asarray(low_rope_height, dtype=np.float64)
+    goal_state = np.asarray(goal_task_state, dtype=np.float64)
+    goal_height = float(goal_low_rope_height)
     steps = np.arange(states.shape[0], dtype=np.int64)
-    fig, ax = plt.subplots(figsize=(7.5, 5.5), dpi=180)
-    if obstacle_reach is not None:
+    fig, ax = plt.subplots(figsize=(7.5, 7.0), dpi=180)
+    y_values = [float(np.min(heights)), float(np.max(heights)), goal_height]
+    if low_rope_cutoff is not None:
+        y_values.append(float(low_rope_cutoff))
+    y_min = min(y_values)
+    y_max = max(y_values)
+    y_center = 0.5 * (y_min + y_max)
+    y_half_range = max(0.5 * (y_max - y_min) * 1.25, 0.075)
+    y_lower = y_center - y_half_range
+    y_upper = y_center + y_half_range
+    if obstacle_reach is not None and low_rope_cutoff is not None:
+        ax.fill_between(
+            [obstacle_reach[0], obstacle_reach[1]],
+            y_lower,
+            float(low_rope_cutoff),
+            color="#d55e00",
+            alpha=0.08,
+            label="obstacle region",
+        )
+    elif obstacle_reach is not None:
         ax.axvspan(obstacle_reach[0], obstacle_reach[1], color="#d55e00", alpha=0.08, label="obstacle reach interval")
     if low_rope_cutoff is not None:
         ax.axhline(low_rope_cutoff, color="#4d4d4d", linestyle="--", linewidth=1.2, label="clearance threshold")
@@ -375,12 +413,26 @@ def save_planner_proxy_rope_diagnostic(
         zorder=2,
     )
     ax.scatter(states[0, 0], heights[0], marker="o", s=72.0, c="#0072b2", edgecolors="black", linewidths=0.5, label="start")
+    ax.scatter(
+        goal_state[0],
+        goal_height,
+        marker="D",
+        s=86.0,
+        c="#009e73",
+        edgecolors="black",
+        linewidths=0.5,
+        label="goal",
+        zorder=4,
+    )
     ax.scatter(states[-1, 0], heights[-1], marker="*", s=120.0, c="#cc79a7", edgecolors="black", linewidths=0.5, label="final")
     cbar = fig.colorbar(scatter, ax=ax)
     cbar.set_label("executed step")
     ax.set_title("Planner trajectory by reach and proxy rope low height")
     ax.set_xlabel("reach")
     ax.set_ylabel("proxy rope low height")
+    if task_reach_bounds is not None:
+        ax.set_xlim(task_reach_bounds[0], task_reach_bounds[1])
+    ax.set_ylim(y_lower, y_upper)
     ax.grid(alpha=0.2)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -421,6 +473,23 @@ def load_dataset_episode(
             "goal_tolerance": float(h5.attrs.get("goal_tolerance", 1e-4)),
             "terminated": bool(h5["terminated"][episode_idx]) if "terminated" in h5 else False,
             "truncated": bool(h5["truncated"][episode_idx]) if "truncated" in h5 else False,
+        }
+
+
+def load_dataset_metadata(dataset_path: Path) -> dict[str, int | float | str]:
+    with h5py.File(dataset_path, "r") as h5:
+        ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
+        fallback_max_steps = int(max(int(np.max(ep_len)) - 1, 1)) if ep_len.size else 1
+        return {
+            "camera": str(h5.attrs.get("camera", "video_cam")),
+            "mode": str(h5.attrs.get("mode", "")),
+            "width": int(h5["pixels"].shape[2]),
+            "height": int(h5["pixels"].shape[1]),
+            "physics_timestep": float(h5.attrs.get("physics_timestep", 1.0 / 500.0)),
+            "control_timestep": float(h5.attrs.get("control_timestep", 25.0 / 500.0)),
+            "control_decimation": int(h5.attrs.get("control_decimation", 25)),
+            "max_episode_steps": int(h5.attrs.get("max_episode_steps", fallback_max_steps)),
+            "goal_tolerance": float(h5.attrs.get("goal_tolerance", 1e-4)),
         }
 
 
@@ -1174,45 +1243,59 @@ def main() -> None:
     action_mean = train_stats_dataset.action_mean.astype(np.float32)
     action_std = train_stats_dataset.action_std.astype(np.float32)
 
-    with h5py.File(dataset_path, "r") as h5:
-        ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
-
-    valid_episodes = np.flatnonzero(ep_len >= 2)
-    if valid_episodes.size == 0:
-        raise ValueError("Need at least one test trajectory with 2 or more frames.")
-
     rng = np.random.default_rng(args.seed)
-    if args.episode_idx is None:
-        episode_idx = int(rng.choice(valid_episodes))
-    else:
-        episode_idx = int(args.episode_idx)
-        if episode_idx < 0 or episode_idx >= ep_len.shape[0]:
-            raise ValueError(f"--episode-idx must be in [0, {ep_len.shape[0] - 1}], got {episode_idx}.")
-        if ep_len[episode_idx] < 2:
-            raise ValueError(f"--episode-idx {episode_idx} must have at least 2 frames, got {ep_len[episode_idx]}.")
+    dataset_metadata = load_dataset_metadata(dataset_path)
+    episode_idx: int | None = None
+    episode_seed: int | None = None
+    task_target_np: np.ndarray | None = None
+    qpos_np: np.ndarray | None = None
+    qvel_np: np.ndarray | None = None
+    control_np: np.ndarray | None = None
+    time_np: np.ndarray | None = None
+    dataset_pixels_np: np.ndarray | None = None
 
-    episode = load_dataset_episode(dataset_path, episode_idx)
-    episode_seed = int(episode["episode_seed"])
-    camera = str(episode["camera"])
-    width = int(episode["width"])
-    height = int(episode["height"])
-    control_decimation = int(episode["control_decimation"])
-    dataset_goal_tolerance = float(episode["goal_tolerance"])
+    if args.use_dataset_endpoints:
+        with h5py.File(dataset_path, "r") as h5:
+            ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
+
+        valid_episodes = np.flatnonzero(ep_len >= 2)
+        if valid_episodes.size == 0:
+            raise ValueError("Need at least one test trajectory with 2 or more frames.")
+
+        if args.episode_idx is None:
+            episode_idx = int(rng.choice(valid_episodes))
+        else:
+            episode_idx = int(args.episode_idx)
+            if episode_idx < 0 or episode_idx >= ep_len.shape[0]:
+                raise ValueError(f"--episode-idx must be in [0, {ep_len.shape[0] - 1}], got {episode_idx}.")
+            if ep_len[episode_idx] < 2:
+                raise ValueError(f"--episode-idx {episode_idx} must have at least 2 frames, got {ep_len[episode_idx]}.")
+
+        episode = load_dataset_episode(dataset_path, episode_idx)
+        episode_seed = int(episode["episode_seed"])
+        task_target_np = np.asarray(episode["task_target"], dtype=np.float32)
+        qpos_np = np.asarray(episode["qpos"], dtype=np.float32)
+        qvel_np = np.asarray(episode["qvel"], dtype=np.float32)
+        control_np = np.asarray(episode["control"], dtype=np.float32)
+        time_np = np.asarray(episode["time"], dtype=np.float32)
+        dataset_pixels_np = np.asarray(episode["pixels"], dtype=np.uint8)
+
+    camera = str(dataset_metadata["camera"])
+    width = int(dataset_metadata["width"])
+    height = int(dataset_metadata["height"])
+    control_decimation = int(dataset_metadata["control_decimation"])
+    dataset_goal_tolerance = float(dataset_metadata["goal_tolerance"])
     goal_tolerance = float(args.goal_tolerance) if args.goal_tolerance is not None else dataset_goal_tolerance
-    dataset_max_episode_steps = int(episode["max_episode_steps"])
-
-    task_target_np = np.asarray(episode["task_target"], dtype=np.float32)
-    qpos_np = np.asarray(episode["qpos"], dtype=np.float32)
-    qvel_np = np.asarray(episode["qvel"], dtype=np.float32)
-    control_np = np.asarray(episode["control"], dtype=np.float32)
-    left_attachment_pos_np = np.asarray(episode["left_attachment_pos"], dtype=np.float32)
-    right_attachment_pos_np = np.asarray(episode["right_attachment_pos"], dtype=np.float32)
-    rope_length_np = np.asarray(episode["rope_length"], dtype=np.float32)
-    time_np = np.asarray(episode["time"], dtype=np.float32)
-    dataset_pixels_np = np.asarray(episode["pixels"], dtype=np.uint8)
+    dataset_max_episode_steps = int(dataset_metadata["max_episode_steps"])
 
     endpoint_source = "dataset_episode" if args.use_dataset_endpoints else "sampled_safe_task_space"
-    run_name = f"{int(time.time())}_{endpoint_source}_episode_{episode_idx:05d}"
+    run_timestamp = int(time.time())
+    if args.use_dataset_endpoints:
+        if episode_idx is None:
+            raise RuntimeError("Dataset endpoint mode did not select an episode.")
+        run_name = f"{run_timestamp}_{endpoint_source}_episode_{episode_idx:05d}"
+    else:
+        run_name = f"{run_timestamp}_{endpoint_source}"
     out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1232,6 +1315,14 @@ def main() -> None:
 
     with mujoco.Renderer(env.model, height=height, width=width) as renderer:
         if args.use_dataset_endpoints:
+            if (
+                task_target_np is None
+                or qpos_np is None
+                or qvel_np is None
+                or control_np is None
+                or time_np is None
+            ):
+                raise RuntimeError("Dataset endpoint mode did not load the selected episode arrays.")
             start_frame, start_info = reset_env_to_state(
                 env,
                 renderer,
@@ -1319,6 +1410,8 @@ def main() -> None:
 
         true_latents = None
         if args.use_dataset_endpoints:
+            if dataset_pixels_np is None:
+                raise RuntimeError("Dataset endpoint mode did not load episode pixels.")
             dataset_pixels = preprocess_pixels(
                 dataset_pixels_np,
                 img_size=img_size,
@@ -1413,7 +1506,7 @@ def main() -> None:
                     u0_norm = u_plan[0].astype(np.float32)
                     u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
 
-                    current_time = float(current_info["time"][0]) + float(episode["control_timestep"])
+                    current_time = float(current_info["time"][0]) + float(dataset_metadata["control_timestep"])
                     current_frame, current_info = step_env_with_action(
                         env,
                         renderer,
@@ -1487,8 +1580,16 @@ def main() -> None:
 
         final_info = current_info
         executed_task_targets_np = np.stack(executed_task_targets, axis=0).astype(np.float32)
-        proxy_low_rope_heights = proxy_rope_low_heights_for_task_states(executed_task_targets_np)
+        proxy_plot_task_states = np.concatenate((executed_task_targets_np, goal_task_target.reshape(1, -1)), axis=0)
+        proxy_plot_low_rope_heights = proxy_rope_low_heights_for_task_states(proxy_plot_task_states)
+        proxy_low_rope_heights = proxy_plot_low_rope_heights[:-1]
+        goal_proxy_low_rope_height = float(proxy_plot_low_rope_heights[-1])
         source_metadata = obstacle_constraint.source_metadata if isinstance(obstacle_constraint.source_metadata, dict) else {}
+        task_reach_bounds_for_plot: tuple[float, float] | None = None
+        task_lower_arr = np.asarray(source_metadata.get("task_lower"), dtype=np.float64)
+        task_upper_arr = np.asarray(source_metadata.get("task_upper"), dtype=np.float64)
+        if task_lower_arr.shape == (3,) and task_upper_arr.shape == (3,):
+            task_reach_bounds_for_plot = (float(task_lower_arr[0]), float(task_upper_arr[0]))
         obstacle_reach_for_plot: tuple[float, float] | None = None
         obstacle_reach_arr = np.asarray(source_metadata.get("obstacle_reach"), dtype=np.float64)
         if obstacle_reach_arr.shape == (2,):
@@ -1501,11 +1602,14 @@ def main() -> None:
             proxy_plot_path,
             executed_task_targets_np,
             proxy_low_rope_heights,
+            goal_task_state=goal_task_target,
+            goal_low_rope_height=goal_proxy_low_rope_height,
+            task_reach_bounds=task_reach_bounds_for_plot,
             obstacle_reach=obstacle_reach_for_plot,
             low_rope_cutoff=low_rope_cutoff_for_plot,
         )
         metrics = {
-            "episode_idx": int(episode_idx),
+            "episode_idx": int(episode_idx) if episode_idx is not None else None,
             "episode_seed": episode_seed,
             "checkpoint": str(checkpoint_path),
             "dataset_path": str(dataset_path),
@@ -1513,7 +1617,7 @@ def main() -> None:
             "endpoint_sampling": endpoint_sampling_info,
             "camera": camera,
             "disable_shadows": bool(args.disable_shadows),
-            "mode": str(episode["mode"]),
+            "mode": str(dataset_metadata["mode"]),
             "img_size": img_size,
             "horizon": int(args.horizon),
             "solver": "nominal_sqp_conformal_obstacle",
@@ -1540,7 +1644,7 @@ def main() -> None:
             "goal_tolerance": goal_tolerance,
             "dataset_max_episode_steps": dataset_max_episode_steps,
             "control_decimation": control_decimation,
-            "control_timestep": float(episode["control_timestep"]),
+            "control_timestep": float(dataset_metadata["control_timestep"]),
             "num_executed_steps": int(len(executed_actions_raw)),
             "success": bool(success),
             "stop_reason": stop_reason,
@@ -1561,6 +1665,7 @@ def main() -> None:
             "final_task_target": np.asarray(final_info["task_target"], dtype=np.float32).tolist(),
             "executed_task_targets": executed_task_targets_np.tolist(),
             "proxy_low_rope_heights": proxy_low_rope_heights.astype(np.float32).tolist(),
+            "goal_proxy_low_rope_height": goal_proxy_low_rope_height,
             "proxy_rope_diagnostic_plot": str(proxy_plot_path),
             "goal_left_attachment_pos": goal_left_pos.tolist(),
             "goal_right_attachment_pos": goal_right_pos.tolist(),

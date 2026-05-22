@@ -529,7 +529,7 @@ def main() -> None:
                 "obstacle_reach": np.array(reach_bounds, dtype=np.float32),
                 "task_lower": lower.astype(np.float32),
                 "task_upper": upper.astype(np.float32),
-                "endpoint_sampling_rule": "sample start and goal only outside the obstacle reach interval",
+                "endpoint_sampling_rule": "force obstacle crossing by sampling start and goal on opposite sides of the obstacle reach interval",
                 "endpoint_sampling_boxes": endpoint_boxes,
                 "samples_per_class": int(args.samples_per_class),
                 "sag_width_steps": int(args.width_steps),
@@ -578,7 +578,7 @@ def main() -> None:
             "task_lower": lower.tolist(),
             "task_upper": upper.tolist(),
             "obstacle_reach": list(reach_bounds),
-            "endpoint_sampling_rule": "sample start and goal only outside the obstacle reach interval",
+            "endpoint_sampling_rule": "force obstacle crossing by sampling start and goal on opposite sides of the obstacle reach interval",
             "endpoint_sampling_boxes": [
                 {
                     "name": str(box["name"]),
