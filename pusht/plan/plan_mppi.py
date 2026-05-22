@@ -76,7 +76,7 @@ Q_TERMINAL = 10.0
 Q_STAGE = 0.5
 R_CONTROL = 0.001
 VIDEO_FPS = 10
-EPISODE_IDX = 184
+EPISODE_IDX = None
 MPPI_SAMPLES = 2048
 MPPI_UPDATE_ITERS = 5
 MPPI_REWARD_WEIGHT = 20.0
@@ -141,8 +141,8 @@ def build_batched_jax_dynamics(
 
     def _fwd_fn(x_np: np.ndarray, u_np: np.ndarray) -> np.ndarray:
         with torch.no_grad():
-            x_t = torch.from_numpy(np.asarray(x_np, dtype=np.float32)).to(device)
-            u_t = torch.from_numpy(np.asarray(u_np, dtype=np.float32)).to(device)
+            x_t = torch.from_numpy(np.asarray(x_np, dtype=np.float32).copy()).to(device)
+            u_t = torch.from_numpy(np.asarray(u_np, dtype=np.float32).copy()).to(device)
             inp = torch.cat((x_t, u_t), dim=-1)
             out = torch_dynamics_net(inp)
             return np.asarray(out.detach().cpu().numpy(), dtype=np.float32)
@@ -153,6 +153,13 @@ def build_batched_jax_dynamics(
         return jax.pure_callback(_fwd_fn, result_shape, x, u)
 
     return jax_dynamics
+
+
+def is_wrapped_keyboard_interrupt(exc: BaseException) -> bool:
+    text = "".join(traceback.format_exception_only(type(exc), exc))
+    return "KeyboardInterrupt" in text and (
+        "CpuCallback error calling callback" in text or "jax.pure_callback failed" in text
+    )
 
 
 def make_mppi_rollout_and_eval(
@@ -374,6 +381,7 @@ def main() -> None:
     mppi_plan_rewards: list[float] = []
     stop_reason = "max_mpc_steps"
     video_path: str | None = None
+    metrics_path = out_dir / "metrics.json"
     final_block = dataset_row_to_block_pose(state_np[0], env_state_np[0], state_format)
     final_agent = env_state_np[0, :2].astype(np.float32)
     goal_block = dataset_row_to_block_pose(state_np[-1], env_state_np[-1], state_format)
@@ -384,13 +392,82 @@ def main() -> None:
     prev_u = jnp.zeros((args.horizon, action_dim), dtype=jnp.float32)
     goal_state_jax = jnp.asarray(goal_state.detach().cpu().numpy().astype(np.float32))
     jax_key = jax.random.PRNGKey(0 if args.seed is None else int(args.seed))
+    action_low, action_high = pusht_agent_action_bounds()
+
+    def scalar_or_nan(values: list[float], index: int) -> float:
+        return values[index] if values else float("nan")
+
+    def save_outputs() -> dict[str, Any]:
+        nonlocal video_path
+        metrics = {
+            "episode_idx": episode_idx,
+            "planner": "mppi",
+            "model_dir": str(model_dir),
+            "checkpoint": str(checkpoint_path),
+            "config_path": str(model_dir / "config.json"),
+            "dataset_path": str(dataset_path),
+            "train_dataset_paths": [str(path) for path in train_dataset_paths],
+            "dataset_state_format": state_format,
+            "markov_deriv": markov_deriv,
+            "action_history_size": 1,
+            "state_space": "latent_plus_finite_differences",
+            "markov_state_dim": markov_state_dim,
+            "frameskip": frameskip,
+            "horizon": args.horizon,
+            "max_mpc_steps": args.max_mpc_steps,
+            "stop_reason": stop_reason,
+            "num_mpc_steps": len(executed_actions_norm),
+            "action_space": "normalized_dataset_action_then_raw_then_absolute_env_target",
+            "control_bound_low_norm": CONTROL_MIN_NORM,
+            "control_bound_high_norm": CONTROL_MAX_NORM,
+            "env_action_scale": ENV_ACTION_SCALE,
+            "action_target_low": action_low.tolist(),
+            "action_target_high": action_high.tolist(),
+            "num_action_clips": num_action_clips,
+            "start_agent_pos": env_state_np[0, :2].tolist(),
+            "goal_block_pose": goal_block.tolist(),
+            "goal_pose": goal_pose.tolist() if goal_pose is not None else None,
+            "final_agent_pos": final_agent.tolist(),
+            "final_block_pose": final_block.tolist(),
+            "goal_proprio": proprio_np[-1].tolist(),
+            "latent_goal_distance_initial": scalar_or_nan(latent_goal_distances, 0),
+            "latent_goal_distance_final": scalar_or_nan(latent_goal_distances, -1),
+            "block_goal_distance_initial": scalar_or_nan(block_goal_distances, 0),
+            "block_goal_distance_final": scalar_or_nan(block_goal_distances, -1),
+            "latent_goal_distances": latent_goal_distances,
+            "block_goal_distances": block_goal_distances,
+            "solve_times_ms": solve_times_ms,
+            "mppi_samples": args.mppi_samples,
+            "mppi_update_iters": args.mppi_update_iters,
+            "mppi_reward_weight": args.mppi_reward_weight,
+            "mppi_noise_level": args.mppi_noise_level,
+            "mppi_noise_decay": args.mppi_noise_decay,
+            "mppi_beta_filter": args.mppi_beta_filter,
+            "jax_platform": jax_platform,
+            "mppi_q_stage": args.q_stage,
+            "mppi_q_terminal": args.q_terminal,
+            "mppi_r_control": args.r_control,
+            "mppi_plan_rewards": mppi_plan_rewards,
+            "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
+            "executed_actions_raw": [action.tolist() for action in executed_actions_raw],
+            "executed_actions_env": [action.tolist() for action in executed_actions_env],
+            "video_path": video_path,
+        }
+        with metrics_path.open("w", encoding="utf-8") as handle:
+            json.dump(metrics, handle, indent=2)
+
+        if rollout_frames and video_path is None:
+            video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps))
+            metrics["video_path"] = video_path
+            with metrics_path.open("w", encoding="utf-8") as handle:
+                json.dump(metrics, handle, indent=2)
+        return metrics
 
     plan_env = make_planning_env(width=width, height=height)
     viz_env = make_visualization_env(width=width, height=height)
     try:
         set_goal_pose(plan_env, goal_pose)
         set_goal_pose(viz_env, goal_pose)
-        action_low, action_high = pusht_agent_action_bounds()
         hidden_start = reset_env_to_state(plan_env, env_state_np[0])
         visible_start = reset_env_to_state(viz_env.unwrapped, env_state_np[0])
 
@@ -487,73 +564,22 @@ def main() -> None:
                     break
         except KeyboardInterrupt:
             stop_reason = "keyboard_interrupt"
+        except Exception as exc:
+            if not is_wrapped_keyboard_interrupt(exc):
+                raise
+            stop_reason = "keyboard_interrupt"
         finally:
             pbar.close()
 
         final_block = current_block_pose(plan_env)
         final_agent = current_agent_pos(plan_env)
-        video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
+    except KeyboardInterrupt:
+        stop_reason = "keyboard_interrupt"
     finally:
         plan_env.close()
         viz_env.close()
 
-    metrics = {
-        "episode_idx": episode_idx,
-        "planner": "mppi",
-        "model_dir": str(model_dir),
-        "checkpoint": str(checkpoint_path),
-        "config_path": str(model_dir / "config.json"),
-        "dataset_path": str(dataset_path),
-        "train_dataset_paths": [str(path) for path in train_dataset_paths],
-        "dataset_state_format": state_format,
-        "markov_deriv": markov_deriv,
-        "action_history_size": 1,
-        "state_space": "latent_plus_finite_differences",
-        "markov_state_dim": markov_state_dim,
-        "frameskip": frameskip,
-        "horizon": args.horizon,
-        "max_mpc_steps": args.max_mpc_steps,
-        "stop_reason": stop_reason,
-        "num_mpc_steps": len(executed_actions_norm),
-        "action_space": "normalized_dataset_action_then_raw_then_absolute_env_target",
-        "control_bound_low_norm": CONTROL_MIN_NORM,
-        "control_bound_high_norm": CONTROL_MAX_NORM,
-        "env_action_scale": ENV_ACTION_SCALE,
-        "action_target_low": action_low.tolist(),
-        "action_target_high": action_high.tolist(),
-        "num_action_clips": num_action_clips,
-        "start_agent_pos": env_state_np[0, :2].tolist(),
-        "goal_block_pose": goal_block.tolist(),
-        "goal_pose": goal_pose.tolist() if goal_pose is not None else None,
-        "final_agent_pos": final_agent.tolist(),
-        "final_block_pose": final_block.tolist(),
-        "goal_proprio": proprio_np[-1].tolist(),
-        "latent_goal_distance_initial": latent_goal_distances[0],
-        "latent_goal_distance_final": latent_goal_distances[-1],
-        "block_goal_distance_initial": block_goal_distances[0],
-        "block_goal_distance_final": block_goal_distances[-1],
-        "latent_goal_distances": latent_goal_distances,
-        "block_goal_distances": block_goal_distances,
-        "solve_times_ms": solve_times_ms,
-        "mppi_samples": args.mppi_samples,
-        "mppi_update_iters": args.mppi_update_iters,
-        "mppi_reward_weight": args.mppi_reward_weight,
-        "mppi_noise_level": args.mppi_noise_level,
-        "mppi_noise_decay": args.mppi_noise_decay,
-        "mppi_beta_filter": args.mppi_beta_filter,
-        "jax_platform": jax_platform,
-        "mppi_q_stage": args.q_stage,
-        "mppi_q_terminal": args.q_terminal,
-        "mppi_r_control": args.r_control,
-        "mppi_plan_rewards": mppi_plan_rewards,
-        "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
-        "executed_actions_raw": [action.tolist() for action in executed_actions_raw],
-        "executed_actions_env": [action.tolist() for action in executed_actions_env],
-        "video_path": video_path,
-    }
-    metrics_path = out_dir / "metrics.json"
-    with metrics_path.open("w", encoding="utf-8") as handle:
-        json.dump(metrics, handle, indent=2)
+    metrics = save_outputs()
 
     print(
         json.dumps(
