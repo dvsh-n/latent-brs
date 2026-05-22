@@ -113,16 +113,17 @@ def build_dense_task_grid(
 
 
 def states_to_qpos_and_control(
-    env: LabEnv,
     task_states: np.ndarray,
     *,
     progress_desc: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if task_states.shape[0] == 0:
+        env = LabEnv()
         return (
             np.zeros((0, env.model.nq), dtype=np.float32),
             np.zeros((0, env.model.nu), dtype=np.float32),
         )
+    env = LabEnv()
     qpos_batch: list[np.ndarray] = []
     control_batch: list[np.ndarray] = []
     iterator = tqdm(task_states, desc=progress_desc, unit="state", leave=False) if progress_desc else task_states
@@ -134,11 +135,11 @@ def states_to_qpos_and_control(
 
 
 def compute_proxy_midpoint_heights(
-    proxy_env: LabEnv,
     task_states: np.ndarray,
     *,
     progress_desc: str | None = None,
 ) -> np.ndarray:
+    proxy_env = LabEnv(base_config=BaseEnvConfig(enable_proxy_rope=True))
     midpoint_heights = np.zeros((task_states.shape[0],), dtype=np.float64)
     iterator = (
         tqdm(enumerate(task_states), total=task_states.shape[0], desc=progress_desc, unit="state")
@@ -165,7 +166,6 @@ def render_rgb_frame(
 
 
 def render_dataset_images(
-    env: LabEnv,
     task_states: np.ndarray,
     qpos_batch: np.ndarray,
     control_batch: np.ndarray,
@@ -175,6 +175,7 @@ def render_dataset_images(
     image_height: int,
     disable_shadows: bool,
 ) -> np.ndarray:
+    env = LabEnv()
     camera_id = env.model.camera(camera_name).id
     qvel = np.zeros((env.model.nv,), dtype=np.float32)
     frames: list[np.ndarray] = []
@@ -326,7 +327,6 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env = LabEnv()
-    proxy_env = LabEnv(base_config=BaseEnvConfig(enable_proxy_rope=True))
     lower, upper = task_bounds_arrays(env)
     validate_args(lower, upper, args, env)
 
@@ -338,7 +338,6 @@ def main() -> None:
         width_steps=int(args.width_steps),
     )
     midpoint_heights = compute_proxy_midpoint_heights(
-        proxy_env,
         dense_states,
         progress_desc="Classifying dense task grid",
     )
@@ -349,12 +348,10 @@ def main() -> None:
 
     dataset_states = balanced["task_target"].astype(np.float64)
     dataset_qpos, dataset_control = states_to_qpos_and_control(
-        env,
         dataset_states,
         progress_desc="Packing balanced dataset states",
     )
     dataset_pixels = render_dataset_images(
-        env,
         dataset_states,
         dataset_qpos,
         dataset_control,

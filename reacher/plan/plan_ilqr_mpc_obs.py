@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run constrained Reacher MPC from a saved nominal rollout directory."""
+"""Run constrained Reacher MPC with a v2 obstacle classifier and fixed custom endpoints."""
 
 from __future__ import annotations
 
@@ -26,23 +26,32 @@ from tqdm.auto import tqdm
 
 from reacher.plan import plan_ilqr_mpc as nominal_planner
 
-DEFAULT_ROLLOUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn/1779300191_episode_00163"
-DEFAULT_OUT_SUBDIR = "constrained_mpc_obs"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/train_data_noisy.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_4"
+DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn_obs_v2"
+DEFAULT_OBSTACLE_DIR = "reacher/plan/circle_obstacle_sampling"
+DEFAULT_OBSTACLE_NET_DIR = "reacher/plan/circle_obstacle_sampling/obstacle_net_v2"
 DEVICE = "cuda"
 VIDEO_FPS = 60
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rollout-dir", type=Path, default=Path(DEFAULT_ROLLOUT_DIR))
+    parser.add_argument("--model-dir", type=Path, default=Path(DEFAULT_MODEL_DIR))
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
+    parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
+    parser.add_argument("--obstacle-dir", type=Path, default=Path(DEFAULT_OBSTACLE_DIR))
+    parser.add_argument("--obstacle-net-dir", type=Path, default=Path(DEFAULT_OBSTACLE_NET_DIR))
     parser.add_argument("--device", default=DEVICE)
+    parser.add_argument("--episode-idx", type=int, default=nominal_planner.EPISODE_IDX)
     parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--video-fps", type=int, default=VIDEO_FPS)
-    parser.add_argument("--horizon", type=int, default=None)
-    parser.add_argument("--max-mpc-steps", type=int, default=None)
-    parser.add_argument("--q-terminal", type=float, default=None)
-    parser.add_argument("--q-stage", type=float, default=None)
-    parser.add_argument("--r-control", type=float, default=None)
+    parser.add_argument("--horizon", type=int, default=nominal_planner.HORIZON)
+    parser.add_argument("--max-mpc-steps", type=int, default=nominal_planner.MAX_MPC_STEPS)
+    parser.add_argument("--q-terminal", type=float, default=nominal_planner.Q_TERMINAL)
+    parser.add_argument("--q-stage", type=float, default=nominal_planner.Q_STAGE)
+    parser.add_argument("--r-control", type=float, default=nominal_planner.R_CONTROL)
     parser.add_argument("--sqp-max-iters", type=int, default=8)
     parser.add_argument("--sqp-tol", type=float, default=1e-4)
     parser.add_argument("--qp-regularization", type=float, default=1e-5)
@@ -51,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--line-search-min-alpha", type=float, default=0.05)
     parser.add_argument("--merit-obstacle-weight", type=float, default=1e3)
     parser.add_argument("--nonlinear-obstacle-tol", type=float, default=1e-4)
-    parser.add_argument("--obstacle-margin-logit", type=float, default=0.05)
+    parser.add_argument("--obstacle-margin-score", type=float, default=0.05)
     parser.add_argument("--force-unconstrained-fallback", action="store_true", default=False)
     return parser.parse_args()
 
@@ -73,11 +82,6 @@ def log_progress(message: str) -> None:
     print(f"[plan_ilqr_mpc_obs] {message}", flush=True)
 
 
-def clamp_probability(prob: torch.Tensor | float, eps: float = 1e-6) -> torch.Tensor:
-    tensor = prob if isinstance(prob, torch.Tensor) else torch.tensor(prob, dtype=torch.float64)
-    return torch.clamp(tensor, eps, 1.0 - eps)
-
-
 def resolve_override(value: int | float | None, fallback: int | float) -> int | float:
     return fallback if value is None else value
 
@@ -91,8 +95,7 @@ def load_nominal_rollout_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
-def discover_obstacle_cache_dir(rollout_dir: Path) -> Path:
-    obstacle_root = rollout_dir / "obstacle_net"
+def discover_obstacle_cache_dir(obstacle_root: Path) -> Path:
     if not obstacle_root.is_dir():
         raise FileNotFoundError(f"Obstacle cache root not found: {obstacle_root}")
     candidates = sorted(
@@ -115,6 +118,15 @@ def load_obstacle_artifact(cache_dir: Path) -> tuple[dict[str, Any], Path]:
     with summary_path.open("r", encoding="utf-8") as handle:
         summary = json.load(handle)
     return summary, model_path
+
+
+def load_circle_obstacle_payload(path: Path) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    required = ("metadata", "episode_data", "planner_data")
+    missing = [key for key in required if key not in payload or not isinstance(payload[key], dict)]
+    if missing:
+        raise ValueError(f"Invalid circle obstacle payload {path}: missing sections {missing}.")
+    return payload
 
 
 class ObstacleMLP(nn.Module):
@@ -153,28 +165,31 @@ class ObstacleClassifierTorch:
         self.embed_dim = input_dim
         self.feature_mean = torch.as_tensor(payload["feature_mean"], dtype=torch.float32, device=device)
         self.feature_std = torch.as_tensor(payload["feature_std"], dtype=torch.float32, device=device)
-        tau = float(payload["conformal_threshold"])
-        tau_tensor = clamp_probability(tau)
-        self.threshold_prob = float(tau_tensor.item())
-        self.threshold_logit = float(torch.log(tau_tensor / (1.0 - tau_tensor)).item())
+        self.base_decision_threshold = float(payload.get("base_decision_threshold", 0.0))
+        self.safe_score_threshold = float(payload["conformal_safe_score_threshold"])
+        sign_convention = payload.get("score_sign_convention", {})
+        if sign_convention.get("obstacle") not in {None, "negative"}:
+            raise ValueError("Obstacle classifier sign convention mismatch: expected obstacle scores to be negative.")
+        if sign_convention.get("non_obstacle") not in {None, "positive"}:
+            raise ValueError("Obstacle classifier sign convention mismatch: expected non-obstacle scores to be positive.")
         self.nominal_position = torch.as_tensor(payload["nominal_position"], dtype=torch.float32, device=device)
 
     def normalize(self, z: torch.Tensor) -> torch.Tensor:
         return (z - self.feature_mean) / self.feature_std
 
-    def logits(self, z: torch.Tensor) -> torch.Tensor:
+    def scores(self, z: torch.Tensor) -> torch.Tensor:
         squeeze = False
         if z.ndim == 1:
             z = z.unsqueeze(0)
             squeeze = True
-        logits = self.net(self.normalize(z))
-        return logits[0] if squeeze else logits
+        scores = self.net(self.normalize(z))
+        return scores[0] if squeeze else scores
 
     def linearize(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         z_var = z.detach().clone().requires_grad_(True)
-        logit = self.net(self.normalize(z_var.unsqueeze(0)))[0]
-        grad = torch.autograd.grad(logit, z_var, retain_graph=False, create_graph=False)[0]
-        return logit.detach(), grad.detach()
+        score = self.net(self.normalize(z_var.unsqueeze(0)))[0]
+        grad = torch.autograd.grad(score, z_var, retain_graph=False, create_graph=False)[0]
+        return score.detach(), grad.detach()
 
 
 class ConstrainedSQPMPCSolver:
@@ -197,7 +212,7 @@ class ConstrainedSQPMPCSolver:
         line_search_min_alpha: float,
         merit_obstacle_weight: float,
         nonlinear_obstacle_tol: float,
-        obstacle_margin_logit: float,
+        obstacle_margin_score: float,
         device: torch.device,
     ) -> None:
         self.dynamics = dynamics
@@ -217,7 +232,7 @@ class ConstrainedSQPMPCSolver:
         self.line_search_min_alpha = float(line_search_min_alpha)
         self.merit_obstacle_weight = float(merit_obstacle_weight)
         self.nonlinear_obstacle_tol = float(nonlinear_obstacle_tol)
-        self.obstacle_logit_limit = float(obstacle_model.threshold_logit - obstacle_margin_logit)
+        self.obstacle_score_limit = float(obstacle_model.safe_score_threshold + obstacle_margin_score)
         self.device = device
         self.line_search_alphas = (1.0, 0.5, 0.25, 0.1, 0.05)
         self.u_min = torch.as_tensor(u_min, dtype=torch.float32, device=device).reshape(-1)
@@ -294,7 +309,7 @@ class ConstrainedSQPMPCSolver:
         state_maps = self._condensed_state_maps(a_seq, b_seq)
         qp_rows: list[torch.Tensor] = []
         qp_rhs: list[torch.Tensor] = []
-        obstacle_stage_logits: list[float] = []
+        obstacle_stage_scores: list[float] = []
 
         for step in range(self.horizon):
             s_map = state_maps[step]
@@ -327,18 +342,18 @@ class ConstrainedSQPMPCSolver:
 
         for step in range(1, self.horizon + 1):
             z_nom = x_traj[step, : self.embed_dim]
-            logit_nom, grad_z = self.obstacle_model.linearize(z_nom)
+            score_nom, grad_z = self.obstacle_model.linearize(z_nom)
             full_grad = torch.zeros((self.state_dim,), dtype=torch.float32, device=self.device)
             full_grad[: self.embed_dim] = grad_z
             row = (full_grad.to(dtype) @ state_maps[step]).reshape(1, -1)
             rhs = torch.tensor(
-                [self.obstacle_logit_limit - float(logit_nom.item())],
+                [self.obstacle_score_limit - float(score_nom.item())],
                 dtype=dtype,
                 device=self.device,
             )
             qp_rows.append(row)
             qp_rhs.append(rhs)
-            obstacle_stage_logits.append(float(logit_nom.item()))
+            obstacle_stage_scores.append(float(score_nom.item()))
 
         if qp_rows:
             a_ineq = torch.cat(qp_rows, dim=0)
@@ -349,7 +364,7 @@ class ConstrainedSQPMPCSolver:
         h_mat = 0.5 * (h_mat + h_mat.T)
         info = {
             "num_constraints": int(a_ineq.shape[0]),
-            "max_nominal_obstacle_logit": float(max(obstacle_stage_logits)) if obstacle_stage_logits else float("-inf"),
+            "max_nominal_obstacle_score": float(max(obstacle_stage_scores)) if obstacle_stage_scores else float("-inf"),
         }
         return h_mat, g_vec, a_ineq, b_ineq, info
 
@@ -422,10 +437,10 @@ class ConstrainedSQPMPCSolver:
         if x_traj.shape[0] <= 1:
             return float("-inf"), 0.0
         z = x_traj[1:, : self.embed_dim]
-        logits = self.obstacle_model.logits(z)
-        max_logit = float(torch.max(logits).item())
-        violation = float(torch.max(logits - self.obstacle_logit_limit).item())
-        return max_logit, violation
+        scores = self.obstacle_model.scores(z)
+        max_score = float(torch.max(scores).item())
+        violation = float(torch.max(scores - self.obstacle_score_limit).item())
+        return max_score, violation
 
     def _evaluate_candidate(
         self,
@@ -439,14 +454,14 @@ class ConstrainedSQPMPCSolver:
         u_new = torch.clamp(u_new, min=self.u_min, max=self.u_max)
         x_new = self._rollout(x0, u_new)
         cost = float(self._trajectory_cost(x_new, u_new, x_goal).item())
-        max_logit, obstacle_violation = self._obstacle_violation(x_new)
+        max_score, obstacle_violation = self._obstacle_violation(x_new)
         merit = cost + self.merit_obstacle_weight * max(obstacle_violation, 0.0) ** 2
         return {
             "x_traj": x_new,
             "u_seq": u_new,
             "cost": cost,
             "merit": merit,
-            "max_logit": max_logit,
+            "max_score": max_score,
             "obstacle_violation": obstacle_violation,
             "alpha": float(alpha),
         }
@@ -513,7 +528,7 @@ class ConstrainedSQPMPCSolver:
             "iterations": int(sqp_iterations),
             "cost": float(current["cost"]),
             "merit": float(current["merit"]),
-            "max_logit": float(current["max_logit"]),
+            "max_score": float(current["max_score"]),
             "obstacle_violation": float(current["obstacle_violation"]),
             "feasible": bool(feasible_solution_found and current["obstacle_violation"] <= self.nonlinear_obstacle_tol),
             "qp_success": bool(qp_success),
@@ -523,28 +538,34 @@ class ConstrainedSQPMPCSolver:
 
 def main() -> None:
     args = parse_args()
-    rollout_dir = args.rollout_dir.expanduser().resolve()
-    nominal_path = rollout_dir / "nominal_rollout.pt"
-    if not nominal_path.is_file():
-        raise FileNotFoundError(f"Nominal rollout not found: {nominal_path}")
-
+    model_dir = args.model_dir.expanduser().resolve()
+    dataset_path = args.dataset_path.expanduser().resolve()
+    out_root = args.out_dir.expanduser().resolve()
+    obstacle_dir = args.obstacle_dir.expanduser().resolve()
+    obstacle_net_root = args.obstacle_net_dir.expanduser().resolve()
+    obstacle_payload_path = (obstacle_dir / "planner_start_goal_obstacle.pt").resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
     device = nominal_planner.require_device(args.device)
-    nominal_payload = load_nominal_rollout_payload(nominal_path)
-    metadata = nominal_payload["metadata"]
-    episode_data = nominal_payload["episode_data"]
-    planner_data = nominal_payload["planner_data"]
-    executed_rollout = nominal_payload["executed_rollout"]
+    if not obstacle_payload_path.is_file():
+        raise FileNotFoundError(f"Circle obstacle payload not found: {obstacle_payload_path}")
 
-    obstacle_cache_dir = discover_obstacle_cache_dir(rollout_dir)
+    obstacle_payload = load_circle_obstacle_payload(obstacle_payload_path)
+    obstacle_metadata = obstacle_payload["metadata"]
+    obstacle_planner_data = obstacle_payload["planner_data"]
+
+    obstacle_cache_dir = discover_obstacle_cache_dir(obstacle_net_root)
     obstacle_summary, obstacle_model_path = load_obstacle_artifact(obstacle_cache_dir)
 
     cache_config = obstacle_summary.get("cache_config")
     if not isinstance(cache_config, dict):
         raise ValueError(f"Invalid obstacle summary {obstacle_cache_dir / 'summary.json'}: missing cache_config.")
-    checkpoint_path = Path(str(cache_config["checkpoint_path"])).expanduser().resolve()
-    model_dir = Path(str(cache_config["model_dir"])).expanduser().resolve()
+    checkpoint_path = (
+        args.checkpoint.expanduser().resolve()
+        if args.checkpoint is not None
+        else nominal_planner.latest_object_checkpoint(model_dir).resolve()
+    )
 
-    log_progress(f"Loading nominal rollout from {nominal_path}")
+    log_progress(f"Loading circle obstacle payload from {obstacle_payload_path}")
     log_progress(f"Loading obstacle artifact from {obstacle_cache_dir}")
     config = nominal_planner.load_config(model_dir)
     world_model = nominal_planner.load_model(checkpoint_path, device)
@@ -559,40 +580,32 @@ def main() -> None:
             f"Obstacle net embed_dim mismatch: planner model uses {embed_dim}, obstacle net uses {obstacle_model.embed_dim}."
         )
 
-    horizon = int(resolve_override(args.horizon, int(metadata["horizon"])))
-    max_mpc_steps = int(resolve_override(args.max_mpc_steps, int(metadata["max_mpc_steps"])))
-    q_terminal = float(resolve_override(args.q_terminal, float(metadata["q_terminal"])))
-    q_stage = float(resolve_override(args.q_stage, float(metadata["q_stage"])))
-    r_control = float(resolve_override(args.r_control, float(metadata["r_control"])))
+    horizon = int(args.horizon)
+    max_mpc_steps = int(args.max_mpc_steps)
+    q_terminal = float(args.q_terminal)
+    q_stage = float(args.q_stage)
+    r_control = float(args.r_control)
 
-    action_mean = np.asarray(planner_data["action_mean"], dtype=np.float32)
-    action_std = np.asarray(planner_data["action_std"], dtype=np.float32)
-    pixels_np = np.asarray(episode_data["pixels"], dtype=np.uint8)
-    qpos_np = np.asarray(episode_data["qpos"], dtype=np.float32)
-    qvel_np = np.asarray(episode_data["qvel"], dtype=np.float32)
-    obs_np = np.asarray(episode_data["observation"], dtype=np.float32)
-    start_idx = int(metadata["start_idx"])
-    goal_idx = int(metadata["goal_idx"])
-    episode_seed = int(metadata["episode_seed"])
-    physics_freq_hz = float(metadata["physics_freq_hz"])
-    time_limit = float(metadata["time_limit"])
-    height = int(metadata["height"])
-    width = int(metadata["width"])
-    goal_obs = np.asarray(planner_data["goal_obs"], dtype=np.float32)
-    goal_state_np = np.asarray(planner_data["goal_state"], dtype=np.float32)
+    train_dataset_paths = nominal_planner.resolve_training_dataset_paths(config.get("dataset_path"), dataset_path)
+    action_mean, action_std = nominal_planner.load_action_stats(train_dataset_paths, action_dim)
+    episode = nominal_planner.load_dataset_episode(dataset_path, int(args.episode_idx))
+    qpos_np = np.asarray(episode["qpos"], dtype=np.float32)
+    qvel_np = np.asarray(episode["qvel"], dtype=np.float32)
+    obs_np = np.asarray(episode["observation"], dtype=np.float32)
+    episode_seed = int(obstacle_metadata["episode_seed"])
+    physics_freq_hz = float(obstacle_metadata["physics_freq_hz"])
+    time_limit = float(obstacle_metadata["time_limit"])
+    height = int(obstacle_metadata["height"])
+    width = int(obstacle_metadata["width"])
 
-    if goal_state_np.shape[0] != markov_state_dim:
-        raise ValueError(
-            f"Goal state dimension mismatch: expected {markov_state_dim}, got {goal_state_np.shape[0]} from nominal."
-        )
+    start_qpos = np.array([0.1, -2.0], dtype=np.float32)
+    goal_qpos = np.array([2.42, -0.95], dtype=np.float32)
+    zero_qvel = np.zeros_like(start_qpos, dtype=np.float32)
 
     pixel_mean, pixel_std = nominal_planner.imagenet_pixel_stats(device)
-    run_name = f"{int(time.time())}_episode_{int(metadata['episode_idx']):05d}"
-    out_dir = rollout_dir / DEFAULT_OUT_SUBDIR / run_name
+    run_name = f"{int(time.time())}_episode_custom_obs_v2"
+    out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    nominal_planner.save_rgb_image(out_dir / "start_image.png", pixels_np[start_idx])
-    nominal_planner.save_rgb_image(out_dir / "goal_image.png", pixels_np[goal_idx])
 
     env = nominal_planner.make_render_env(
         seed=episode_seed,
@@ -601,11 +614,49 @@ def main() -> None:
         height=height,
         physics_freq_hz=physics_freq_hz,
     )
+    start_frame = nominal_planner.reset_env_to_state(
+        env,
+        seed=episode_seed,
+        qpos=start_qpos,
+        qvel=zero_qvel,
+        height=height,
+        width=width,
+    )
+    goal_frame = nominal_planner.reset_env_to_state(
+        env,
+        seed=episode_seed,
+        qpos=goal_qpos,
+        qvel=zero_qvel,
+        height=height,
+        width=width,
+    )
+    start_emb = nominal_planner.encode_single_frame(
+        world_model,
+        start_frame,
+        device=device,
+        img_size=img_size,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+    )
+    goal_emb = nominal_planner.encode_single_frame(
+        world_model,
+        goal_frame,
+        device=device,
+        img_size=img_size,
+        pixel_mean=pixel_mean,
+        pixel_std=pixel_std,
+    )
+    goal_state_np = nominal_planner.make_markov_state(goal_emb).detach().cpu().numpy().astype(np.float64)
+    goal_obs = nominal_planner.build_goal_observation(env, goal_qpos=goal_qpos, goal_qvel=zero_qvel, obs_dim=int(obs_np.shape[1]))
+
+    nominal_planner.save_rgb_image(out_dir / "start_image.png", start_frame)
+    nominal_planner.save_rgb_image(out_dir / "goal_image.png", goal_frame)
+
     current_frame = nominal_planner.reset_env_to_state(
         env,
         seed=episode_seed,
-        qpos=qpos_np[start_idx],
-        qvel=qvel_np[start_idx],
+        qpos=start_qpos,
+        qvel=zero_qvel,
         height=height,
         width=width,
     )
@@ -632,7 +683,7 @@ def main() -> None:
         line_search_min_alpha=args.line_search_min_alpha,
         merit_obstacle_weight=args.merit_obstacle_weight,
         nonlinear_obstacle_tol=args.nonlinear_obstacle_tol,
-        obstacle_margin_logit=args.obstacle_margin_logit,
+        obstacle_margin_score=args.obstacle_margin_score,
         device=device,
     )
 
@@ -648,23 +699,23 @@ def main() -> None:
     current_obs = nominal_planner.build_observation_from_env(env, obs_dim=int(goal_obs.shape[0]), goal_obs=goal_obs)
 
     rollout_frames = [current_frame.copy()]
-    rollout_qpos = [np.asarray(env._env.physics.data.qpos[: qpos_np.shape[1]], dtype=np.float32).copy()]
-    rollout_qvel = [np.asarray(env._env.physics.data.qvel[: qvel_np.shape[1]], dtype=np.float32).copy()]
+    rollout_qpos = [np.asarray(env._env.physics.data.qpos[: start_qpos.shape[0]], dtype=np.float32).copy()]
+    rollout_qvel = [np.asarray(env._env.physics.data.qvel[: zero_qvel.shape[0]], dtype=np.float32).copy()]
     rollout_emb = [current_emb.detach().cpu().numpy().astype(np.float32)]
     rollout_states = [current_state.detach().cpu().numpy().astype(np.float32)]
     executed_actions_raw: list[np.ndarray] = []
     executed_actions_norm: list[np.ndarray] = []
     latent_goal_distances = [float(torch.linalg.vector_norm(current_state - torch.as_tensor(goal_state_np, device=device)).item())]
-    embedding_goal = torch.as_tensor(np.asarray(planner_data["goal_embedding"], dtype=np.float32), device=device)
+    embedding_goal = goal_emb.detach()
     embedding_goal_distances = [float(torch.linalg.vector_norm(current_emb - embedding_goal).item())]
     observation_goal_distances = [nominal_planner.compute_observation_goal_distance(current_obs, goal_obs)]
     solve_times_ms: list[float] = []
     sqp_iterations: list[int] = []
     sqp_costs: list[float] = []
     sqp_merits: list[float] = []
-    predicted_obstacle_max_logits: list[float] = []
+    predicted_obstacle_max_scores: list[float] = []
     predicted_obstacle_violations: list[float] = []
-    executed_obstacle_logits = [float(obstacle_model.logits(current_emb).item())]
+    executed_obstacle_scores = [float(obstacle_model.scores(current_emb).item())]
     qp_successes: list[bool] = []
     feasible_solves: list[bool] = []
     qp_infos: list[dict[str, Any]] = []
@@ -684,7 +735,7 @@ def main() -> None:
         sqp_iterations.append(int(solve_payload["iterations"]))
         sqp_costs.append(float(solve_payload["cost"]))
         sqp_merits.append(float(solve_payload["merit"]))
-        predicted_obstacle_max_logits.append(float(solve_payload["max_logit"]))
+        predicted_obstacle_max_scores.append(float(solve_payload["max_score"]))
         predicted_obstacle_violations.append(float(solve_payload["obstacle_violation"]))
         qp_successes.append(bool(solve_payload["qp_success"]))
         feasible_solves.append(bool(solve_payload["feasible"]))
@@ -714,24 +765,24 @@ def main() -> None:
         current_emb = next_emb
 
         rollout_frames.append(current_frame.copy())
-        rollout_qpos.append(np.asarray(env._env.physics.data.qpos[: qpos_np.shape[1]], dtype=np.float32).copy())
-        rollout_qvel.append(np.asarray(env._env.physics.data.qvel[: qvel_np.shape[1]], dtype=np.float32).copy())
+        rollout_qpos.append(np.asarray(env._env.physics.data.qpos[: start_qpos.shape[0]], dtype=np.float32).copy())
+        rollout_qvel.append(np.asarray(env._env.physics.data.qvel[: zero_qvel.shape[0]], dtype=np.float32).copy())
         rollout_emb.append(current_emb.detach().cpu().numpy().astype(np.float32))
         rollout_states.append(current_state.detach().cpu().numpy().astype(np.float32))
 
         latent_goal_distance = float(torch.linalg.vector_norm(current_state - torch.as_tensor(goal_state_np, device=device)).item())
         embedding_goal_distance = float(torch.linalg.vector_norm(current_emb - embedding_goal).item())
         obs_goal_distance = nominal_planner.compute_observation_goal_distance(current_obs, goal_obs)
-        executed_logit = float(obstacle_model.logits(current_emb).item())
+        executed_score = float(obstacle_model.scores(current_emb).item())
         latent_goal_distances.append(latent_goal_distance)
         embedding_goal_distances.append(embedding_goal_distance)
         observation_goal_distances.append(obs_goal_distance)
-        executed_obstacle_logits.append(executed_logit)
+        executed_obstacle_scores.append(executed_score)
 
         pbar.set_postfix(
             solve_ms=f"{solve_times_ms[-1]:.1f}",
             sqp_it=f"{sqp_iterations[-1]}",
-            obs_logit=f"{executed_logit:.2f}",
+            obs_score=f"{executed_score:.2f}",
             obs_goal=f"{obs_goal_distance:.3f}",
         )
 
@@ -748,14 +799,14 @@ def main() -> None:
     env.close()
 
     summary = {
-        "rollout_dir": str(rollout_dir),
-        "nominal_rollout_path": str(nominal_path),
+        "out_dir": str(out_dir),
         "obstacle_cache_dir": str(obstacle_cache_dir),
         "obstacle_model_path": str(obstacle_model_path),
         "checkpoint_path": str(checkpoint_path),
-        "episode_idx": int(metadata["episode_idx"]),
-        "start_idx": start_idx,
-        "goal_idx": goal_idx,
+        "dataset_path": str(dataset_path),
+        "episode_idx": int(args.episode_idx),
+        "start_qpos": start_qpos.tolist(),
+        "goal_qpos": goal_qpos.tolist(),
         "stop_reason": stop_reason,
         "num_steps_executed": int(len(executed_actions_raw)),
         "planner": {
@@ -772,21 +823,21 @@ def main() -> None:
             "line_search_min_alpha": float(args.line_search_min_alpha),
             "merit_obstacle_weight": float(args.merit_obstacle_weight),
             "nonlinear_obstacle_tol": float(args.nonlinear_obstacle_tol),
-            "obstacle_margin_logit": float(args.obstacle_margin_logit),
+            "obstacle_margin_score": float(args.obstacle_margin_score),
             "force_unconstrained_fallback": bool(args.force_unconstrained_fallback),
         },
         "obstacle_thresholds": {
-            "prob_threshold": float(obstacle_model.threshold_prob),
-            "logit_threshold": float(obstacle_model.threshold_logit),
-            "logit_limit": float(mpc_solver.obstacle_logit_limit),
+            "base_decision_threshold": float(obstacle_model.base_decision_threshold),
+            "safe_score_threshold": float(obstacle_model.safe_score_threshold),
+            "score_limit": float(mpc_solver.obstacle_score_limit),
         },
         "solve_times_ms": solve_times_ms,
         "sqp_iterations": sqp_iterations,
         "sqp_costs": sqp_costs,
         "sqp_merits": sqp_merits,
-        "predicted_obstacle_max_logits": predicted_obstacle_max_logits,
+        "predicted_obstacle_max_scores": predicted_obstacle_max_scores,
         "predicted_obstacle_violations": predicted_obstacle_violations,
-        "executed_obstacle_logits": executed_obstacle_logits,
+        "executed_obstacle_scores": executed_obstacle_scores,
         "qp_successes": qp_successes,
         "feasible_solves": feasible_solves,
         "qp_infos": qp_infos,
@@ -803,8 +854,10 @@ def main() -> None:
         "final_obs": final_obs.tolist(),
         "nominal_reference": {
             "obstacle_center_qpos": obstacle_summary.get("obstacle_center_qpos"),
-            "obstacle_step": cache_config.get("obstacle_step"),
             "joint_ranges": obstacle_summary.get("joint_ranges"),
+            "circle_center_xy": obstacle_planner_data.get("circle_center_xy").tolist()
+            if isinstance(obstacle_planner_data.get("circle_center_xy"), np.ndarray)
+            else obstacle_planner_data.get("circle_center_xy"),
         },
         "video_path": video_path,
     }

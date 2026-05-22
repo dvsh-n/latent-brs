@@ -24,13 +24,12 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from reacher.plan import obstacle_net_train as obstacle_v1
 from reacher.plan import plan_ilqr_mpc as planner
 
-DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
+DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_noisy.h5"
 DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_4"
 DEFAULT_OBSTACLE_DIR = "reacher/plan/circle_obstacle_sampling"
 DEFAULT_OBSTACLE_PAYLOAD_NAME = "planner_start_goal_obstacle.pt"
@@ -42,7 +41,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=Path(DEFAULT_MODEL_DIR))
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
     parser.add_argument("--background-dataset-path", type=Path, default=None)
     parser.add_argument("--obstacle-dir", type=Path, default=Path(DEFAULT_OBSTACLE_DIR))
     parser.add_argument("--obstacle-payload-name", type=str, default=DEFAULT_OBSTACLE_PAYLOAD_NAME)
@@ -64,8 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--label-smoothing", type=float, default=0.0)
-    parser.add_argument("--delta", type=float, default=0.05)
+    parser.add_argument("--margin", type=float, default=1.0)
+    parser.add_argument("--delta", type=float, default=0.01)
     parser.add_argument("--calibration-frac", type=float, default=0.15)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
@@ -89,7 +87,6 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
 class ObstacleCacheConfigV2:
     model_dir: str
     checkpoint_path: str
-    dataset_path: str
     background_dataset_path: str
     obstacle_payload_path: str
     obstacle_summary_path: str
@@ -108,7 +105,7 @@ class ObstacleCacheConfigV2:
     batch_size: int
     lr: float
     weight_decay: float
-    label_smoothing: float
+    margin: float
     delta: float
     calibration_frac: float
     val_frac: float
@@ -162,16 +159,77 @@ def infer_joint_ranges(
     return np.maximum(inferred * float(range_scale), float(range_min)).astype(np.float64)
 
 
-def threshold_metrics(eval_payload: dict[str, Any], labels: np.ndarray, threshold: float) -> dict[str, float]:
-    probs = np.asarray(eval_payload["probs"], dtype=np.float64)
-    preds = probs >= threshold
-    pos_mask = labels > 0.5
+def hinge_loss(scores: torch.Tensor, labels: torch.Tensor, *, margin: float) -> torch.Tensor:
+    return torch.clamp(float(margin) - labels * scores, min=0.0).mean()
+
+
+def compute_signed_metrics(scores: torch.Tensor, labels: torch.Tensor, *, threshold: float = 0.0) -> dict[str, float]:
+    preds_obstacle = scores <= float(threshold)
+    labels_obstacle = labels < 0.0
+    accuracy = float((preds_obstacle == labels_obstacle).float().mean().item())
+    pos_mask = labels_obstacle
     neg_mask = ~pos_mask
-    coverage_pos = float(np.mean(preds[pos_mask])) if np.any(pos_mask) else 0.0
-    false_positive_rate = float(np.mean(preds[neg_mask])) if np.any(neg_mask) else 0.0
+    recall = float(preds_obstacle[pos_mask].float().mean().item()) if torch.any(pos_mask) else 0.0
+    specificity = float((~preds_obstacle[neg_mask]).float().mean().item()) if torch.any(neg_mask) else 0.0
+    tp = float(torch.sum(preds_obstacle & pos_mask).item())
+    fp = float(torch.sum(preds_obstacle & neg_mask).item())
+    precision = tp / max(tp + fp, 1.0)
     return {
-        "obstacle_coverage": coverage_pos,
-        "outside_activation_rate": false_positive_rate,
+        "accuracy": accuracy,
+        "recall": recall,
+        "specificity": specificity,
+        "precision": precision,
+    }
+
+
+def evaluate_signed_model(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    batch_size: int,
+    device: torch.device,
+    margin: float,
+) -> dict[str, Any]:
+    model.eval()
+    score_chunks: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, x.shape[0], batch_size):
+            xb = x[start : start + batch_size].to(device)
+            score_chunks.append(model(xb).cpu())
+    scores = torch.cat(score_chunks, dim=0)
+    loss = float(hinge_loss(scores, y, margin=margin).item())
+    metrics = compute_signed_metrics(scores, y, threshold=0.0)
+    return {
+        "loss": loss,
+        "scores": scores.numpy().astype(np.float32),
+        **metrics,
+    }
+
+
+def compute_conformal_score_threshold(obstacle_nonconformity_cal: np.ndarray, delta: float) -> dict[str, float]:
+    if obstacle_nonconformity_cal.ndim != 1:
+        raise ValueError(f"Expected 1D obstacle calibration nonconformity scores, got shape {obstacle_nonconformity_cal.shape}.")
+    if obstacle_nonconformity_cal.size == 0:
+        raise ValueError("Need at least one obstacle calibration sample for conformal calibration.")
+    threshold = obstacle_v1.conformal_quantile(obstacle_nonconformity_cal.astype(np.float64), delta=delta)
+    return {
+        "threshold": float(threshold),
+        "score_quantile": float(threshold),
+        "num_obstacle_calibration": int(obstacle_nonconformity_cal.size),
+    }
+
+
+def score_threshold_metrics(eval_payload: dict[str, Any], labels: np.ndarray, threshold: float) -> dict[str, float]:
+    scores = np.asarray(eval_payload["scores"], dtype=np.float64)
+    preds_obstacle = scores <= threshold
+    pos_mask = labels < 0.0
+    neg_mask = ~pos_mask
+    obstacle_coverage = float(np.mean(preds_obstacle[pos_mask])) if np.any(pos_mask) else 0.0
+    outside_activation_rate = float(np.mean(preds_obstacle[neg_mask])) if np.any(neg_mask) else 0.0
+    return {
+        "obstacle_coverage": obstacle_coverage,
+        "outside_activation_rate": outside_activation_rate,
         "threshold": float(threshold),
     }
 
@@ -183,7 +241,6 @@ def main() -> None:
 
     device = planner.require_device(args.device)
     model_dir = args.model_dir.expanduser().resolve()
-    dataset_path = args.dataset_path.expanduser().resolve()
     obstacle_dir = args.obstacle_dir.expanduser().resolve()
     obstacle_payload_path = (obstacle_dir / args.obstacle_payload_name).resolve()
     obstacle_summary_path = (obstacle_dir / args.obstacle_summary_name).resolve()
@@ -197,7 +254,8 @@ def main() -> None:
         else planner.latest_object_checkpoint(model_dir).resolve()
     )
     world_model = planner.load_model(checkpoint_path, device)
-    background_dataset_path = obstacle_v1.choose_background_dataset_path(args, config, dataset_path)
+    default_background_dataset_path = Path(DEFAULT_TEST_DATASET_PATH).expanduser().resolve()
+    background_dataset_path = obstacle_v1.choose_background_dataset_path(args, config, default_background_dataset_path)
     obstacle_payload = load_circle_obstacle_payload(obstacle_payload_path)
     obstacle_summary = load_circle_obstacle_summary(obstacle_summary_path)
 
@@ -225,7 +283,6 @@ def main() -> None:
     cache_config = ObstacleCacheConfigV2(
         model_dir=str(model_dir),
         checkpoint_path=str(checkpoint_path),
-        dataset_path=str(dataset_path),
         background_dataset_path=str(background_dataset_path),
         obstacle_payload_path=str(obstacle_payload_path),
         obstacle_summary_path=str(obstacle_summary_path),
@@ -244,7 +301,7 @@ def main() -> None:
         batch_size=int(args.batch_size),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
-        label_smoothing=float(args.label_smoothing),
+        margin=float(args.margin),
         delta=float(args.delta),
         calibration_frac=float(args.calibration_frac),
         val_frac=float(args.val_frac),
@@ -283,7 +340,6 @@ def main() -> None:
         physics_freq_hz=float(metadata["physics_freq_hz"]),
     )
     lower, upper = obstacle_v1.joint_limits_from_env(env)
-    nominal_position = center_qpos.astype(np.float32, copy=False)
     nominal_frame = planner.reset_env_to_state(
         env,
         seed=int(metadata["episode_seed"]),
@@ -370,16 +426,16 @@ def main() -> None:
 
     x_obstacle = obstacle_latents.astype(np.float32)
     x_outside = np.concatenate((outside_latents, background_latents), axis=0).astype(np.float32)
-    y_obstacle = np.ones((x_obstacle.shape[0],), dtype=np.float32)
-    y_outside = np.zeros((x_outside.shape[0],), dtype=np.float32)
+    y_obstacle = -np.ones((x_obstacle.shape[0],), dtype=np.float32)
+    y_outside = np.ones((x_outside.shape[0],), dtype=np.float32)
     x_all = np.concatenate((x_obstacle, x_outside), axis=0).astype(np.float32)
-    y_all = np.concatenate((y_obstacle, y_outside), axis=0).astype(np.float32)
+    y_all_signed = np.concatenate((y_obstacle, y_outside), axis=0).astype(np.float32)
 
     x_tensor = torch.from_numpy(x_all)
-    y_tensor = torch.from_numpy(y_all)
+    y_tensor = torch.from_numpy(y_all_signed)
     full_dataset = TensorDataset(x_tensor, y_tensor)
     split_indices = obstacle_v1.stratified_split_indices(
-        y_all,
+        (y_all_signed < 0.0).astype(np.float32),
         cal_frac=float(args.calibration_frac),
         val_frac=float(args.val_frac),
         test_frac=float(args.test_frac),
@@ -389,7 +445,7 @@ def main() -> None:
     cal_idx = split_indices["cal"]
     val_idx = split_indices["val"]
     test_idx = split_indices["test"]
-    if not np.any(y_all[cal_idx] > 0.5):
+    if not np.any(y_all_signed[cal_idx] < 0.0):
         raise RuntimeError("Calibration split contains no obstacle samples; increase sample counts or adjust split fractions.")
 
     train_x = x_tensor[train_idx]
@@ -415,14 +471,6 @@ def main() -> None:
 
     model = obstacle_v1.ObstacleMLP(embed_dim, int(args.hidden_dim), int(args.depth), float(args.dropout)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
-
-    train_labels = y_all[train_idx].astype(np.int64, copy=False)
-    class_counts = np.bincount(train_labels, minlength=2)
-    pos_weight = torch.tensor(
-        float(class_counts[0] / max(class_counts[1], 1)),
-        dtype=torch.float32,
-        device=device,
-    )
     best_state = None
     best_val_loss = math.inf
     train_start = time.perf_counter()
@@ -435,22 +483,19 @@ def main() -> None:
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
-            logits = model(xb)
-            if args.label_smoothing > 0.0:
-                yb_loss = yb * (1.0 - args.label_smoothing) + 0.5 * args.label_smoothing
-            else:
-                yb_loss = yb
-            loss = F.binary_cross_entropy_with_logits(logits, yb_loss, pos_weight=pos_weight)
+            scores = model(xb)
+            loss = hinge_loss(scores, yb, margin=float(args.margin))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
-        val_eval = obstacle_v1.evaluate_model(
+        val_eval = evaluate_signed_model(
             model,
             normalized[val_idx],
             y_tensor[val_idx],
             batch_size=int(args.batch_size),
             device=device,
+            margin=float(args.margin),
         )
         if val_eval["loss"] < best_val_loss:
             best_val_loss = val_eval["loss"]
@@ -461,45 +506,50 @@ def main() -> None:
     model.load_state_dict(best_state)
     train_seconds = time.perf_counter() - train_start
 
-    train_eval = obstacle_v1.evaluate_model(
+    train_eval = evaluate_signed_model(
         model,
         normalized[train_idx],
         y_tensor[train_idx],
         batch_size=int(args.batch_size),
         device=device,
+        margin=float(args.margin),
     )
-    cal_eval = obstacle_v1.evaluate_model(
+    cal_eval = evaluate_signed_model(
         model,
         normalized[cal_idx],
         y_tensor[cal_idx],
         batch_size=int(args.batch_size),
         device=device,
+        margin=float(args.margin),
     )
-    val_eval = obstacle_v1.evaluate_model(
+    val_eval = evaluate_signed_model(
         model,
         normalized[val_idx],
         y_tensor[val_idx],
         batch_size=int(args.batch_size),
         device=device,
+        margin=float(args.margin),
     )
-    test_eval = obstacle_v1.evaluate_model(
+    test_eval = evaluate_signed_model(
         model,
         normalized[test_idx],
         y_tensor[test_idx],
         batch_size=int(args.batch_size),
         device=device,
+        margin=float(args.margin),
     )
 
-    cal_labels = y_all[cal_idx]
-    cal_probs = np.asarray(cal_eval["probs"], dtype=np.float64)
-    cal_obstacle_probs = cal_probs[cal_labels > 0.5]
-    conformal = obstacle_v1.compute_conformal_threshold(cal_obstacle_probs, float(args.delta))
-    tau = float(conformal["threshold"])
+    cal_labels = y_all_signed[cal_idx]
+    cal_scores = np.asarray(cal_eval["scores"], dtype=np.float64)
+    cal_obstacle_scores = cal_scores[cal_labels < 0.0]
+    cal_obstacle_nonconformity = np.maximum(cal_obstacle_scores, 0.0)
+    conformal = compute_conformal_score_threshold(cal_obstacle_nonconformity, float(args.delta))
+    safe_score_threshold = float(conformal["threshold"])
 
-    train_cp = threshold_metrics(train_eval, y_all[train_idx], tau)
-    cal_cp = threshold_metrics(cal_eval, cal_labels, tau)
-    val_cp = threshold_metrics(val_eval, y_all[val_idx], tau)
-    test_cp = threshold_metrics(test_eval, y_all[test_idx], tau)
+    train_cp = score_threshold_metrics(train_eval, y_all_signed[train_idx], safe_score_threshold)
+    cal_cp = score_threshold_metrics(cal_eval, cal_labels, safe_score_threshold)
+    val_cp = score_threshold_metrics(val_eval, y_all_signed[val_idx], safe_score_threshold)
+    test_cp = score_threshold_metrics(test_eval, y_all_signed[test_idx], safe_score_threshold)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     log_progress("Saving obstacle overlay image with nominal state emphasized.")
@@ -520,8 +570,14 @@ def main() -> None:
             "feature_mean": train_mean.numpy().astype(np.float32),
             "feature_std": train_std.numpy().astype(np.float32),
             "nominal_position": nominal_latent.astype(np.float32),
-            "conformal_threshold": float(tau),
+            "score_sign_convention": {
+                "obstacle": "negative",
+                "non_obstacle": "positive",
+            },
+            "base_decision_threshold": 0.0,
+            "conformal_safe_score_threshold": float(safe_score_threshold),
             "conformal_delta": float(args.delta),
+            "conformal_nonconformity_definition": "max(0, NN(x)) on obstacle calibration samples",
             "conformal_score_quantile": float(conformal["score_quantile"]),
             "cache_config": asdict(cache_config),
         },
@@ -530,7 +586,7 @@ def main() -> None:
     torch.save(
         {
             "x_all": x_all.astype(np.float32),
-            "y_all": y_all.astype(np.float32),
+            "y_all_signed": y_all_signed.astype(np.float32),
             "indices": {
                 "train": train_idx,
                 "cal": cal_idx,
@@ -544,8 +600,10 @@ def main() -> None:
                 "test": test_eval,
             },
             "conformal": {
-                "threshold": float(tau),
+                "base_decision_threshold": 0.0,
+                "safe_score_threshold": float(safe_score_threshold),
                 "delta": float(args.delta),
+                "nonconformity_definition": "max(0, NN(x)) on obstacle calibration samples",
                 "score_quantile": float(conformal["score_quantile"]),
                 "num_obstacle_calibration": int(conformal["num_obstacle_calibration"]),
                 "metrics": {
@@ -590,14 +648,16 @@ def main() -> None:
             "test": int(len(test_ds)),
         },
         "metrics": {
-            "train": {k: float(v) for k, v in train_eval.items() if k not in {"logits", "probs"}},
-            "cal": {k: float(v) for k, v in cal_eval.items() if k not in {"logits", "probs"}},
-            "val": {k: float(v) for k, v in val_eval.items() if k not in {"logits", "probs"}},
-            "test": {k: float(v) for k, v in test_eval.items() if k not in {"logits", "probs"}},
+            "train": {k: float(v) for k, v in train_eval.items() if k not in {"scores"}},
+            "cal": {k: float(v) for k, v in cal_eval.items() if k not in {"scores"}},
+            "val": {k: float(v) for k, v in val_eval.items() if k not in {"scores"}},
+            "test": {k: float(v) for k, v in test_eval.items() if k not in {"scores"}},
         },
         "conformal": {
-            "threshold": float(tau),
+            "base_decision_threshold": 0.0,
+            "safe_score_threshold": float(safe_score_threshold),
             "delta": float(args.delta),
+            "nonconformity_definition": "max(0, NN(x)) on obstacle calibration samples",
             "score_quantile": float(conformal["score_quantile"]),
             "num_obstacle_calibration": int(conformal["num_obstacle_calibration"]),
             "metrics": {
@@ -606,6 +666,10 @@ def main() -> None:
                 "val": val_cp,
                 "test": test_cp,
             },
+        },
+        "score_sign_convention": {
+            "obstacle": "negative",
+            "non_obstacle": "positive",
         },
         "obstacle_center_qpos": center_qpos.tolist(),
         "joint_ranges": obstacle_ranges.tolist(),
@@ -618,6 +682,8 @@ def main() -> None:
     print(f"Model path: {model_path}")
     print(f"Val acc:    {val_eval['accuracy']:.4f}")
     print(f"Test acc:   {test_eval['accuracy']:.4f}")
+    print("Conformal nonconformity: max(0, NN(x)) on obstacle calibration samples")
+    print(f"Applied safe score threshold: {safe_score_threshold:.6f}")
 
 
 if __name__ == "__main__":

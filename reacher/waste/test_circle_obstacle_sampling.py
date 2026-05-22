@@ -32,10 +32,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--sample-count", type=int, default=256)
+    parser.add_argument("--sample-count", type=int, default=2048)
     parser.add_argument("--bend-sign", type=int, choices=(-1, 1), default=-1)
-    parser.add_argument("--circle-center-x", type=float, default=0.12)
-    parser.add_argument("--circle-center-y", type=float, default=0.12)
+    parser.add_argument("--circle-center-x", type=float, default=0.135)
+    parser.add_argument("--circle-center-y", type=float, default=0.135)
     parser.add_argument("--circle-radius", type=float, default=0.035)
     parser.add_argument("--outside-count", type=int, default=2)
     parser.add_argument("--outside-margin", type=float, default=0.02)
@@ -195,19 +195,20 @@ def sample_points_outside_circle(
     accepted: list[np.ndarray] = []
     tries = 0
     while len(accepted) < count and tries < max_tries:
-        tries += 1
-        theta = float(rng.uniform(0.0, 2.0 * math.pi))
-        radial = math.sqrt(rng.uniform(min_radius * min_radius, max_radius * max_radius))
-        candidate = center_xy + radial * np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)
-        candidate_local = candidate - base_xy
-        candidate_norm = float(np.linalg.norm(candidate_local))
-        if candidate_norm < reach_min + 1e-4 or candidate_norm > reach_max - 1e-4:
-            continue
-        accepted.append(candidate)
+        remaining = count - len(accepted)
+        batch_size = min(max(remaining * 2, 64), max_tries - tries)
+        theta = rng.uniform(0.0, 2.0 * math.pi, size=batch_size)
+        radial = np.sqrt(rng.uniform(min_radius * min_radius, max_radius * max_radius, size=batch_size))
+        offsets = np.stack((radial * np.cos(theta), radial * np.sin(theta)), axis=1)
+        candidates = center_xy[None, :] + offsets
+        candidate_norms = np.linalg.norm(candidates - base_xy[None, :], axis=1)
+        valid_mask = (candidate_norms >= reach_min + 1e-4) & (candidate_norms <= reach_max - 1e-4)
+        accepted.extend(candidates[valid_mask])
+        tries += batch_size
 
     if len(accepted) < count:
         raise RuntimeError(f"Failed to sample {count} outside-circle points after {tries} tries.")
-    return np.stack(accepted, axis=0)
+    return np.stack(accepted[:count], axis=0)
 
 
 def solve_two_link_ik(
