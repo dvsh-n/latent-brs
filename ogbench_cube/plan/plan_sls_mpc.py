@@ -18,6 +18,7 @@ import h5py
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import mujoco
 from tqdm.auto import tqdm
 import pyrallis
 
@@ -35,6 +36,7 @@ from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 
 # OGBench environment & data tracking utilities
 import ogbench.manipspace  # noqa: F401
+from ogbench.manipspace import lie
 from ogbench_cube.data.ogbench_cube_data_gen import LocalCubePlanOracle
 from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, build_markov_state
 from error_model import MGNLLPredictor
@@ -59,6 +61,12 @@ class PlanSLSOGBenchConfig:
     grasp_alignment_threshold: float = 0.03
 
 # --- Helper Utilities ---
+
+def hide_target_cube(env) -> None:
+    """Zeroes out the alpha transparency channel for the target block visual geoms."""
+    for geom_ids in env.unwrapped._cube_target_geom_ids_list:
+        for gid in geom_ids:
+            env.unwrapped._model.geom(gid).rgba[3] = 0.0
 
 def make_control_box_constraints(u_min, u_max):
     u_min, u_max = jnp.asarray(u_min), jnp.asarray(u_max)
@@ -87,18 +95,34 @@ def cube_is_grasped(info, contact_thresh, align_thresh) -> bool:
     return bool(gripper_contact >= contact_thresh and block_alignment <= align_thresh)
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
-    pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
-    candidates = [(int(m.group(1)), p) for p in model_dir.glob("*_epoch_*_object.ckpt") for m in [pattern.match(p.name)] if m]
+    pattern = re.compile(r".*_epoch[_=](\d+).*\.ckpt$")
+    candidates = [(int(m.group(1)), p) for p in model_dir.glob("*.ckpt") for m in [pattern.match(p.name)] if m]
     if not candidates: raise FileNotFoundError(f"No object checkpoints found in {model_dir}")
     return max(candidates, key=lambda item: item[0])[1]
 
 @torch.no_grad()
 def encode_single_frame(model: torch.nn.Module, pixel_np: np.ndarray, device: torch.device, img_size: int, pixel_mean: torch.Tensor, pixel_std: torch.Tensor) -> torch.Tensor:
-    tensor = torch.from_numpy(pixel_np.copy()).unsqueeze(0).permute(0, 3, 1, 2).float().div_(255.0)
+    # FIX: Pushed tensor to device immediately before normalization arithmetic
+    tensor = torch.from_numpy(pixel_np.copy()).unsqueeze(0).permute(0, 3, 1, 2).float().div_(255.0).to(device)
     if tuple(tensor.shape[-2:]) != (img_size, img_size):
         tensor = torch.nn.functional.interpolate(tensor, size=(img_size, img_size), mode="bilinear", align_corners=False)
     tensor = (tensor - pixel_mean) / pixel_std
-    return model.projector(model.encoder(tensor.to(device), interpolate_pos_encoding=True).last_hidden_state[:, 0])[0]
+    return model.projector(model.encoder(tensor, interpolate_pos_encoding=True).last_hidden_state[:, 0])[0]
+
+@torch.no_grad()
+def encode_frames(model: torch.nn.Module, pixels_np: np.ndarray, device: torch.device, img_size: int, pixel_mean: torch.Tensor, pixel_std: torch.Tensor) -> torch.Tensor:
+    # FIX: Pushed tensor to device immediately before normalization arithmetic
+    tensor = torch.from_numpy(pixels_np.copy()).permute(0, 3, 1, 2).float().div_(255.0).to(device)
+    if tuple(tensor.shape[-2:]) != (img_size, img_size):
+        tensor = torch.nn.functional.interpolate(tensor, size=(img_size, img_size), mode="bilinear", align_corners=False)
+    tensor = (tensor - pixel_mean) / pixel_std
+    
+    latents = []
+    for start in range(0, tensor.shape[0], 32):
+        chunk = tensor[start : start + 32]
+        output = model.encoder(chunk, interpolate_pos_encoding=True)
+        latents.append(model.projector(output.last_hidden_state[:, 0]))
+    return torch.cat(latents, dim=0)
 
 # --- JAX Black-box Wrappers ---
 
@@ -168,29 +192,46 @@ def main():
 
     train_stats = LeWMOGBenchCubeDataset(str(cfg.dataset_path), markov_deriv=1, num_preds=1, frameskip=1, img_size=img_size, action_dim=action_dim)
     action_mean, action_std = train_stats.action_mean.astype(np.float32), train_stats.action_std.astype(np.float32)
-    pixel_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    pixel_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    pixel_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+    pixel_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
 
     with h5py.File(cfg.dataset_path, "r") as h5:
         episode_idx = cfg.episode_idx if cfg.episode_idx is not None else int(np.random.choice(np.flatnonzero(h5["ep_len"][:] >= 2)))
         rows = np.arange(int(h5["ep_offset"][episode_idx]), int(h5["ep_offset"][episode_idx]) + int(h5["ep_len"][episode_idx]))
         qpos_init, qvel_init = h5["qpos"][rows[0]], h5["qvel"][rows[0]]
         qpos_goal, qvel_goal = h5["qpos"][rows[-1]], h5["qvel"][rows[-1]]
-        tgt_pos, tgt_yaw = h5["target_block_pos"][rows[0]], h5["target_block_yaw"][rows[0]]
+        
+        target_pos_goal = np.asarray(h5["target_block_pos"][rows[-1]], dtype=np.float32)
+        target_yaw_goal = float(np.asarray(h5["target_block_yaw"][rows[-1]]).reshape(-1)[0])
 
     env = gymnasium.make("cube-single-v0", terminate_at_goal=False, mode="data_collection", width=config_dict.get("width", 256), height=config_dict.get("height", 256))
     oracle = LocalCubePlanOracle(env=env, segment_dt=0.4, noise=0.0, noise_smoothing=0.5)
 
-    # Resolve Goals
+    # --- Fetch goal image sequence & propagate physics before capturing frame ---
     env.reset(seed=cfg.seed)
+    hide_target_cube(env)
+    
+    # Sync target body orientations before evaluating visual render boundaries
+    env.unwrapped._target_block = 0
+    target_mocap_id = env.unwrapped._cube_target_mocap_ids[0]
+    env.unwrapped._data.mocap_pos[target_mocap_id] = np.asarray(target_pos_goal, dtype=np.float64)
+    env.unwrapped._data.mocap_quat[target_mocap_id] = np.asarray(lie.SO3.from_z_radians(float(target_yaw_goal)).wxyz, dtype=np.float64)
+    
     env.unwrapped._data.qpos[:qpos_goal.shape[0]] = qpos_goal.astype(np.float64)
     env.unwrapped._data.qvel[:qvel_goal.shape[0]] = qvel_goal.astype(np.float64)
+    env.unwrapped.pre_step()
+    mujoco.mj_forward(env.unwrapped._model, env.unwrapped._data)  # Force visual state sync
+    env.unwrapped.post_step()
     goal_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)
 
-    # Initial Reset
+    # --- Fetch initial image sequence & propagate physics before capturing frame ---
     env.reset(seed=cfg.seed)
+    hide_target_cube(env)
     env.unwrapped._data.qpos[:qpos_init.shape[0]] = qpos_init.astype(np.float64)
     env.unwrapped._data.qvel[:qvel_init.shape[0]] = qvel_init.astype(np.float64)
+    env.unwrapped.pre_step()
+    mujoco.mj_forward(env.unwrapped._model, env.unwrapped._data)  # Force visual state sync
+    env.unwrapped.post_step()
     current_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)
     current_info = env.unwrapped.get_step_info()
 
@@ -200,6 +241,9 @@ def main():
     rollout_frames = [current_frame.copy()]
     oracle_pbar = tqdm(range(cfg.max_oracle_steps), desc="Oracle Reaching Phase")
     grasped = False
+
+    # Initialize geometry logic tracking bounds
+    oracle.reset(None, current_info)
 
     # --- Stage 1: Execute Oracle Tracking Loop until contact registers ---
     for _ in oracle_pbar:
@@ -218,16 +262,22 @@ def main():
 
     # --- Stage 2: Conformal SLS Latent Space Receding Horizon Loop ---
     print("\n[HANDOFF] Handoff conditions met. Initializing SLS Engine Core...")
-    W_stage = jnp.ones((state_dim,)).at[state_dim // 2:].set(1.0)
-    W_term = jnp.ones((state_dim,)).at[:state_dim // 2].set(4000.0)
-    cost = make_tracking_cost(0.01, cfg.horizon, W_term, jnp.asarray(goal_state))
+    # W_stage = jnp.ones((state_dim,)) * 100
+    # W_stage = W_stage.at[:state_dim // 2].set(1.0)
+    # W_term = jnp.ones((state_dim,))*0.1
+    # W_term = W_term.at[:state_dim // 2].set(100.0)
+    W_stage = jnp.ones((state_dim,)) * 0.005
+    # W_stage = W_stage.at[:state_dim // 2].set(1.0)
+    W_term = jnp.ones((state_dim,))*5.0
+    # W_term = W_term.at[:state_dim // 2].set(100.0)
+    cost = make_tracking_cost(0.1, cfg.horizon, W_term, jnp.asarray(goal_state))
 
     controller = GenericMPC(
         SLSConfig(max_sls_iterations=1, enable_fastsls=False, initialize_nominal=True, warm_start=False, rti=True),
         SQPConfig(max_sqp_iterations=1, warm_start=False, feas_tol=1e-2, step_tol=1e-4, line_search=False),
         ADMMConfig(eps_abs=1e-2, eps_rel=1e-4, rho_max=1e2, max_iterations=300, initial_rho=1.0),
         config=MPCConfig(n=state_dim, nu=action_dim, N=cfg.horizon, W=W_stage, u_ref=jnp.zeros(action_dim), dt=1.0/20.0),
-        dynamics=dynamics, constraints=combine_constraints(make_state_box_constraints(-100.0*jnp.ones(state_dim), 100.0*jnp.ones(state_dim)), make_control_box_constraints(-2.0*jnp.ones(action_dim), 2.0*jnp.ones(action_dim))),
+        dynamics=dynamics, constraints=combine_constraints(make_state_box_constraints(-100.0*jnp.ones(state_dim), 100.0*jnp.ones(state_dim)), make_control_box_constraints(-10.0*jnp.ones(action_dim), 10.0*jnp.ones(action_dim))),
         obstacles=jnp.zeros((0, 3)), cost=cost, num_constraints=2 * action_dim + 2 * state_dim, disturbance=disturbance, shift=1,
         X_in=jnp.zeros((cfg.horizon + 1, state_dim), dtype=jnp.float64), U_in=jnp.zeros((cfg.horizon, action_dim), dtype=jnp.float64)
     )
@@ -242,7 +292,9 @@ def main():
         try:
             u0, X_pred, U_pred, *solver_info = controller.run(x0=current_state, reference=X_ref, parameter=1.0/20.0)
             status = "sls_mpc"
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             u0, X_pred = None, None
             status = "exception"
 
@@ -253,7 +305,7 @@ def main():
             prev_u0 = np.asarray(u0, dtype=np.float32)
 
         # Map standardized control variables back to raw gym dimensions
-        u_raw = ((np.asarray(u0, dtype=np.float32) * action_std) + action_mean).astype(np.float32)
+        u_raw = ((np.asarray(u0, dtype=np.float32) * action_std.flatten()) + action_mean.flatten()).astype(np.float32)
         _, _, _, _, current_info = env.step(u_raw)
         
         current_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)

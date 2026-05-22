@@ -35,6 +35,7 @@ from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.mppi_planner import MPPIPlanner
 
 import ogbench.manipspace  # noqa: F401
+from ogbench.manipspace import lie
 from ogbench_cube.data.ogbench_cube_data_gen import LocalCubePlanOracle
 from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset
 from error_model import MGNLLPredictor
@@ -141,12 +142,34 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
     if not candidates: raise FileNotFoundError(f"No valid checkpoints found in {model_dir}")
     return max(candidates, key=lambda item: item[0])[1]
 
-def hide_target_cube(env) -> None:
-    """Zeroes out the alpha transparency channel for the target block visual geoms."""
-    for geom_ids in env.unwrapped._cube_target_geom_ids_list:
+# --- Target Cube Sync & Hiding Utilities ---
+def restore_target_pose(env: gymnasium.Env, target_block_pos: np.ndarray, target_block_yaw: float) -> None:
+    unwrapped = env.unwrapped
+    unwrapped._target_block = 0
+    target_mocap_id = unwrapped._cube_target_mocap_ids[0]
+    unwrapped._data.mocap_pos[target_mocap_id] = np.asarray(target_block_pos, dtype=np.float64)
+    unwrapped._data.mocap_quat[target_mocap_id] = np.asarray(
+        lie.SO3.from_z_radians(float(target_block_yaw)).wxyz,
+        dtype=np.float64,
+    )
+    for geom_ids in unwrapped._cube_target_geom_ids_list:
         for gid in geom_ids:
-            env.unwrapped._model.geom(gid).rgba[3] = 0.0
+            unwrapped._model.geom(gid).rgba[3] = 0.0
 
+def reset_env_to_state(env: gymnasium.Env, seed: int, qpos: np.ndarray, qvel: np.ndarray, target_block_pos: np.ndarray, target_block_yaw: float, camera: str) -> tuple[np.ndarray, dict]:
+    env.reset(seed=seed)
+    unwrapped = env.unwrapped
+    unwrapped._data.qpos[: qpos.shape[0]] = np.asarray(qpos, dtype=np.float64)
+    unwrapped._data.qvel[: qvel.shape[0]] = np.asarray(qvel, dtype=np.float64)
+    restore_target_pose(env, target_block_pos=target_block_pos, target_block_yaw=target_block_yaw)
+    unwrapped.pre_step()
+    mujoco.mj_forward(unwrapped._model, unwrapped._data)
+    unwrapped.post_step()
+    frame = np.asarray(unwrapped.render(camera=camera), dtype=np.uint8)
+    info = unwrapped.get_step_info()
+    return frame, info
+
+# --- Vision Frame Encoding Utilities ---
 @torch.no_grad()
 def encode_single_frame(model: torch.nn.Module, pixel_np: np.ndarray, device: torch.device, img_size: int, pixel_mean: torch.Tensor, pixel_std: torch.Tensor) -> torch.Tensor:
     tensor = torch.from_numpy(pixel_np.copy()).unsqueeze(0).permute(0, 3, 1, 2).float().div_(255.0)
@@ -194,32 +217,32 @@ def main():
     with h5py.File(cfg.dataset_path, "r") as h5:
         episode_idx = cfg.episode_idx if cfg.episode_idx is not None else int(np.random.choice(np.flatnonzero(h5["ep_len"][:] >= 2)))
         rows = np.arange(int(h5["ep_offset"][episode_idx]), int(h5["ep_offset"][episode_idx]) + int(h5["ep_len"][episode_idx]))
+        
         qpos_init, qpos_goal = h5["qpos"][rows[0]], h5["qpos"][rows[-1]]
         qvel_init, qvel_goal = h5["qvel"][rows[0]], h5["qvel"][rows[-1]]
+        
+        target_pos_init = np.asarray(h5["target_block_pos"][rows[0]], dtype=np.float32)
+        target_pos_goal = np.asarray(h5["target_block_pos"][rows[-1]], dtype=np.float32)
+        target_yaw_init = float(np.asarray(h5["target_block_yaw"][rows[0]]).reshape(-1)[0])
+        target_yaw_goal = float(np.asarray(h5["target_block_yaw"][rows[-1]]).reshape(-1)[0])
 
     env = gymnasium.make("cube-single-v0", terminate_at_goal=False, mode="data_collection", width=256, height=256)
     oracle = LocalCubePlanOracle(env=env, segment_dt=0.4, noise=0.0)
 
-    # --- 1. Fetch goal image sequence & propagate physics before capturing frame ---
-    env.reset(seed=cfg.seed)
-    hide_target_cube(env)
-    env.unwrapped._data.qpos[:qpos_goal.shape[0]] = qpos_goal.astype(np.float64)
-    env.unwrapped._data.qvel[:qvel_goal.shape[0]] = qvel_goal.astype(np.float64)
-    env.unwrapped.pre_step()
-    mujoco.mj_forward(env.unwrapped._model, env.unwrapped._data)  # Force visual state sync
-    env.unwrapped.post_step()
-    goal_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)
+    # Replaced manual resets with proper mocap coordinate wrappers
+    goal_frame, goal_info = reset_env_to_state(
+        env, seed=cfg.seed, 
+        qpos=qpos_goal, qvel=qvel_goal, 
+        target_block_pos=target_pos_goal, target_block_yaw=target_yaw_goal, 
+        camera="front_pixels"
+    )
 
-    # --- 2. Fetch initial image sequence & propagate physics before capturing frame ---
-    env.reset(seed=cfg.seed)
-    hide_target_cube(env)
-    env.unwrapped._data.qpos[:qpos_init.shape[0]] = qpos_init.astype(np.float64)
-    env.unwrapped._data.qvel[:qvel_init.shape[0]] = qvel_init.astype(np.float64)
-    env.unwrapped.pre_step()
-    mujoco.mj_forward(env.unwrapped._model, env.unwrapped._data)  # Force visual state sync
-    env.unwrapped.post_step()
-    current_frame = np.asarray(env.unwrapped.render(camera="front_pixels"), dtype=np.uint8)
-    current_info = env.unwrapped.get_step_info()
+    current_frame, current_info = reset_env_to_state(
+        env, seed=cfg.seed, 
+        qpos=qpos_init, qvel=qvel_init, 
+        target_block_pos=target_pos_init, target_block_yaw=target_yaw_init, 
+        camera="front_pixels"
+    )
 
     pixel_mean, pixel_std = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
     goal_emb = encode_single_frame(model, goal_frame, device, img_size, pixel_mean, pixel_std)
@@ -298,12 +321,9 @@ def main():
         X_ws = jnp.concatenate([jnp.asarray(current_state)[None, :], jnp.asarray(mppi_res["state_seq"])], axis=0)
         
         controller.X_in, controller.U_in = X_ws, jnp.asarray(mppi_res["act_seq"])
-        try:
-            u0, X_pred, U_pred, *_ = controller.run(x0=current_state, reference=X_ws, parameter=1.0/20.0)
-            status = "sls_refined"
-        except Exception:
-            u0, U_pred = mppi_res["act_seq"][0], mppi_res["act_seq"]
-            status = "fallback"
+
+        u0, X_pred, U_pred, *_ = controller.run(x0=current_state, reference=X_ws, parameter=1.0/20.0)
+        status = "sls_refined"
 
         prev_U = U_pred
         u_raw = ((np.asarray(u0, dtype=np.float32) * train_stats.action_std.flatten()) + train_stats.action_mean.flatten()).astype(np.float32)

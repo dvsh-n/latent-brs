@@ -5,8 +5,8 @@ error_model_ckpt: "ogbench_cube/models/err_pred_logs/cube_experiment_embed_8/ver
 dataset_path: "ogbench_cube/data/test_data/ogbench_cube_test.h5"
 out_dir: "ogbench_cube/plan/sls_mpc_conformal"
 device: "auto"
-horizon: 10
-max_mpc_steps: 400
+horizon: 15
+max_mpc_steps: 200
 video_fps: 50
 episode_idx: 1498 # 6588  # 6560 6534 6588# Use a number (e.g. 5) or null for random
 seed: 42
