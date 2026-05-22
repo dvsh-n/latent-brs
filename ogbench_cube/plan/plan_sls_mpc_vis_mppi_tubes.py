@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan in OGBench space using Conformal SLS MPC warmstarted by MPPI over an Equinox-wrapped world model."""
+"""Plan in OGBench space using non-RTI Conformal SLS MPC warmstarted by MPPI, with tube visualizations."""
 
 import os
 import sys
@@ -26,6 +26,9 @@ import torch
 import mujoco
 from tqdm.auto import tqdm
 import pyrallis
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
@@ -48,12 +51,12 @@ from error_model import MGNLLPredictor
 
 @dataclass
 class PlanSLSMoppiCubeConfig:
-    """Configuration for Warmstarted Conformal SLS MPC on OGBench Cubes"""
+    """Configuration for Warmstarted non-RTI Conformal SLS MPC tube visualization on OGBench Cubes"""
     q_learned: float = field(default=0.0)
     model_dir: Path = field(default=Path("ogbench_cube/models/mlpdyn"))
     error_model_ckpt: Path = field(default=Path("ogbench_cube/models/error_model/best-error-model.ckpt"))
     dataset_path: Path = field(default=Path("ogbench_cube/data/test_data/ogbench_cube_test.h5"))
-    out_dir: Path = field(default=Path("ogbench_cube/plan/sls_mppi_conformal"))
+    out_dir: Path = field(default=Path("ogbench_cube/plan/sls_mppi_conformal_tube_vis"))
     device: str = field(default="auto")
     horizon: int = field(default=16)
     max_mpc_steps: int = field(default=120)
@@ -63,6 +66,7 @@ class PlanSLSMoppiCubeConfig:
     seed: int = field(default=42)
     visualize_success_colors: bool = field(default=False)
     terminate_on_ogbench_success: bool = field(default=True)
+    vis_every: int = field(default=1)
     
     mppi_samples: int = 512
     mppi_update_iter: int = 5
@@ -146,6 +150,96 @@ def ogbench_success(info: dict) -> bool:
         return all(bool(value) for value in success.values())
     return bool(np.asarray(success).item())
 
+def save_rgb_image(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(path, np.ascontiguousarray(image))
+
+def save_rollout_video(frames: list[np.ndarray], out_dir: Path, fps: int) -> Path:
+    mp4_path = out_dir / "cube_mppi_sls.mp4"
+    gif_path = out_dir / "cube_mppi_sls.gif"
+    try:
+        imageio.mimwrite(mp4_path, frames, fps=fps, quality=8, macro_block_size=1)
+        return mp4_path
+    except Exception:
+        imageio.mimwrite(gif_path, frames, fps=fps)
+        return gif_path
+
+def plot_planner_diagnostics(
+    path: Path,
+    *,
+    step_idx: int,
+    mppi_states: np.ndarray,
+    sls_states: Optional[np.ndarray],
+    mppi_actions: np.ndarray,
+    sls_actions: Optional[np.ndarray],
+    goal_state: np.ndarray,
+    status: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mppi_err = np.linalg.norm(mppi_states - goal_state[None, :], axis=-1)
+    sls_err = None if sls_states is None else np.linalg.norm(sls_states - goal_state[None, :], axis=-1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.0))
+    axes[0].plot(np.arange(len(mppi_err)), mppi_err, label="MPPI warmstart", color="tab:orange", linewidth=2.0)
+    if sls_err is not None:
+        axes[0].plot(np.arange(len(sls_err)), sls_err, label="SLS non-RTI prediction", color="tab:blue", linewidth=2.0)
+    axes[0].set_title(f"Latent distance to goal, step {step_idx:03d}")
+    axes[0].set_xlabel("Horizon index")
+    axes[0].set_ylabel("L2 distance")
+    axes[0].grid(True, linestyle="--", alpha=0.35)
+    axes[0].legend(loc="best")
+
+    action_horizon = np.arange(mppi_actions.shape[0])
+    for action_idx in range(mppi_actions.shape[1]):
+        axes[1].plot(action_horizon, mppi_actions[:, action_idx], color="tab:orange", alpha=0.35, linewidth=1.2)
+    if sls_actions is not None:
+        for action_idx in range(sls_actions.shape[1]):
+            axes[1].plot(np.arange(sls_actions.shape[0]), sls_actions[:, action_idx], color="tab:blue", alpha=0.45, linewidth=1.2)
+    axes[1].set_title(f"Normalized actions ({status})")
+    axes[1].set_xlabel("Horizon index")
+    axes[1].set_ylabel("Action")
+    axes[1].grid(True, linestyle="--", alpha=0.35)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+def save_frame_panel(path: Path, start_frame: np.ndarray, current_frame: np.ndarray, goal_frame: np.ndarray, step_idx: int, status: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(9.0, 3.2))
+    panels = [("Start", start_frame), (f"Step {step_idx:03d} ({status})", current_frame), ("Goal", goal_frame)]
+    for ax, (title, frame) in zip(axes, panels):
+        ax.imshow(frame)
+        ax.set_title(title)
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+def save_tube_width_plot(path: Path, tube: np.ndarray, step_idx: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state_dim = tube.shape[1]
+    n_cols = 6
+    n_rows = int(np.ceil(state_dim / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 2.2 * n_rows), sharex=True)
+    axes = np.atleast_1d(axes).flatten()
+    horizon_axis = np.arange(tube.shape[0])
+
+    for dim_idx in range(state_dim):
+        ax = axes[dim_idx]
+        ax.plot(horizon_axis, tube[:, dim_idx], color="tab:blue", linewidth=1.5)
+        ax.set_title(f"Dim {dim_idx}", fontsize=8)
+        ax.grid(True, linestyle="--", alpha=0.45)
+        ax.tick_params(axis="both", which="major", labelsize=8)
+
+    for dim_idx in range(state_dim, len(axes)):
+        axes[dim_idx].axis("off")
+
+    fig.suptitle(f"Projected Tube Widths Across Horizon (MPC Step {step_idx})", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch[_=](\d+).*\.ckpt$")
     candidates = []
@@ -217,8 +311,14 @@ def encode_frames(model: torch.nn.Module, pixels_np: np.ndarray, device: torch.d
 def main():
     cfg = pyrallis.parse(config_class=PlanSLSMoppiCubeConfig)
     device = torch.device("cuda" if torch.cuda.is_available() and cfg.device == "auto" else "cpu")
-    out_dir = cfg.out_dir.expanduser().resolve() / f"{int(time.time())}_mppi_sls_cube"
+    out_dir = cfg.out_dir.expanduser().resolve() / f"{int(time.time())}_mppi_sls_cube_tube_vis"
     out_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir = out_dir / "planner_diagnostics"
+    frame_panels_dir = out_dir / "frame_panels"
+    tube_plots_dir = out_dir / "tube_plots"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    frame_panels_dir.mkdir(parents=True, exist_ok=True)
+    tube_plots_dir.mkdir(parents=True, exist_ok=True)
 
     model_dir = cfg.model_dir.expanduser().resolve()
     with open(model_dir / "config.json") as f: config_dict = json.load(f)
@@ -280,6 +380,9 @@ def main():
     goal_emb = encode_single_frame(model, goal_frame, device, img_size, pixel_mean, pixel_std)
     goal_state = torch.cat([goal_emb, torch.zeros_like(goal_emb)], dim=-1).cpu().numpy().astype(np.float64)
 
+    save_rgb_image(out_dir / "start_image.png", current_frame)
+    save_rgb_image(out_dir / "goal_image.png", goal_frame)
+
     rollout_frames = [current_frame.copy()]
     grasped = False
 
@@ -291,13 +394,16 @@ def main():
         current_info = env.step(np.asarray(oracle.select_action(None, current_info), dtype=np.float32))[4]
         rollout_frames.append(render_without_target_cube(env, "front_pixels"))
 
-    if not grasped: return env.close()
+    if not grasped:
+        save_rollout_video(rollout_frames, out_dir, fps=cfg.video_fps)
+        env.close()
+        return
 
     W_mppi = jnp.ones((state_dim,)) * 100
     W_mppi = W_mppi.at[state_dim // 2:].set(1.0)
     W_stage_scaled = jnp.ones((state_dim,)) * 10.0
-    W_stage_scaled = W_stage_scaled.at[state_dim // 2:].set(1.0)
-    W_terminal_scaled = jnp.ones((state_dim,)) * 100.0
+    W_stage_scaled = W_stage_scaled.at[state_dim // 2:].set(10.0)
+    W_terminal_scaled = jnp.ones((state_dim,)) * 1.0
     W_terminal_scaled = W_terminal_scaled.at[state_dim // 2:].set(1.0)
 
     mppi_roll, mppi_ev = make_mppi_rollout_and_eval(dynamics, W_mppi, jnp.asarray(goal_state))
@@ -324,9 +430,19 @@ def main():
     constraints_all = combine_constraints(make_state_box_constraints(x_min, x_max), make_control_box_constraints(u_min, u_max))
 
     controller = GenericMPC(
-        SLSConfig(max_sls_iterations=1, enable_fastsls=False, initialize_nominal=True, warm_start=True, rti=True),
-        SQPConfig(max_sqp_iterations=1, warm_start=False, feas_tol=1e-2, step_tol=1e-4, line_search=False),
-        ADMMConfig(eps_abs=1e-2, eps_rel=1e-4, rho_max=1e2, max_iterations=300, initial_rho=1.0),
+        SLSConfig(
+            max_sls_iterations=1,
+            sls_primal_tol=1e-2,
+            enable_fastsls=True,
+            max_initial_sqp_iterations=0,
+            initialize_nominal=True,
+            warm_start=True,
+            rti=False,
+            R_bar=None,
+            Q_bar=None,
+        ),
+        SQPConfig(max_sqp_iterations=3, warm_start=False, feas_tol=1e-2, step_tol=1e-4, line_search=False),
+        ADMMConfig(eps_abs=1e-2, eps_rel=1e-4, rho_max=1e2, max_iterations=200, rho_update_frequency=20, initial_rho=1.0),
         config=MPCConfig(n=state_dim, nu=action_dim, N=cfg.horizon, W=W_stage_scaled, u_ref=jnp.zeros(action_dim), dt=1.0/20.0),
         dynamics=dynamics, constraints=constraints_all, obstacles=jnp.zeros((0, 3)), cost=cost, num_constraints=2 * action_dim + 2 * state_dim,
         disturbance=disturbance, shift=1, X_in=jnp.zeros((cfg.horizon + 1, state_dim)), U_in=jnp.zeros((cfg.horizon, action_dim))
@@ -335,6 +451,7 @@ def main():
     current_emb = encode_single_frame(model, rollout_frames[-1], device, img_size, pixel_mean, pixel_std)
     current_state = torch.cat([current_emb, torch.zeros_like(current_emb)], dim=-1).cpu().numpy().astype(np.float64)
     prev_U, jax_seed = jnp.zeros((cfg.horizon, action_dim)), jax.random.PRNGKey(cfg.seed)
+    trace_rows = []
     train_stats = LeWMOGBenchCubeDataset(
         str(cfg.dataset_path),
         markov_deriv=1,
@@ -345,17 +462,49 @@ def main():
     )
 
     mpc_pbar = tqdm(range(cfg.max_mpc_steps), desc="Refined MPPI + SLS tracking loops")
-    for _ in mpc_pbar:
+    for mpc_step in mpc_pbar:
         jax_seed, subkey = jax.random.split(jax_seed)
         init_act_seq = jnp.concatenate([prev_U[1:], prev_U[-1:]], axis=0)
         
         mppi_res = run_mppi_opt(subkey, jnp.asarray(current_state), init_act_seq)
-        X_ws = jnp.concatenate([jnp.asarray(current_state)[None, :], jnp.asarray(mppi_res["state_seq"])], axis=0)
+        X_mppi = jnp.asarray(mppi_res["state_seq"])
+        U_mppi = jnp.asarray(mppi_res["act_seq"])
+        X_ws = jnp.concatenate([jnp.asarray(current_state)[None, :], X_mppi], axis=0)
+        X_ws_np = np.asarray(X_ws, dtype=np.float64)
         
-        controller.X_in, controller.U_in = X_ws, jnp.asarray(mppi_res["act_seq"])
+        controller.X_in, controller.U_in = X_ws, U_mppi
 
-        u0, X_pred, U_pred, *_ = controller.run(x0=current_state, reference=X_ws, parameter=1.0/20.0)
-        status = "sls_refined"
+        try:
+            u0, X_pred, U_pred, *solver_info = controller.run(x0=current_state, reference=X_ws, parameter=1.0/20.0)
+            if u0 is None or not jnp.all(jnp.isfinite(X_pred)) or not jnp.all(jnp.isfinite(U_pred)):
+                print("\n[WARN] Non-RTI SLS returned NaN/non-finite values. Using MPPI fallback.")
+                u0, U_pred = U_mppi[0], U_mppi
+                status = "mppi_fallback"
+                sls_states_np = None
+                sls_actions_np = None
+                solver_info = []
+            else:
+                status = "sls_non_rti"
+                sls_states_np = np.asarray(X_pred, dtype=np.float64)
+                sls_actions_np = np.asarray(U_pred, dtype=np.float64)
+        except Exception as e:
+            print(f"\n[WARN] GenericMPC solve raised exception: {e}")
+            u0, U_pred = U_mppi[0], U_mppi
+            status = "mppi_fallback"
+            sls_states_np = None
+            sls_actions_np = None
+            solver_info = []
+
+        tube_mean = np.nan
+        tube_max = np.nan
+        if sls_states_np is not None and len(solver_info) >= 3:
+            Phi_x = solver_info[2]
+            tube = np.asarray(jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1), dtype=np.float64)
+            tube_mean = float(np.mean(tube))
+            tube_max = float(np.max(tube))
+            if cfg.vis_every > 0 and (mpc_step % cfg.vis_every == 0):
+                np.save(tube_plots_dir / f"tube_widths_step_{mpc_step:03d}.npy", tube)
+                save_tube_width_plot(tube_plots_dir / f"tube_widths_step_{mpc_step:03d}.png", tube, mpc_step)
 
         prev_U = U_pred
         u_raw = ((np.asarray(u0, dtype=np.float32) * train_stats.action_std.flatten()) + train_stats.action_mean.flatten()).astype(np.float32)
@@ -372,11 +521,52 @@ def main():
         lat_err = float(np.linalg.norm(current_state - goal_state))
         if reached_ogbench_success:
             status = "ogbench_success"
+        trace_rows.append(
+            {
+                "step": mpc_step,
+                "latent_error": lat_err,
+                "status": status,
+                "tube_mean": tube_mean,
+                "tube_max": tube_max,
+                "u0_norm": np.asarray(u0, dtype=np.float32),
+                "u0_raw": u_raw,
+            }
+        )
+        if cfg.vis_every > 0 and (mpc_step % cfg.vis_every == 0):
+            plot_planner_diagnostics(
+                diagnostics_dir / f"planner_step_{mpc_step:03d}.png",
+                step_idx=mpc_step,
+                mppi_states=X_ws_np,
+                sls_states=sls_states_np,
+                mppi_actions=np.asarray(U_mppi, dtype=np.float64),
+                sls_actions=sls_actions_np,
+                goal_state=goal_state,
+                status=status,
+            )
+            save_frame_panel(
+                frame_panels_dir / f"frames_step_{mpc_step:03d}.png",
+                start_frame=rollout_frames[0],
+                current_frame=frame,
+                goal_frame=goal_frame,
+                step_idx=mpc_step,
+                status=status,
+            )
         mpc_pbar.set_postfix(latent_err=f"{lat_err:.4f}", status=status)
         if cfg.terminate_on_ogbench_success and reached_ogbench_success: break
         if lat_err <= 0.05: break
 
-    imageio.mimwrite(out_dir / "cube_mppi_sls.mp4", rollout_frames, fps=cfg.video_fps)
+    save_rollout_video(rollout_frames, out_dir, fps=cfg.video_fps)
+    if trace_rows:
+        np.savez(
+            out_dir / "planner_trace.npz",
+            step=np.asarray([row["step"] for row in trace_rows], dtype=np.int64),
+            latent_error=np.asarray([row["latent_error"] for row in trace_rows], dtype=np.float64),
+            status=np.asarray([row["status"] for row in trace_rows]),
+            tube_mean=np.asarray([row["tube_mean"] for row in trace_rows], dtype=np.float64),
+            tube_max=np.asarray([row["tube_max"] for row in trace_rows], dtype=np.float64),
+            u0_norm=np.stack([row["u0_norm"] for row in trace_rows]),
+            u0_raw=np.stack([row["u0_raw"] for row in trace_rows]),
+        )
     env.close()
 
 if __name__ == "__main__":

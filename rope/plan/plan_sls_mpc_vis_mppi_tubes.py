@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan in Rope pixel space using Conformal SLS MPC warmstarted by MPPI over an Equinox-wrapped world model."""
+"""Plan in Rope pixel space using RTI Conformal SLS MPC warmstarted by MPPI, with tube visualizations."""
 
 import os
 import sys
@@ -21,6 +21,9 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 import pyrallis
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
@@ -36,25 +39,27 @@ from gpu_sls.generic_mpc import GenericMPC, MPCConfig
 from gpu_sls.utils.constraint_utils import combine_constraints, make_state_box_constraints
 from gpu_sls.mppi_planner import MPPIPlanner
 
-from rope.train.mlpdyn_train import LeWMRopeDataset, preprocess_pixels
+from rope.train.mlpdyn_train import LeWMRopeDataset, build_markov_state, preprocess_pixels, required_markov_history
 from error_model import MGNLLPredictor
 
 @dataclass
 class PlanSLSMoppiRopeConfig:
-    """Configuration for Warmstarted Conformal SLS MPC on Rope Lines"""
+    """Configuration for Warmstarted RTI Conformal SLS MPC tube visualization on Rope Lines"""
     q_learned: float = field(default=0.0)
     model_dir: Path = field(default=Path("rope/models/mlpdyn"))
     error_model_ckpt: Path = field(default=Path("rope/models/error_model/best-error-model.ckpt"))
     use_constant_covariance: bool = field(default=False)
     constant_covariance_path: Path = field(default=Path("rope/eval/fixed_error_covariance.pt"))
+    track_fixed_covariance_coverage: bool = field(default=True)
     dataset_path: Path = field(default=Path("rope/data/expert_data/rope_random_cubic_spline.h5"))
-    out_dir: Path = field(default=Path("rope/plan/sls_mppi_conformal"))
+    out_dir: Path = field(default=Path("rope/plan/sls_mppi_conformal_rti_tube_vis"))
     device: str = field(default="auto")
     horizon: int = field(default=24)
     max_mpc_steps: int = field(default=150)
     video_fps: int = field(default=30)
     episode_idx: Optional[int] = field(default=None)
     seed: int = field(default=42)
+    vis_every: int = field(default=1)
     
     mppi_samples: int = 512
     mppi_update_iter: int = 6
@@ -133,6 +138,19 @@ def load_calibrated_cholesky(path: Path) -> np.ndarray:
         )
     return np.asarray(matrix.detach().cpu().numpy(), dtype=np.float64)
 
+def fixed_ellipsoid_score(calibrated_cholesky: np.ndarray, error: np.ndarray) -> float:
+    whitened = np.linalg.solve(calibrated_cholesky, np.asarray(error, dtype=np.float64))
+    return float(np.linalg.norm(whitened, ord=2))
+
+def markov_state_at(latents: torch.Tensor, index: int, markov_deriv: int) -> np.ndarray:
+    history_len = required_markov_history(markov_deriv)
+    start_idx = max(0, index - history_len + 1)
+    history = latents[start_idx : index + 1]
+    if history.shape[0] < history_len:
+        padding_amt = history_len - history.shape[0]
+        history = torch.cat((history[:1].repeat(padding_amt, 1), history), dim=0)
+    return build_markov_state(history.unsqueeze(0), markov_deriv)[0].cpu().numpy().astype(np.float64)
+
 def make_mppi_rollout_and_eval(
     jax_dynamics_fn,
     state_dim,
@@ -198,6 +216,101 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
     if not candidates: raise FileNotFoundError(f"No object checkpoints in {model_dir}")
     return max(candidates, key=lambda item: item[0])[1]
 
+def save_rgb_image(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(path, np.ascontiguousarray(image))
+
+def save_rollout_video(frames: list[np.ndarray], out_dir: Path, fps: int) -> Path:
+    mp4_path = out_dir / "mppi_sls_rope.mp4"
+    gif_path = out_dir / "mppi_sls_rope.gif"
+    try:
+        imageio.mimwrite(mp4_path, frames, fps=fps, quality=8, macro_block_size=1)
+        return mp4_path
+    except Exception:
+        imageio.mimwrite(gif_path, frames, fps=fps)
+        return gif_path
+
+def plot_planner_diagnostics(
+    path: Path,
+    *,
+    step_idx: int,
+    mppi_states: np.ndarray,
+    sls_states: Optional[np.ndarray],
+    mppi_actions: np.ndarray,
+    sls_actions: Optional[np.ndarray],
+    goal_state: np.ndarray,
+    status: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mppi_err = np.linalg.norm(mppi_states - goal_state[None, :], axis=-1)
+    sls_err = None if sls_states is None else np.linalg.norm(sls_states - goal_state[None, :], axis=-1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.0))
+    axes[0].plot(np.arange(len(mppi_err)), mppi_err, label="MPPI warmstart", color="tab:orange", linewidth=2.0)
+    if sls_err is not None:
+        axes[0].plot(np.arange(len(sls_err)), sls_err, label="SLS RTI prediction", color="tab:blue", linewidth=2.0)
+    axes[0].set_title(f"Latent distance to goal, step {step_idx:03d}")
+    axes[0].set_xlabel("Horizon index")
+    axes[0].set_ylabel("L2 distance")
+    axes[0].grid(True, linestyle="--", alpha=0.35)
+    axes[0].legend(loc="best")
+
+    for action_idx in range(mppi_actions.shape[1]):
+        axes[1].plot(np.arange(mppi_actions.shape[0]), mppi_actions[:, action_idx], color="tab:orange", alpha=0.35, linewidth=1.2)
+    if sls_actions is not None:
+        for action_idx in range(sls_actions.shape[1]):
+            axes[1].plot(np.arange(sls_actions.shape[0]), sls_actions[:, action_idx], color="tab:blue", alpha=0.45, linewidth=1.2)
+    axes[1].set_title(f"Normalized actions ({status})")
+    axes[1].set_xlabel("Horizon index")
+    axes[1].set_ylabel("Action")
+    axes[1].grid(True, linestyle="--", alpha=0.35)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+def save_frame_panel(path: Path, start_frame: np.ndarray, current_frame: np.ndarray, goal_frame: np.ndarray, step_idx: int, status: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(9.0, 3.2))
+    panels = [("Start", start_frame), (f"Step {step_idx:03d} ({status})", current_frame), ("Goal", goal_frame)]
+    for ax, (title, frame) in zip(axes, panels):
+        ax.imshow(frame)
+        ax.set_title(title)
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+def save_tube_bounds_plot(path: Path, tube: np.ndarray, nominal_states: np.ndarray, step_idx: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    horizon_len = min(tube.shape[0], nominal_states.shape[0])
+    tube = tube[:horizon_len]
+    nominal_states = nominal_states[:horizon_len]
+    state_dim = tube.shape[1]
+    n_cols = 6
+    n_rows = int(np.ceil(state_dim / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 2.2 * n_rows), sharex=True)
+    axes = np.atleast_1d(axes).flatten()
+    horizon_axis = np.arange(horizon_len)
+
+    for dim_idx in range(state_dim):
+        ax = axes[dim_idx]
+        nominal = nominal_states[:, dim_idx]
+        width = tube[:, dim_idx]
+        ax.fill_between(horizon_axis, nominal - width, nominal + width, color="tab:blue", alpha=0.22, linewidth=0.0)
+        ax.plot(horizon_axis, nominal, color="tab:blue", linewidth=1.5)
+        ax.set_title(f"Dim {dim_idx}", fontsize=8)
+        ax.grid(True, linestyle="--", alpha=0.45)
+        ax.tick_params(axis="both", which="major", labelsize=8)
+
+    for dim_idx in range(state_dim, len(axes)):
+        axes[dim_idx].axis("off")
+
+    fig.suptitle(f"RTI Nominal Latent Plan With Projected Tube Bounds (MPC Step {step_idx})", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
 # @torch.no_grad()
 # def encode_frames(model: torch.nn.Module, pixels_np: np.ndarray, device: torch.device, img_size: int) -> torch.Tensor:
 #     tensor = preprocess_pixels(torch.from_numpy(pixels_np.copy()).permute(0, 3, 1, 2).contiguous(), img_size).to(device)
@@ -245,14 +358,20 @@ def main():
     model = torch.load(latest_object_checkpoint(model_dir), map_location=device, weights_only=False).eval()
     
     state_dim = config_dict.get("markov_state_dim", 36)
-    action_dim = config_dict.get("action_dim", 5) # 5D gripper actions
+    action_dim = config_dict.get("action_dim", 5)
     img_size = config_dict.get("img_size", 224)
+    markov_deriv = int(config_dict.get("markov_deriv", 1))
+    frameskip = int(config_dict.get("frameskip", 1))
 
     init_key = jax.random.PRNGKey(cfg.seed)
     key_dyn, key_err = jax.random.split(init_key)
     dynamics = make_jax_dynamics(build_equinox_mlp_from_pytorch(model.predictor.net, key_dyn))
+    fixed_coverage_cholesky = None
+    if cfg.use_constant_covariance or cfg.track_fixed_covariance_coverage:
+        fixed_coverage_cholesky = load_calibrated_cholesky(cfg.constant_covariance_path)
+
     if cfg.use_constant_covariance:
-        calibrated_cholesky = load_calibrated_cholesky(cfg.constant_covariance_path)
+        calibrated_cholesky = fixed_coverage_cholesky
         disturbance = make_constant_jax_disturbance(calibrated_cholesky, state_dim)
         print(f"Using fixed calibrated covariance disturbance from {cfg.constant_covariance_path}")
     else:
@@ -264,6 +383,15 @@ def main():
             error_model.diagonal,
         )
 
+    action_stats_dataset = LeWMRopeDataset(
+        str(cfg.dataset_path),
+        markov_deriv=markov_deriv,
+        num_preds=1,
+        frameskip=frameskip,
+        img_size=img_size,
+        action_dim=action_dim,
+    )
+
     with h5py.File(cfg.dataset_path, "r") as h5:
         ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
         episode_idx = cfg.episode_idx if cfg.episode_idx is not None else int(np.random.choice(np.flatnonzero(ep_len >= cfg.horizon)))
@@ -271,12 +399,22 @@ def main():
         length = int(h5["ep_len"][episode_idx])
         rows = np.arange(offset, offset + length, dtype=np.int64)
         pixels_np = np.asarray(h5["pixels"][rows], dtype=np.uint8)
+        actions_np = np.asarray(h5["action"][rows], dtype=np.float32)
+    actions_norm = (np.nan_to_num(actions_np, nan=0.0) - action_stats_dataset.action_mean) / action_stats_dataset.action_std
 
-    run_dir = out_dir / f"{int(time.time())}_mppi_sls_rope_{episode_idx:05d}"
+    run_dir = out_dir / f"{int(time.time())}_mppi_sls_rope_rti_tube_vis_{episode_idx:05d}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir = run_dir / "planner_diagnostics"
+    frame_panels_dir = run_dir / "frame_panels"
+    tube_plots_dir = run_dir / "tube_plots"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    frame_panels_dir.mkdir(parents=True, exist_ok=True)
+    tube_plots_dir.mkdir(parents=True, exist_ok=True)
 
     true_latents = encode_frames(model, pixels_np, device, img_size)
-    goal_state = torch.cat([true_latents[-1], true_latents[-1] - true_latents[-2]], dim=-1).cpu().numpy().astype(np.float64)
+    goal_state = markov_state_at(true_latents, len(true_latents) - 1, markov_deriv)
+    save_rgb_image(run_dir / "start_image.png", pixels_np[0])
+    save_rgb_image(run_dir / "goal_image.png", pixels_np[-1])
 
     W_mppi = jnp.ones((state_dim,)) * 100
     W_mppi = W_mppi.at[state_dim // 2:].set(1.0)
@@ -313,7 +451,7 @@ def main():
     jit_mppi_trajopt = jax.jit(lambda k, s, a: mppi_planner.trajectory_optimization(k, s, a, skip=False))
 
     # SLS Setup footprint
-    sls_cfg = SLSConfig(max_sls_iterations=1, sls_primal_tol=1e-2, enable_fastsls=True, initialize_nominal=True, warm_start=False, rti=False)
+    sls_cfg = SLSConfig(max_sls_iterations=1, sls_primal_tol=1e-2, enable_fastsls=True, initialize_nominal=True, warm_start=False, rti=True)
     controller = GenericMPC(
         sls_cfg, SQPConfig(max_sqp_iterations=1, warm_start=False, feas_tol=1e-2, step_tol=1e-4, line_search=True),
         ADMMConfig(eps_abs=5e-2, eps_rel=1e-4, rho_max=1e4, max_iterations=400, rho_update_frequency=20, initial_rho=1.0),
@@ -324,10 +462,13 @@ def main():
     )
 
     current_frame = pixels_np[0].copy()
-    current_state = torch.cat([true_latents[0], torch.zeros_like(true_latents[0])], dim=-1).cpu().numpy().astype(np.float64)
+    current_state = markov_state_at(true_latents, 0, markov_deriv)
     rollout_frames = [current_frame.copy()]
     prev_U = jnp.zeros((cfg.horizon, action_dim), dtype=jnp.float64)
     jax_seed_key = jax.random.PRNGKey(cfg.seed)
+    trace_rows = []
+    fixed_coverage_total = 0
+    fixed_coverage_covered = 0
 
     pbar = tqdm(range(cfg.max_mpc_steps), desc="Receding Horizon MPPI + SLS Sequence Loops")
     for step_idx in pbar:
@@ -335,31 +476,155 @@ def main():
         init_act_seq = jnp.concatenate([prev_U[1:], prev_U[-1:]], axis=0)
         
         mppi_res = jit_mppi_trajopt(subkey, jnp.asarray(current_state), init_act_seq)
-        X_warmstart = jnp.concatenate([jnp.asarray(current_state)[None, :], jnp.asarray(mppi_res["state_seq"])], axis=0)
+        X_mppi = jnp.asarray(mppi_res["state_seq"])
+        U_mppi = jnp.asarray(mppi_res["act_seq"])
+        X_warmstart = jnp.concatenate([jnp.asarray(current_state)[None, :], X_mppi], axis=0)
+        X_warmstart_np = np.asarray(X_warmstart, dtype=np.float64)
         
         controller.X_in = X_warmstart
-        controller.U_in = jnp.asarray(mppi_res["act_seq"])
+        controller.U_in = U_mppi
 
         try:
             u0, X_pred, U_pred, *solver_info = controller.run(x0=current_state, reference=X_warmstart, parameter=1.0/30.0)
-            solver_status = "sls_refined"
-        except Exception:
-            u0, X_pred, U_pred = mppi_res["act_seq"][0], X_warmstart, mppi_res["act_seq"]
+            if u0 is None or not jnp.all(jnp.isfinite(X_pred)) or not jnp.all(jnp.isfinite(U_pred)):
+                print("\n[WARN] RTI SLS returned NaN/non-finite values. Using MPPI fallback.")
+                u0, X_pred, U_pred = U_mppi[0], X_warmstart, U_mppi
+                solver_status = "mppi_fallback"
+                sls_states_np = None
+                sls_actions_np = None
+                solver_info = []
+            else:
+                solver_status = "sls_rti"
+                sls_states_np = np.asarray(X_pred, dtype=np.float64)
+                sls_actions_np = np.asarray(U_pred, dtype=np.float64)
+        except Exception as e:
+            print(f"\n[WARN] GenericMPC solve raised exception: {e}")
+            u0, X_pred, U_pred = U_mppi[0], X_warmstart, U_mppi
             solver_status = "mppi_fallback"
+            sls_states_np = None
+            sls_actions_np = None
+            solver_info = []
 
-        prev_U = jnp.concatenate([U_pred[1:], U_pred[-1:]], axis=0)
-        
+        tube_mean = np.nan
+        tube_max = np.nan
+        if sls_states_np is not None and len(solver_info) >= 3:
+            Phi_x = solver_info[2]
+            tube = np.asarray(jnp.linalg.norm(Phi_x, ord=2, axis=-1).sum(axis=1), dtype=np.float64)
+            tube_mean = float(np.mean(tube))
+            tube_max = float(np.max(tube))
+            if cfg.vis_every > 0 and (step_idx % cfg.vis_every == 0):
+                np.save(tube_plots_dir / f"tube_widths_step_{step_idx:03d}.npy", tube)
+                save_tube_bounds_plot(tube_plots_dir / f"tube_bounds_step_{step_idx:03d}.png", tube, sls_states_np, step_idx)
+
+        predicted_next_state_planned = np.asarray(
+            dynamics(jnp.asarray(current_state), jnp.asarray(u0), 0.0, 1.0),
+            dtype=np.float64,
+        )
+
         sim_index = min(step_idx + 1, len(pixels_np) - 1)
         current_frame = pixels_np[sim_index].copy()
         rollout_frames.append(current_frame.copy())
 
-        current_state = torch.cat([true_latents[sim_index], true_latents[sim_index] - true_latents[sim_index-1]], dim=-1).cpu().numpy().astype(np.float64)
+        action_start = max(0, sim_index - frameskip)
+        action_stop = sim_index
+        logged_action = actions_norm[action_start:action_stop].reshape(-1)
+        if logged_action.shape[0] != action_dim:
+            raise ValueError(f"Expected logged action dim {action_dim}, got {logged_action.shape[0]}.")
+        predicted_next_state_logged = np.asarray(
+            dynamics(jnp.asarray(current_state), jnp.asarray(logged_action), 0.0, 1.0),
+            dtype=np.float64,
+        )
+
+        next_state_actual = markov_state_at(true_latents, sim_index, markov_deriv)
+        fixed_score = np.nan
+        fixed_planned_action_score = np.nan
+        fixed_covered = False
+        if fixed_coverage_cholesky is not None:
+            one_step_error = next_state_actual - predicted_next_state_logged
+            fixed_score = fixed_ellipsoid_score(fixed_coverage_cholesky, one_step_error)
+            planned_action_error = next_state_actual - predicted_next_state_planned
+            fixed_planned_action_score = fixed_ellipsoid_score(fixed_coverage_cholesky, planned_action_error)
+            fixed_covered = bool(fixed_score <= 1.0)
+            fixed_coverage_total += 1
+            fixed_coverage_covered += int(fixed_covered)
+
+        current_state = next_state_actual
 
         latent_err = float(np.linalg.norm(current_state - goal_state))
-        pbar.set_postfix(lat_err=f"{latent_err:.3f}", status=solver_status)
+        trace_rows.append(
+            {
+                "step": step_idx,
+                "dataset_index": sim_index,
+                "latent_error": latent_err,
+                "status": solver_status,
+                "tube_mean": tube_mean,
+                "tube_max": tube_max,
+                "u0_norm": np.asarray(u0, dtype=np.float32),
+                "logged_action_norm": np.asarray(logged_action, dtype=np.float32),
+                "fixed_ellipsoid_score": fixed_score,
+                "fixed_ellipsoid_planned_action_score": fixed_planned_action_score,
+                "fixed_ellipsoid_covered": fixed_covered,
+            }
+        )
+        if cfg.vis_every > 0 and (step_idx % cfg.vis_every == 0):
+            plot_planner_diagnostics(
+                diagnostics_dir / f"planner_step_{step_idx:03d}.png",
+                step_idx=step_idx,
+                mppi_states=X_warmstart_np,
+                sls_states=sls_states_np,
+                mppi_actions=np.asarray(U_mppi, dtype=np.float64),
+                sls_actions=sls_actions_np,
+                goal_state=goal_state,
+                status=solver_status,
+            )
+            save_frame_panel(
+                frame_panels_dir / f"frames_step_{step_idx:03d}.png",
+                start_frame=rollout_frames[0],
+                current_frame=current_frame,
+                goal_frame=pixels_np[-1],
+                step_idx=step_idx,
+                status=solver_status,
+            )
+        pbar.set_postfix(lat_err=f"{latent_err:.3f}", status=solver_status, fixed_cov=bool(fixed_covered))
+        prev_U = jnp.concatenate([U_pred[1:], U_pred[-1:]], axis=0)
         if sim_index == len(pixels_np) - 1: break
 
-    imageio.mimwrite(run_dir / "mppi_sls_rope.mp4", rollout_frames, fps=cfg.video_fps)
+    save_rollout_video(rollout_frames, run_dir, fps=cfg.video_fps)
+    fixed_coverage_percent = (
+        100.0 * fixed_coverage_covered / fixed_coverage_total
+        if fixed_coverage_total > 0
+        else float("nan")
+    )
+    if trace_rows:
+        np.savez(
+            run_dir / "planner_trace.npz",
+            step=np.asarray([row["step"] for row in trace_rows], dtype=np.int64),
+            dataset_index=np.asarray([row["dataset_index"] for row in trace_rows], dtype=np.int64),
+            latent_error=np.asarray([row["latent_error"] for row in trace_rows], dtype=np.float64),
+            status=np.asarray([row["status"] for row in trace_rows]),
+            tube_mean=np.asarray([row["tube_mean"] for row in trace_rows], dtype=np.float64),
+            tube_max=np.asarray([row["tube_max"] for row in trace_rows], dtype=np.float64),
+            u0_norm=np.stack([row["u0_norm"] for row in trace_rows]),
+            logged_action_norm=np.stack([row["logged_action_norm"] for row in trace_rows]),
+            fixed_ellipsoid_score=np.asarray([row["fixed_ellipsoid_score"] for row in trace_rows], dtype=np.float64),
+            fixed_ellipsoid_planned_action_score=np.asarray([row["fixed_ellipsoid_planned_action_score"] for row in trace_rows], dtype=np.float64),
+            fixed_ellipsoid_covered=np.asarray([row["fixed_ellipsoid_covered"] for row in trace_rows], dtype=bool),
+        )
+    coverage_summary = {
+        "constant_covariance_path": str(cfg.constant_covariance_path),
+        "tracked": bool(fixed_coverage_cholesky is not None),
+        "covered": int(fixed_coverage_covered),
+        "total": int(fixed_coverage_total),
+        "coverage_percent": fixed_coverage_percent,
+        "coverage_action_source": "normalized logged dataset action",
+        "planned_action_score_field": "fixed_ellipsoid_planned_action_score",
+    }
+    with (run_dir / "fixed_ellipsoid_coverage.json").open("w") as f:
+        json.dump(coverage_summary, f, indent=2)
+    print(
+        f"Fixed ellipsoid one-step coverage: "
+        f"{fixed_coverage_covered}/{fixed_coverage_total} ({fixed_coverage_percent:.2f}%)"
+    )
     print(f"Rollout successfully complete. Artifacts written to {run_dir}")
 
 if __name__ == "__main__":

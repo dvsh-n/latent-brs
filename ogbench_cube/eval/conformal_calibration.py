@@ -304,7 +304,7 @@ def run_pipeline(data_path: str, base_log_dir: str, alpha: float = 0.1, batch_si
     model = MGNLLPredictor(
         input_dim=dm.input_dim, state_dim=dm.state_dim, 
         num_layers=2, hidden_dim=128, diagonal=False, 
-        lr=0.00025, reg_scale=10, dropout_prob=0.3, use_spectral_norm=False
+        lr=0.0003, reg_scale=10, dropout_prob=0.3, use_spectral_norm=False
     )
 
     logger = TensorBoardLogger(save_dir=str(lightning_dir), name="cube_experiment_embed_8")

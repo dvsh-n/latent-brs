@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan in Rope pixel space using Conformal SLS MPC warmstarted by MPPI over an Equinox-wrapped world model."""
+"""Plan in Rope pixel space using Conformal SLS MPC warmstarted by MPPI with an EBM domain constraint."""
 
 import os
 import sys
@@ -33,7 +33,7 @@ from gpu_sls.gpu_admm import ADMMConfig
 from gpu_sls.gpu_sls import SLSConfig
 from gpu_sls.gpu_sqp import SQPConfig
 from gpu_sls.generic_mpc import GenericMPC, MPCConfig
-from gpu_sls.utils.constraint_utils import combine_constraints, make_state_box_constraints
+from gpu_sls.utils.constraint_utils import combine_constraints
 from gpu_sls.mppi_planner import MPPIPlanner
 
 from rope.train.mlpdyn_train import LeWMRopeDataset, preprocess_pixels
@@ -41,14 +41,17 @@ from error_model import MGNLLPredictor
 
 @dataclass
 class PlanSLSMoppiRopeConfig:
-    """Configuration for Warmstarted Conformal SLS MPC on Rope Lines"""
+    """Configuration for Warmstarted Conformal SLS MPC on Rope Lines with an EBM domain constraint"""
     q_learned: float = field(default=0.0)
     model_dir: Path = field(default=Path("rope/models/mlpdyn"))
     error_model_ckpt: Path = field(default=Path("rope/models/error_model/best-error-model.ckpt"))
     use_constant_covariance: bool = field(default=False)
     constant_covariance_path: Path = field(default=Path("rope/eval/fixed_error_covariance.pt"))
+    ebm_artifact_path: Path = field(default=Path("rope/models/latent_ebm/model.pt"))
+    ebm_penalty_weight: float = 1000.0
+    ebm_threshold_scale: float = 1.0
     dataset_path: Path = field(default=Path("rope/data/expert_data/rope_random_cubic_spline.h5"))
-    out_dir: Path = field(default=Path("rope/plan/sls_mppi_conformal"))
+    out_dir: Path = field(default=Path("rope/plan/sls_mppi_conformal_ebm"))
     device: str = field(default="auto")
     horizon: int = field(default=24)
     max_mpc_steps: int = field(default=150)
@@ -61,7 +64,6 @@ class PlanSLSMoppiRopeConfig:
     mppi_reward_weight: float = 25.0
     mppi_noise_level: float = 0.2
     mppi_beta_filter: float = 0.65
-    mppi_state_box_penalty: float = 1000.0
 
 # --- PyTorch weight ingestion to Equinox Objects ---
 
@@ -85,6 +87,86 @@ def build_equinox_mlp_from_pytorch(pt_model: torch.nn.Module, key: jax.Array, ac
             for layer in self.layers: x = layer(x)
             return x
     return JAXMLP(layers)
+
+class JAXEnergyMLP(eqx.Module):
+    linear_layers: list
+    layer_norm_scales: list
+    layer_norm_biases: list
+    pair_mean: jax.Array
+    pair_std: jax.Array
+    energy_threshold: jax.Array
+
+    def __call__(self, pair):
+        x = (pair - self.pair_mean) / self.pair_std
+        for i, linear in enumerate(self.linear_layers[:-1]):
+            x = linear(x)
+            mean = jnp.mean(x, axis=-1, keepdims=True)
+            var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+            x = (x - mean) / jnp.sqrt(var + 1e-5)
+            x = x * self.layer_norm_scales[i] + self.layer_norm_biases[i]
+            x = jax.nn.silu(x)
+        return self.linear_layers[-1](x).squeeze(-1)
+
+def build_jax_ebm_from_artifact(artifact_path: Path, key: jax.Array, threshold_scale: float = 1.0) -> JAXEnergyMLP:
+    artifact = torch.load(artifact_path.expanduser(), map_location="cpu", weights_only=False)
+    state_dict = artifact["state_dict"]
+    input_dim = int(artifact["input_dim"])
+    hidden_dim = int(artifact["hidden_dim"])
+    depth = int(artifact["depth"])
+
+    linear_layers = []
+    layer_norm_scales = []
+    layer_norm_biases = []
+    keys = jax.random.split(key, depth + 1)
+
+    module_idx = 0
+    current_dim = input_dim
+    for i in range(depth):
+        linear = eqx.nn.Linear(current_dim, hidden_dim, key=keys[i])
+        linear = eqx.tree_at(
+            lambda layer: (layer.weight, layer.bias),
+            linear,
+            (
+                jnp.asarray(state_dict[f"net.{module_idx}.weight"].detach().cpu().numpy()),
+                jnp.asarray(state_dict[f"net.{module_idx}.bias"].detach().cpu().numpy()),
+            ),
+        )
+        linear_layers.append(linear)
+
+        ln_idx = module_idx + 1
+        layer_norm_scales.append(jnp.asarray(state_dict[f"net.{ln_idx}.weight"].detach().cpu().numpy()))
+        layer_norm_biases.append(jnp.asarray(state_dict[f"net.{ln_idx}.bias"].detach().cpu().numpy()))
+
+        module_idx += 3
+        if f"net.{module_idx}.weight" not in state_dict:
+            module_idx += 1
+        current_dim = hidden_dim
+
+    output_linear = eqx.nn.Linear(current_dim, 1, key=keys[-1])
+    output_linear = eqx.tree_at(
+        lambda layer: (layer.weight, layer.bias),
+        output_linear,
+        (
+            jnp.asarray(state_dict[f"net.{module_idx}.weight"].detach().cpu().numpy()),
+            jnp.asarray(state_dict[f"net.{module_idx}.bias"].detach().cpu().numpy()),
+        ),
+    )
+    linear_layers.append(output_linear)
+
+    return JAXEnergyMLP(
+        linear_layers=linear_layers,
+        layer_norm_scales=layer_norm_scales,
+        layer_norm_biases=layer_norm_biases,
+        pair_mean=jnp.asarray(artifact["pair_mean"], dtype=jnp.float64),
+        pair_std=jnp.asarray(artifact["pair_std"], dtype=jnp.float64),
+        energy_threshold=jnp.asarray(float(artifact["energy_threshold"]) * float(threshold_scale), dtype=jnp.float64),
+    )
+
+def make_ebm_domain_constraint(ebm_model: JAXEnergyMLP):
+    def constraint(x, u, t):
+        pair = jnp.concatenate([x, u], axis=-1)
+        return jnp.asarray([ebm_model(pair) - ebm_model.energy_threshold])
+    return constraint
 
 def make_jax_dynamics(eqx_dyn_model):
     def jax_dynamics(x, u, t=0.0, parameter=1.0):
@@ -140,15 +222,9 @@ def make_mppi_rollout_and_eval(
     horizon,
     W_state,
     goal_state,
-    box_min=None,
-    box_max=None,
-    box_penalty_weight: float = 0.0,
+    ebm_model=None,
+    ebm_penalty_weight: float = 0.0,
 ):
-    if box_min is not None:
-        box_min = jnp.asarray(box_min)
-    if box_max is not None:
-        box_max = jnp.asarray(box_max)
-
     def mppi_rollout_fn(state_cur, act_seqs, reach_config=None):
         def single_sample_rollout(actions):
             def step(state, u):
@@ -162,13 +238,14 @@ def make_mppi_rollout_and_eval(
         delta = state_seqs - goal_state[None, None, :]
         stage_costs = jnp.sum(W_state[None, None, :] * (delta ** 2), axis=-1)
         action_costs = 1.0 * jnp.sum(act_seqs ** 2, axis=-1)
-        if box_min is not None and box_max is not None and box_penalty_weight > 0.0:
-            lower_violation = jnp.maximum(box_min[None, None, :] - state_seqs, 0.0)
-            upper_violation = jnp.maximum(state_seqs - box_max[None, None, :], 0.0)
-            box_costs = box_penalty_weight * jnp.sum(lower_violation**2 + upper_violation**2, axis=-1)
+        if ebm_model is not None and ebm_penalty_weight > 0.0:
+            pairs = jnp.concatenate([state_seqs, act_seqs], axis=-1)
+            energies = jax.vmap(jax.vmap(ebm_model))(pairs)
+            ebm_violation = jnp.maximum(energies - ebm_model.energy_threshold, 0.0)
+            ebm_costs = ebm_penalty_weight * ebm_violation**2
         else:
-            box_costs = jnp.zeros_like(stage_costs)
-        return {"rewards": -jnp.sum(stage_costs + action_costs + box_costs, axis=-1)}
+            ebm_costs = jnp.zeros_like(stage_costs)
+        return {"rewards": -jnp.sum(stage_costs + action_costs + ebm_costs, axis=-1)}
 
     return mppi_rollout_fn, mppi_eval_fn
 
@@ -176,13 +253,6 @@ def make_control_box_constraints(u_min, u_max):
     u_min, u_max = jnp.asarray(u_min), jnp.asarray(u_max)
     def constraints(x, u, t):
         return jnp.concatenate([u - u_max, u_min - u], axis=0)
-    return constraints
-
-def make_state_box_constraints(x_min, x_max):
-    x_min, x_max = jnp.asarray(x_min), jnp.asarray(x_max)
-    def constraints(x, u, t):
-        # Maps boundaries to: [x - x_max <= 0, x_min - x <= 0]
-        return jnp.concatenate([x - x_max, x_min - x], axis=0)
     return constraints
 
 def make_tracking_cost(action_weight: float, horizon: int, W_term: jnp.ndarray, goal_state: jnp.ndarray):
@@ -249,8 +319,19 @@ def main():
     img_size = config_dict.get("img_size", 224)
 
     init_key = jax.random.PRNGKey(cfg.seed)
-    key_dyn, key_err = jax.random.split(init_key)
+    key_dyn, key_err, key_ebm = jax.random.split(init_key, 3)
     dynamics = make_jax_dynamics(build_equinox_mlp_from_pytorch(model.predictor.net, key_dyn))
+    ebm_model = build_jax_ebm_from_artifact(cfg.ebm_artifact_path, key_ebm, threshold_scale=cfg.ebm_threshold_scale)
+    expected_ebm_dim = state_dim + action_dim
+    if ebm_model.pair_mean.shape[0] != expected_ebm_dim:
+        raise ValueError(
+            f"EBM input_dim={ebm_model.pair_mean.shape[0]} but planner expected state_dim+action_dim={expected_ebm_dim}."
+        )
+    ebm_constraint = make_ebm_domain_constraint(ebm_model)
+    print(
+        f"Using EBM domain constraint from {cfg.ebm_artifact_path} "
+        f"with threshold {float(ebm_model.energy_threshold):.6g}"
+    )
     if cfg.use_constant_covariance:
         calibrated_cholesky = load_calibrated_cholesky(cfg.constant_covariance_path)
         disturbance = make_constant_jax_disturbance(calibrated_cholesky, state_dim)
@@ -287,11 +368,6 @@ def main():
 
     cost = make_tracking_cost(1.0, cfg.horizon, W_term, jnp.asarray(goal_state))
 
-    box_min, box_max = -3.0 * jnp.ones(state_dim), 3.0 * jnp.ones(state_dim)
-    # second half (velocity) should stay around +/- 0.5
-    box_min = box_min.at[state_dim // 2:].set(-0.5)
-    box_max = box_max.at[state_dim // 2:].set(0.5)
-
     mppi_rollout, mppi_eval = make_mppi_rollout_and_eval(
         dynamics,
         state_dim,
@@ -299,9 +375,8 @@ def main():
         cfg.horizon,
         W_mppi,
         jnp.asarray(goal_state),
-        box_min=box_min,
-        box_max=box_max,
-        box_penalty_weight=cfg.mppi_state_box_penalty,
+        ebm_model=ebm_model,
+        ebm_penalty_weight=cfg.ebm_penalty_weight,
     )
 
     mppi_planner = MPPIPlanner(
@@ -318,8 +393,9 @@ def main():
         sls_cfg, SQPConfig(max_sqp_iterations=1, warm_start=False, feas_tol=1e-2, step_tol=1e-4, line_search=True),
         ADMMConfig(eps_abs=5e-2, eps_rel=1e-4, rho_max=1e4, max_iterations=400, rho_update_frequency=20, initial_rho=1.0),
         config=MPCConfig(n=state_dim, nu=action_dim, N=cfg.horizon, W=W_stage, u_ref=jnp.zeros(action_dim), dt=1.0/30.0),
-        dynamics=dynamics, constraints=combine_constraints(make_state_box_constraints(box_min, box_max), make_control_box_constraints(-5.0*jnp.ones(action_dim), 5.0*jnp.ones(action_dim))),
-        obstacles=jnp.zeros((0, 3)), cost=cost, num_constraints=2 * action_dim + 2 * state_dim, disturbance=disturbance, shift=1,
+        dynamics=dynamics,
+        constraints=combine_constraints(ebm_constraint, make_control_box_constraints(-5.0*jnp.ones(action_dim), 5.0*jnp.ones(action_dim))),
+        obstacles=jnp.zeros((0, 3)), cost=cost, num_constraints=2 * action_dim + 1, disturbance=disturbance, shift=1,
         X_in=jnp.zeros((cfg.horizon + 1, state_dim), dtype=jnp.float64), U_in=jnp.zeros((cfg.horizon, action_dim), dtype=jnp.float64)
     )
 
@@ -339,6 +415,17 @@ def main():
         
         controller.X_in = X_warmstart
         controller.U_in = jnp.asarray(mppi_res["act_seq"])
+
+        current_pair_energy = ebm_model(jnp.concatenate([jnp.asarray(current_state), jnp.zeros(action_dim)]))
+        warmstart_pairs = jnp.concatenate([X_warmstart[:-1], controller.U_in], axis=-1)
+        warmstart_energies = jax.vmap(ebm_model)(warmstart_pairs)
+        print(
+            f"EBM energy step={step_idx:03d}: "
+            f"current_zero_u={float(current_pair_energy):.3f}, "
+            f"warmstart_min={float(jnp.min(warmstart_energies)):.3f}, "
+            f"warmstart_max={float(jnp.max(warmstart_energies)):.3f}, "
+            f"threshold={float(ebm_model.energy_threshold):.3f}"
+        )
 
         try:
             u0, X_pred, U_pred, *solver_info = controller.run(x0=current_state, reference=X_warmstart, parameter=1.0/30.0)

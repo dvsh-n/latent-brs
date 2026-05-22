@@ -1,12 +1,14 @@
 # sls_config.yaml
-q_learned: 4.601882457733154 # Update this with the value from conformal_config.json
+q_learned: 4.59367561340332 # Update this with the value from conformal_config.json
 model_dir: "ogbench_cube/models/mlpdyn_embd_8"
-error_model_ckpt: "ogbench_cube/models/err_pred_logs/cube_experiment_embed_8/version_3/checkpoints/best-error-model-epoch=6398.ckpt"
+error_model_ckpt: "ogbench_cube/models/err_pred_logs/cube_experiment_embed_8/version_5/checkpoints/best-error-model-epoch=6344.ckpt"
 dataset_path: "ogbench_cube/data/test_data/ogbench_cube_test.h5"
 out_dir: "ogbench_cube/plan/sls_mpc_conformal"
 device: "auto"
-horizon: 15
+horizon: 10
 max_mpc_steps: 200
-video_fps: 50
+video_fps: 20
 episode_idx: 1498 # 6588  # 6560 6534 6588# Use a number (e.g. 5) or null for random
 seed: 42
+visualize_success_colors: false
+terminate_on_ogbench_success: true
