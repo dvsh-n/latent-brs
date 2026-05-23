@@ -30,7 +30,8 @@ from tqdm.auto import tqdm
 
 DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
 DEFAULT_DATA_PATH = "rope/plan/obstacle_data/obstacle_classifier_data.pt"
-DEFAULT_OUT_DIR = "rope/plan/obs_net"
+DEFAULT_OUT_DIR = "rope/plan/sm_obs_net"
+DEFAULT_ACTIVATION = nn.GELU
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--frame-batch-size", type=int, default=64)
-    parser.add_argument("--hidden-dim", type=int, default=32)
+    parser.add_argument("--hidden-dim", type=int, default=12)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=100)
@@ -203,7 +204,7 @@ class ObstacleMLP(nn.Module):
         for _ in range(depth - 1):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
+            layers.append(DEFAULT_ACTIVATION())
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
             in_dim = hidden_dim

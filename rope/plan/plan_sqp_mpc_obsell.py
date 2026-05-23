@@ -32,14 +32,14 @@ from rope.shared.lab_env import BaseEnvConfig, LabEnv, TaskState
 from rope.train.mlpdyn_train import LeWMRopeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "rope/data/test_data_noshadow.h5"
-DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow"
 DEFAULT_OUT_DIR = "rope/plan/sqp_mpc_obsell"
 DEFAULT_OBSTACLE_ELLIPSOID_PATH = "rope/plan/obs_ellipsoid/ellipsoid.pt"
 
 DEVICE = "auto"
-HORIZON = 15
-MAX_MPC_STEPS = 50
-Q_TERMINAL = 5.0
+HORIZON = 25
+MAX_MPC_STEPS = 100
+Q_TERMINAL = 15.0
 Q_STAGE = 0.005
 R_CONTROL = 0.01
 VIDEO_FPS = 20
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-max-iters", type=int, default=15)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
-    parser.add_argument("--sqp-max-iters", type=int, default=10)
+    parser.add_argument("--sqp-max-iters", type=int, default=3)
     parser.add_argument("--sqp-tol", type=float, default=1e-3)
     parser.add_argument("--u-min", type=float, default=-2.0)
     parser.add_argument("--u-max", type=float, default=2.0)
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obstacle-slack-quadratic", type=float, default=100.0)
     parser.add_argument("--qp-admm-iters", type=int, default=250)
     parser.add_argument("--qp-admm-rho", type=float, default=1.0)
-    parser.add_argument("--qp-admm-tol", type=float, default=1e-4)
+    parser.add_argument("--qp-admm-tol", type=float, default=1e-2)
     parser.add_argument(
         "--use-dataset-endpoints",
         action="store_true",

@@ -35,6 +35,7 @@ DIAGNOSTIC_PLOT_NAME = "balanced_obstacle_dataset_reach_height.png"
 DEFAULT_SAMPLES_PER_CLASS = 8192
 DEFAULT_OBSTACLE_REACH_LOWER = 0.05
 DEFAULT_OBSTACLE_REACH_UPPER = 0.15
+DEFAULT_OBSTACLE_BASE_HEIGHT = float(TABLE_TOP_Z)
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,8 +81,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--midpoint-buffer",
         type=float,
-        default=0.025,
+        default=0.01,
         help="Extra clearance margin for proxy/model error.",
+    )
+    parser.add_argument(
+        "--obstacle-base-height",
+        type=float,
+        default=DEFAULT_OBSTACLE_BASE_HEIGHT,
+        help="Base height where the half-ellipse obstacle meets its left/right reach boundaries.",
     )
     return parser.parse_args()
 
@@ -223,6 +230,23 @@ def interpolate_sag_drop(widths: np.ndarray, width_values: np.ndarray, sag_drop_
     )
 
 
+def half_ellipse_obstacle_height(
+    reach: np.ndarray,
+    obstacle_reach: tuple[float, float],
+    obstacle_base_height: float,
+    obstacle_peak_height: float,
+) -> np.ndarray:
+    reach_values = np.asarray(reach, dtype=np.float64)
+    center = 0.5 * (float(obstacle_reach[0]) + float(obstacle_reach[1]))
+    half_width = 0.5 * (float(obstacle_reach[1]) - float(obstacle_reach[0]))
+    if half_width <= 0.0:
+        raise ValueError("Obstacle reach interval must have positive width.")
+    normalized = (reach_values - center) / half_width
+    boundary = 1.0 - normalized**2
+    profile = np.sqrt(np.clip(boundary, 0.0, None))
+    return float(obstacle_base_height) + (float(obstacle_peak_height) - float(obstacle_base_height)) * profile
+
+
 def estimate_low_rope_height(
     states: np.ndarray,
     width_values: np.ndarray,
@@ -236,14 +260,16 @@ def classify_obstacle_states(
     states: np.ndarray,
     *,
     obstacle_reach: tuple[float, float],
-    low_rope_cutoff: float,
+    obstacle_base_height: float,
+    obstacle_peak_height: float,
     width_values: np.ndarray,
     sag_drop_values: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     low_rope_height = estimate_low_rope_height(states, width_values, sag_drop_values)
     sag_drop = interpolate_sag_drop(states[:, 2], width_values, sag_drop_values)
+    profile_height = half_ellipse_obstacle_height(states[:, 0], obstacle_reach, obstacle_base_height, obstacle_peak_height)
     in_reach = (states[:, 0] >= obstacle_reach[0]) & (states[:, 0] <= obstacle_reach[1])
-    labels = (in_reach & (low_rope_height <= low_rope_cutoff)).astype(np.int64)
+    labels = (in_reach & (low_rope_height <= profile_height)).astype(np.int64)
     return labels, low_rope_height, sag_drop
 
 
@@ -254,7 +280,8 @@ def sample_labeled_task_states(
     lower: np.ndarray,
     upper: np.ndarray,
     obstacle_reach: tuple[float, float],
-    low_rope_cutoff: float,
+    obstacle_base_height: float,
+    obstacle_peak_height: float,
     width_values: np.ndarray,
     sag_drop_values: np.ndarray,
     rng: np.random.Generator,
@@ -270,7 +297,8 @@ def sample_labeled_task_states(
         candidate_labels, candidate_low, candidate_sag = classify_obstacle_states(
             candidates,
             obstacle_reach=obstacle_reach,
-            low_rope_cutoff=low_rope_cutoff,
+            obstacle_base_height=obstacle_base_height,
+            obstacle_peak_height=obstacle_peak_height,
             width_values=width_values,
             sag_drop_values=sag_drop_values,
         )
@@ -396,7 +424,8 @@ def save_balanced_dataset_diagnostic(
     low_rope_height: np.ndarray,
     *,
     obstacle_reach: tuple[float, float],
-    low_rope_cutoff: float,
+    obstacle_base_height: float,
+    obstacle_peak_height: float,
 ) -> None:
     fig, ax = plt.subplots(figsize=(7.5, 5.5), dpi=180)
     obstacle_mask = labels == 1
@@ -420,8 +449,18 @@ def save_balanced_dataset_diagnostic(
         edgecolors="none",
         label="obstacle",
     )
-    ax.axvspan(obstacle_reach[0], obstacle_reach[1], color="#d55e00", alpha=0.08, label="obstacle reach interval")
-    ax.axhline(low_rope_cutoff, color="#4d4d4d", linestyle="--", linewidth=1.2, label="clearance threshold")
+    curve_reach = np.linspace(float(obstacle_reach[0]), float(obstacle_reach[1]), num=256, dtype=np.float64)
+    curve_height = half_ellipse_obstacle_height(curve_reach, obstacle_reach, obstacle_base_height, obstacle_peak_height)
+    ax.fill_between(
+        curve_reach,
+        float(obstacle_base_height),
+        curve_height,
+        color="#d55e00",
+        alpha=0.08,
+        label="half-ellipse obstacle region",
+    )
+    ax.plot(curve_reach, curve_height, color="#4d4d4d", linestyle="--", linewidth=1.2, label="obstacle boundary")
+    ax.axhline(float(TABLE_TOP_Z), color="#0072b2", linestyle=":", linewidth=1.2, label="table top")
     ax.set_title("Balanced obstacle dataset by reach and estimated low-rope height")
     ax.set_xlabel("reach")
     ax.set_ylabel("estimated low-rope height")
@@ -452,7 +491,12 @@ def main() -> None:
     )
 
     low_rope_target = float(TABLE_TOP_Z + float(args.midpoint_clearance))
-    low_rope_cutoff = float(low_rope_target + float(args.midpoint_buffer))
+    obstacle_base_height = float(args.obstacle_base_height)
+    obstacle_peak_height = float(low_rope_target + float(args.midpoint_buffer))
+    if obstacle_base_height > obstacle_peak_height:
+        raise ValueError(
+            f"Obstacle base height {obstacle_base_height} cannot exceed obstacle peak height {obstacle_peak_height}."
+        )
 
     obstacle_states, obstacle_low_rope_height, obstacle_sag_drop = sample_labeled_task_states(
         1,
@@ -460,7 +504,8 @@ def main() -> None:
         lower=lower,
         upper=upper,
         obstacle_reach=reach_bounds,
-        low_rope_cutoff=low_rope_cutoff,
+        obstacle_base_height=obstacle_base_height,
+        obstacle_peak_height=obstacle_peak_height,
         width_values=width_values,
         sag_drop_values=sag_drop_values,
         rng=rng,
@@ -471,7 +516,8 @@ def main() -> None:
         lower=lower,
         upper=upper,
         obstacle_reach=reach_bounds,
-        low_rope_cutoff=low_rope_cutoff,
+        obstacle_base_height=obstacle_base_height,
+        obstacle_peak_height=obstacle_peak_height,
         width_values=width_values,
         sag_drop_values=sag_drop_values,
         rng=rng,
@@ -508,7 +554,8 @@ def main() -> None:
         balanced["label"],
         balanced["low_rope_height"],
         obstacle_reach=reach_bounds,
-        low_rope_cutoff=low_rope_cutoff,
+        obstacle_base_height=obstacle_base_height,
+        obstacle_peak_height=obstacle_peak_height,
     )
 
     torch.save(
@@ -525,7 +572,10 @@ def main() -> None:
                 "low_rope_clearance": float(args.midpoint_clearance),
                 "model_error_buffer": float(args.midpoint_buffer),
                 "low_rope_target": float(low_rope_target),
-                "low_rope_cutoff": float(low_rope_cutoff),
+                "low_rope_cutoff": float(obstacle_peak_height),
+                "obstacle_profile": "half_ellipse",
+                "obstacle_base_height": float(obstacle_base_height),
+                "obstacle_height": float(obstacle_peak_height),
                 "obstacle_reach": np.array(reach_bounds, dtype=np.float32),
                 "task_lower": lower.astype(np.float32),
                 "task_upper": upper.astype(np.float32),
@@ -588,7 +638,10 @@ def main() -> None:
                 for box in endpoint_boxes
             ],
             "low_rope_target": float(low_rope_target),
-            "low_rope_cutoff": float(low_rope_cutoff),
+            "low_rope_cutoff": float(obstacle_peak_height),
+            "obstacle_profile": "half_ellipse",
+            "obstacle_base_height": float(obstacle_base_height),
+            "obstacle_height": float(obstacle_peak_height),
             "sag_drop_min": float(np.min(sag_drop_values)),
             "sag_drop_max": float(np.max(sag_drop_values)),
         },

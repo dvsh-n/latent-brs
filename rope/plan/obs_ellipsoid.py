@@ -22,10 +22,10 @@ import numpy as np
 import torch
 
 DEFAULT_DATA_PATH = "rope/plan/obstacle_data/obstacle_classifier_data.pt"
-DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow"
 DEFAULT_OUT_DIR = "rope/plan/obs_ellipsoid"
-DEFAULT_ALPHA = 0.1
-DEFAULT_EPSILON = 1e-8
+DEFAULT_ALPHA = 0.15
+DEFAULT_EPSILON = 1e-12
 DEFAULT_LABEL = "obstacle"
 
 

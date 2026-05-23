@@ -29,17 +29,19 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rope.shared.lab_env import BaseEnvConfig, LabEnv, TaskState
-from rope.train.mlpdyn_train import LeWMRopeDataset, build_markov_state, required_markov_history
+from rope.train.mlpdyn_train import build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "rope/data/test_data_noshadow.h5"
-DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow"
 DEFAULT_OUT_DIR = "rope/plan/sqp_mpc_obs"
-DEFAULT_OBSTACLE_MODEL_PATH = "rope/plan/obs_net/da270d7d1050f110/model.pt"
+DEFAULT_OBSTACLE_MODEL_PATH = "rope/plan/obs_net_big/798d07f6f1c6ee95/model.pt"
+DEFAULT_ACTION_NORM_PATH = "rope/models/train_data_noshadow_action_norm.pt"
+DEFAULT_ACTIVATION = nn.SiLU
 
 DEVICE = "auto"
 HORIZON = 15
-MAX_MPC_STEPS = 50
-Q_TERMINAL = 5.0
+MAX_MPC_STEPS = 100
+Q_TERMINAL = 15.0
 Q_STAGE = 0.005
 R_CONTROL = 0.01
 VIDEO_FPS = 20
@@ -54,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     parser.add_argument("--obstacle-model", type=Path, default=Path(DEFAULT_OBSTACLE_MODEL_PATH))
+    parser.add_argument("--action-norm-path", type=Path, default=Path(DEFAULT_ACTION_NORM_PATH))
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--episode-idx", type=int, default=EPISODE_IDX)
     parser.add_argument("--horizon", type=int, default=HORIZON)
@@ -73,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-max-iters", type=int, default=15)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
-    parser.add_argument("--sqp-max-iters", type=int, default=10)
+    parser.add_argument("--sqp-max-iters", type=int, default=3)
     parser.add_argument("--sqp-tol", type=float, default=1e-3)
     parser.add_argument("--u-min", type=float, default=-2.0)
     parser.add_argument("--u-max", type=float, default=2.0)
@@ -137,6 +140,33 @@ def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
     model.eval()
     model.requires_grad_(False)
     return model
+
+
+def load_action_norm(action_norm_path: Path, action_dim: int) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    if not action_norm_path.is_file():
+        raise FileNotFoundError(
+            f"Action normalization stats not found: {action_norm_path}. "
+            "Generate them from rope/data/train_data_noshadow.h5 before running this planner."
+        )
+    stats = torch.load(action_norm_path, map_location="cpu", weights_only=False)
+    if not isinstance(stats, dict):
+        raise ValueError(f"Expected action norm stats dict in {action_norm_path}, got {type(stats).__name__}.")
+    if "action_mean" not in stats or "action_std" not in stats:
+        raise KeyError(f"Action norm stats must contain 'action_mean' and 'action_std': {action_norm_path}")
+
+    action_mean = np.asarray(stats["action_mean"], dtype=np.float32).reshape(-1)
+    action_std = np.asarray(stats["action_std"], dtype=np.float32).reshape(-1)
+    if action_mean.shape[0] != action_dim or action_std.shape[0] != action_dim:
+        raise ValueError(
+            f"Action norm dimension mismatch: expected {action_dim}, "
+            f"got mean={action_mean.shape[0]} std={action_std.shape[0]} from {action_norm_path}."
+        )
+    if not np.all(np.isfinite(action_mean)) or not np.all(np.isfinite(action_std)):
+        raise ValueError(f"Action normalization stats contain non-finite values: {action_norm_path}")
+    if np.any(action_std <= 0.0):
+        raise ValueError(f"Action std must be positive in {action_norm_path}: {action_std.tolist()}")
+
+    return action_mean.astype(np.float32), action_std.astype(np.float32), stats
 
 
 def save_rgb_image(path: Path, image: np.ndarray) -> None:
@@ -606,7 +636,7 @@ class ObstacleMLP(nn.Module):
         for _ in range(depth - 1):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
+            layers.append(DEFAULT_ACTIVATION())
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
             in_dim = hidden_dim
@@ -1206,6 +1236,7 @@ def main() -> None:
     device = require_device(args.device)
     model_dir = args.model_dir.expanduser().resolve()
     dataset_path = args.dataset_path.expanduser().resolve()
+    action_norm_path = args.action_norm_path.expanduser().resolve()
     out_root = args.out_dir.expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -1229,19 +1260,9 @@ def main() -> None:
     if frameskip != 1:
         raise ValueError(f"This rope planner currently expects frameskip=1, got {frameskip}.")
 
-    train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
-    train_stats_dataset = LeWMRopeDataset(
-        train_dataset_path,
-        markov_deriv=markov_deriv,
-        num_preds=1,
-        frameskip=frameskip,
-        img_size=img_size,
-        action_dim=action_dim,
-    )
     pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
     pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
-    action_mean = train_stats_dataset.action_mean.astype(np.float32)
-    action_std = train_stats_dataset.action_std.astype(np.float32)
+    action_mean, action_std, action_norm_stats = load_action_norm(action_norm_path, action_dim)
 
     rng = np.random.default_rng(args.seed)
     dataset_metadata = load_dataset_metadata(dataset_path)
@@ -1613,6 +1634,8 @@ def main() -> None:
             "episode_seed": episode_seed,
             "checkpoint": str(checkpoint_path),
             "dataset_path": str(dataset_path),
+            "action_norm_path": str(action_norm_path),
+            "action_norm_source_dataset_path": str(action_norm_stats.get("source_dataset_path", "")),
             "endpoint_source": endpoint_source,
             "endpoint_sampling": endpoint_sampling_info,
             "camera": camera,
