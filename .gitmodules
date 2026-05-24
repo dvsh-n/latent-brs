@@ -28,3 +28,6 @@
 [submodule "third_party/latent-safety"]
 	path = third_party/latent-safety
 	url = https://github.com/danielyin21/latent-safety.git
+[submodule "third_party/lpb"]
+	path = third_party/lpb
+	url = https://github.com/zhanyisun/lpb.git
