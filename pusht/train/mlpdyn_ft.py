@@ -28,10 +28,10 @@ from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 DEFAULT_DATASET_PATHS = [
     Path("pusht/data/pusht_diffusion_train.h5"),
     Path("pusht/data/pusht_diffusion_edge.h5"),
-    Path("pusht/data/pusht_diffusion_random.h5"),
+    # Path("pusht/data/pusht_diffusion_random.h5"),
 ]
-DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_2"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn_diffusion_dataset_ft_3"
+DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_embd_48"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_embd_48_straighten"
 FIXED_FRAMESKIP = 1
 
 
@@ -54,9 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=64)
+    parser.add_argument("--embed-dim", type=int, default=48)
     parser.add_argument("--markov-deriv", type=int, default=2)
-    parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
@@ -66,10 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
     parser.add_argument(
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Load MLP dynamics weights from the init checkpoint.",
     )
-    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=110)
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(

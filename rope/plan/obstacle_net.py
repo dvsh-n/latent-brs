@@ -30,7 +30,7 @@ from tqdm.auto import tqdm
 
 DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft_3"
 DEFAULT_DATA_PATH = "rope/plan/obstacle_data/obstacle_classifier_data.pt"
-DEFAULT_OUT_DIR = "rope/plan/obs_net_sm_model"
+DEFAULT_OUT_DIR = "rope/plan/obs_net"
 DEFAULT_ACTIVATION = nn.GELU
 
 

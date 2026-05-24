@@ -28,8 +28,8 @@ DEFAULT_DATASET_PATHS = [
     Path("reacher/data/train_data_noisy.h5"),
     # Path("reacher/data/obtuse_data.h5"),
 ]
-DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft_5"
-DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_9"
+DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft_6"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_6_straighten"
 FIXED_FRAMESKIP = 1
 
 

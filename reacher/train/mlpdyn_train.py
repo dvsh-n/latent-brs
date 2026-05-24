@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "reacher/data/train_data_noisy/reacher_train.h5"
-DEFAULT_RUN_DIR = "reacher/models/mlpdyn_no_ms"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_embd_7_straighten"
 FINETUNE_DIR = None
 FIXED_FRAMESKIP = 1
 
@@ -42,9 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=12)
+    parser.add_argument("--embed-dim", type=int, default=7)
     parser.add_argument("--history-size", type=int, default=1)
-    parser.add_argument("--num-preds", type=int, default=1, help="Autoregressive rollout horizon.")
+    parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
@@ -54,10 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=110)
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--prefetch-factor", type=int, default=2)
