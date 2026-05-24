@@ -16,7 +16,7 @@ import imageio.v2 as imageio
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATASET_PATH = REPO_ROOT / "reacher/data/reacher_lewm.h5"
+DEFAULT_DATASET_PATH = REPO_ROOT / "reacher/data/train_data_noisy.h5"
 DEFAULT_FPS = 50.0
 
 

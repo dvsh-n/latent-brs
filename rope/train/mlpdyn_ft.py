@@ -24,9 +24,9 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from rope.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "rope/data/train_data_noshadow/rope_random_cubic_spline.h5"
+DEFAULT_DATASET_PATH = "rope/data/train_data_noshadow.h5"
 DEFAULT_INIT_RUN_DIR = "rope/models/mlpdyn_noshadow"
-DEFAULT_RUN_DIR = "rope/models/mlpdyn_noshadow_ft"
+DEFAULT_RUN_DIR = "rope/models/mlpdyn_noshadow_ft_3"
 FIXED_FRAMESKIP = 1
 
 
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=10)

@@ -25,11 +25,11 @@ from reacher.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
 DEFAULT_DATASET_PATHS = [
-    Path("reacher/data/train_data_noisy/reacher_train.h5"),
-    Path("reacher/data/obtuse_rollouts/reacher_train.h5"),
+    Path("reacher/data/train_data_noisy.h5"),
+    # Path("reacher/data/obtuse_data.h5"),
 ]
-DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft_7"
-DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_8"
+DEFAULT_INIT_RUN_DIR = "reacher/models/mlpdyn_ft_5"
+DEFAULT_RUN_DIR = "reacher/models/mlpdyn_ft_9"
 FIXED_FRAMESKIP = 1
 
 
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=5)
+    parser.add_argument("--embed-dim", type=int, default=7)
     parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
     parser.add_argument("--epochs", type=int, default=10)
@@ -73,13 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--load-projector",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Load projector weights from the init checkpoint.",
     )
     parser.add_argument(
         "--load-mlpdyn",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Load MLP dynamics weights from the init checkpoint.",
     )
     parser.add_argument("--batch-size", type=int, default=110)

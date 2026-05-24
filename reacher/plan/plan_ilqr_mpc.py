@@ -28,17 +28,17 @@ from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
 DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_noisy.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_sin"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_6"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "cuda"
-HORIZON = 20
+HORIZON = 15
 MAX_MPC_STEPS = 100
 Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.01
 VIDEO_FPS = 60
-EPISODE_IDX = None
+EPISODE_IDX = 3781
 # DEFAULT_START_QPOS = np.array([0.146451935172081, -0.7491843104362488], dtype=np.float32)
 # DEFAULT_GOAL_QPOS = np.array([2.4196903705596924, -0.9535070657730103], dtype=np.float32)
 # DEFAULT_START_QPOS = np.array([0.1, -2.0], dtype=np.float32)

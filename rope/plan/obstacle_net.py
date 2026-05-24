@@ -28,9 +28,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
-DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft_3"
 DEFAULT_DATA_PATH = "rope/plan/obstacle_data/obstacle_classifier_data.pt"
-DEFAULT_OUT_DIR = "rope/plan/sm_obs_net"
+DEFAULT_OUT_DIR = "rope/plan/obs_net_sm_model"
 DEFAULT_ACTIVATION = nn.GELU
 
 
