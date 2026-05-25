@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/codex_mplconfig")
 
 USER_SITE_FRAGMENT = ".local/lib/python"
@@ -17,11 +19,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from tqdm.auto import tqdm
+
+from ogbench_cube.plan.obs_data_collect import (
+    DEFAULT_CAMERA,
+    DEFAULT_CONTROL_DECIMATION,
+    DEFAULT_ENV_NAME,
+    DEFAULT_SETTLE_STEPS,
+    DEFAULT_SIM_FREQ_HZ,
+    capture_grasp_reference,
+    make_env,
+    render_without_target_cube,
+    synthesize_grasped_state,
+)
 
 DEFAULT_OUT_DIR = Path("ogbench_cube/plan/random_endpoint_pairs")
 DEFAULT_PLOT_NAME = "start_goal_speed_bump.png"
 DEFAULT_DATASET_NAME = "start_goal_speed_bump.pt"
-DEFAULT_NUM_POINTS = 256
+DEFAULT_NUM_POINTS = 1024
+DEFAULT_IMAGE_WIDTH = 224
+DEFAULT_IMAGE_HEIGHT = 224
 FIXED_YAW = 0.0
 
 X_BOUNDS = (0.30, 0.50)
@@ -43,6 +60,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-name", default=DEFAULT_DATASET_NAME)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-points", type=int, default=DEFAULT_NUM_POINTS)
+    parser.add_argument("--env-name", default=DEFAULT_ENV_NAME)
+    parser.add_argument("--camera", default=DEFAULT_CAMERA)
+    parser.add_argument("--width", type=int, default=DEFAULT_IMAGE_WIDTH)
+    parser.add_argument("--height", type=int, default=DEFAULT_IMAGE_HEIGHT)
+    parser.add_argument("--sim-freq-hz", type=float, default=DEFAULT_SIM_FREQ_HZ)
+    parser.add_argument("--control-decimation", type=int, default=DEFAULT_CONTROL_DECIMATION)
+    parser.add_argument("--max-episode-steps", type=int, default=150)
+    parser.add_argument("--oracle-segment-dt", type=float, default=0.4)
+    parser.add_argument("--oracle-noise", type=float, default=0.0)
+    parser.add_argument("--oracle-noise-smoothing", type=float, default=0.5)
+    parser.add_argument("--max-oracle-steps", type=int, default=80)
+    parser.add_argument("--settle-steps", type=int, default=DEFAULT_SETTLE_STEPS)
+    parser.add_argument("--grasp-contact-threshold", type=float, default=0.5)
+    parser.add_argument("--grasp-alignment-threshold", type=float, default=0.03)
     return parser.parse_args()
 
 
@@ -176,6 +207,30 @@ def save_plot(
     plt.close(fig)
 
 
+def render_grasped_images(
+    points: np.ndarray,
+    *,
+    env: object,
+    reference: object,
+    yaw: float,
+    camera: str,
+    settle_steps: int,
+    seed_offset: int,
+) -> np.ndarray:
+    frames: list[np.ndarray] = []
+    for index, point in enumerate(tqdm(points, desc=f"Rendering {camera}", unit="image")):
+        env.reset(seed=seed_offset + index)
+        synthesize_grasped_state(
+            env,
+            block_pos=np.asarray(point, dtype=np.float64),
+            block_yaw=float(yaw),
+            reference=reference,
+            settle_steps=int(settle_steps),
+        )
+        frames.append(render_without_target_cube(env, str(camera)))
+    return np.stack(frames, axis=0).astype(np.uint8)
+
+
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
@@ -187,10 +242,38 @@ def main() -> None:
     out_path = args.out_dir / args.out_name
 
     save_plot(plot_path, start_points=start_points, goal_points=goal_points)
+    env = make_env(args)
+    try:
+        reference, _ = capture_grasp_reference(env, args)
+        start_pixels = render_grasped_images(
+            start_points,
+            env=env,
+            reference=reference,
+            yaw=FIXED_YAW,
+            camera=str(args.camera),
+            settle_steps=int(args.settle_steps),
+            seed_offset=int(args.seed) + 10_000,
+        )
+        goal_pixels = render_grasped_images(
+            goal_points,
+            env=env,
+            reference=reference,
+            yaw=FIXED_YAW,
+            camera=str(args.camera),
+            settle_steps=int(args.settle_steps),
+            seed_offset=int(args.seed) + 20_000,
+        )
+    finally:
+        env.close()
+
     payload = {
         "metadata": {
             "seed": int(args.seed),
             "num_points": int(args.num_points),
+            "env_name": str(args.env_name),
+            "camera": str(args.camera),
+            "image_width": int(args.width),
+            "image_height": int(args.height),
             "x_bounds": np.asarray(X_BOUNDS, dtype=np.float32),
             "y_bounds": np.asarray(Y_BOUNDS, dtype=np.float32),
             "table_z": float(TABLE_Z),
@@ -205,10 +288,12 @@ def main() -> None:
         "start": {
             "task_target": start_points.astype(np.float32),
             "yaw": np.full((int(args.num_points),), FIXED_YAW, dtype=np.float32),
+            "pixels": start_pixels,
         },
         "goal": {
             "task_target": goal_points.astype(np.float32),
             "yaw": np.full((int(args.num_points),), FIXED_YAW, dtype=np.float32),
+            "pixels": goal_pixels,
         },
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
