@@ -31,3 +31,6 @@
 [submodule "third_party/lpb"]
 	path = third_party/lpb
 	url = https://github.com/zhanyisun/lpb.git
+[submodule "third_party/dino_wm"]
+	path = third_party/dino_wm
+	url = https://github.com/gaoyuezhou/dino_wm.git
