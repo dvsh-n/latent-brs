@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
+import sys
 import time
+import warnings
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -25,9 +28,11 @@ from rope.shared.lab_env import LabEnv, TaskState
 from rope.train.mlpdyn_train import build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "rope/data/test_data_noshadow.h5"
-DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft_3"
 DEFAULT_OUT_DIR = "rope/plan/ilqr_mpc_mlpdyn"
 DEFAULT_ACTION_NORM_PATH = "rope/models/train_data_noshadow_action_norm.pt"
+DEFAULT_ENDPOINT_PAIR_PATH = "rope/plan/random_endpoint_pairs/random_endpoint_pairs.pt"
+DEFAULT_ENDPOINT_PAIR_IDX =11
 
 DEVICE = "auto"
 HORIZON = 15
@@ -47,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     parser.add_argument("--action-norm-path", type=Path, default=Path(DEFAULT_ACTION_NORM_PATH))
+    parser.add_argument("--endpoint-pair-path", type=Path, default=Path(DEFAULT_ENDPOINT_PAIR_PATH))
+    parser.add_argument("--endpoint-pair-idx", type=int, default=DEFAULT_ENDPOINT_PAIR_IDX)
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--episode-idx", type=int, default=EPISODE_IDX)
     parser.add_argument("--horizon", type=int, default=HORIZON)
@@ -143,6 +150,24 @@ def load_action_norm(action_norm_path: Path, action_dim: int) -> tuple[np.ndarra
 def save_rgb_image(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     imageio.imwrite(path, np.ascontiguousarray(image))
+
+
+def to_jsonable(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    return value
+
+
+def stack_or_empty(values: list[np.ndarray], shape_tail: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    if values:
+        return np.stack(values, axis=0).astype(dtype, copy=False)
+    return np.empty((0, *shape_tail), dtype=dtype)
 
 
 def save_rollout_video(frames: list[np.ndarray], out_dir: Path, fps: int) -> Path:
@@ -260,6 +285,63 @@ def load_dataset_episode(
             "terminated": bool(h5["terminated"][episode_idx]) if "terminated" in h5 else False,
             "truncated": bool(h5["truncated"][episode_idx]) if "truncated" in h5 else False,
         }
+
+
+def load_endpoint_pair(
+    endpoint_pair_path: Path,
+    pair_idx: int,
+) -> dict[str, dict[str, np.ndarray] | dict[str, object]]:
+    if not endpoint_pair_path.is_file():
+        raise FileNotFoundError(f"Endpoint pair file not found: {endpoint_pair_path}")
+
+    # The checked-in artifact was written with a NumPy version whose pickle
+    # module paths differ from some environments.
+    try:
+        importlib.import_module("numpy._core")
+    except ModuleNotFoundError:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            numpy_core = importlib.import_module("numpy.core")
+            numpy_multiarray = importlib.import_module("numpy.core.multiarray")
+            numpy_numeric = importlib.import_module("numpy.core.numeric")
+        sys.modules.setdefault("numpy._core", numpy_core)
+        sys.modules.setdefault("numpy._core.multiarray", numpy_multiarray)
+        sys.modules.setdefault("numpy._core.numeric", numpy_numeric)
+
+    payload = torch.load(endpoint_pair_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected endpoint pair payload dict, got {type(payload).__name__}.")
+    for side in ("start", "goal"):
+        if side not in payload or not isinstance(payload[side], dict):
+            raise KeyError(f"Endpoint pair payload must contain a '{side}' dict.")
+        for key in ("task_target", "qpos", "control", "pixels"):
+            if key not in payload[side]:
+                raise KeyError(f"Endpoint pair payload missing {side}.{key}.")
+
+    pair_count = int(np.asarray(payload["start"]["task_target"]).shape[0])
+    if pair_idx < 0 or pair_idx >= pair_count:
+        raise ValueError(f"--endpoint-pair-idx must be in [0, {pair_count - 1}], got {pair_idx}.")
+
+    selected: dict[str, dict[str, np.ndarray] | dict[str, object]] = {
+        "metadata": dict(payload.get("metadata", {})),
+        "start": {},
+        "goal": {},
+    }
+    for side in ("start", "goal"):
+        side_out = selected[side]
+        assert isinstance(side_out, dict)
+        for key, dtype in (
+            ("task_target", np.float32),
+            ("qpos", np.float32),
+            ("control", np.float32),
+            ("pixels", np.uint8),
+        ):
+            side_out[key] = np.asarray(payload[side][key][pair_idx], dtype=dtype)
+        for key in ("low_rope_height", "sag_drop"):
+            if key in payload[side]:
+                side_out[key] = np.asarray(payload[side][key][pair_idx], dtype=np.float32)
+
+    return selected
 
 
 def render_rgb_frame(
@@ -607,26 +689,56 @@ def main() -> None:
             raise ValueError(f"--episode-idx {episode_idx} must have at least 2 frames, got {ep_len[episode_idx]}.")
 
     episode = load_dataset_episode(dataset_path, episode_idx)
+    endpoint_pair_path = args.endpoint_pair_path.expanduser().resolve()
+    endpoint_pair_idx = int(args.endpoint_pair_idx)
+    endpoint_pair = load_endpoint_pair(endpoint_pair_path, endpoint_pair_idx)
+    endpoint_metadata = endpoint_pair["metadata"]
+    endpoint_start = endpoint_pair["start"]
+    endpoint_goal = endpoint_pair["goal"]
+    if not isinstance(endpoint_metadata, dict) or not isinstance(endpoint_start, dict) or not isinstance(endpoint_goal, dict):
+        raise TypeError("Endpoint pair loader returned malformed data.")
+
     episode_seed = int(episode["episode_seed"])
-    camera = str(episode["camera"])
-    width = int(episode["width"])
-    height = int(episode["height"])
+    camera = str(endpoint_metadata.get("camera", episode["camera"]))
+    width = int(endpoint_metadata.get("image_width", episode["width"]))
+    height = int(endpoint_metadata.get("image_height", episode["height"]))
     control_decimation = int(episode["control_decimation"])
     dataset_goal_tolerance = float(episode["goal_tolerance"])
     goal_tolerance = float(args.goal_tolerance) if args.goal_tolerance is not None else dataset_goal_tolerance
     dataset_max_episode_steps = int(episode["max_episode_steps"])
 
-    task_target_np = np.asarray(episode["task_target"], dtype=np.float32)
-    qpos_np = np.asarray(episode["qpos"], dtype=np.float32)
-    qvel_np = np.asarray(episode["qvel"], dtype=np.float32)
-    control_np = np.asarray(episode["control"], dtype=np.float32)
-    left_attachment_pos_np = np.asarray(episode["left_attachment_pos"], dtype=np.float32)
-    right_attachment_pos_np = np.asarray(episode["right_attachment_pos"], dtype=np.float32)
-    rope_length_np = np.asarray(episode["rope_length"], dtype=np.float32)
-    time_np = np.asarray(episode["time"], dtype=np.float32)
-    dataset_pixels_np = np.asarray(episode["pixels"], dtype=np.uint8)
+    task_target_np = np.stack(
+        (
+            np.asarray(endpoint_start["task_target"], dtype=np.float32),
+            np.asarray(endpoint_goal["task_target"], dtype=np.float32),
+        ),
+        axis=0,
+    )
+    qpos_np = np.stack(
+        (
+            np.asarray(endpoint_start["qpos"], dtype=np.float32),
+            np.asarray(endpoint_goal["qpos"], dtype=np.float32),
+        ),
+        axis=0,
+    )
+    qvel_np = np.zeros_like(qpos_np, dtype=np.float32)
+    control_np = np.stack(
+        (
+            np.asarray(endpoint_start["control"], dtype=np.float32),
+            np.asarray(endpoint_goal["control"], dtype=np.float32),
+        ),
+        axis=0,
+    )
+    time_np = np.asarray([[0.0], [float(episode["control_timestep"])]], dtype=np.float32)
+    dataset_pixels_np = np.stack(
+        (
+            np.asarray(endpoint_start["pixels"], dtype=np.uint8),
+            np.asarray(endpoint_goal["pixels"], dtype=np.uint8),
+        ),
+        axis=0,
+    )
 
-    run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
+    run_name = f"{int(time.time())}_endpoint_pair_{endpoint_pair_idx:05d}"
     out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -730,6 +842,10 @@ def main() -> None:
         rollout_frames = [current_frame.copy()]
         executed_actions_raw: list[np.ndarray] = []
         executed_actions_norm: list[np.ndarray] = []
+        executed_markov_states = [current_state.detach().cpu().numpy().astype(np.float64)]
+        executed_embeddings = [current_emb.detach().cpu().numpy().astype(np.float64)]
+        executed_task_targets = [np.asarray(current_info["task_target"], dtype=np.float64).copy()]
+        executed_elapsed_time = [float(current_info["time"][0])]
         latent_goal_distances = [float(torch.linalg.vector_norm(current_state - goal_state).item())]
         embedding_goal_distances = [float(torch.linalg.vector_norm(current_emb - goal_emb).item())]
         task_target_distances = [float(np.linalg.norm(np.asarray(current_info["task_target"]) - goal_task_target))]
@@ -784,6 +900,10 @@ def main() -> None:
                     executed_actions_norm.append(u0_norm.copy())
                     executed_actions_raw.append(u0_raw.copy())
                     rollout_frames.append(current_frame.copy())
+                    executed_markov_states.append(current_state.detach().cpu().numpy().astype(np.float64))
+                    executed_embeddings.append(current_emb.detach().cpu().numpy().astype(np.float64))
+                    executed_task_targets.append(np.asarray(current_info["task_target"], dtype=np.float64).copy())
+                    executed_elapsed_time.append(float(current_info["time"][0]))
                     latent_goal_distance = float(torch.linalg.vector_norm(current_state - goal_state).item())
                     embedding_goal_distance = float(torch.linalg.vector_norm(current_emb - goal_emb).item())
                     task_target_distance = float(np.linalg.norm(np.asarray(current_info["task_target"]) - goal_task_target))
@@ -820,9 +940,29 @@ def main() -> None:
                 pbar.close()
 
         final_info = current_info
+        executed_actions_path = out_dir / "executed_actions.npz"
+        executed_states_path = out_dir / "executed_states.npz"
+        np.savez(
+            executed_actions_path,
+            executed_actions_norm=stack_or_empty(executed_actions_norm, (action_dim,), np.float32),
+            executed_actions_raw=stack_or_empty(executed_actions_raw, (action_dim,), np.float32),
+        )
+        np.savez(
+            executed_states_path,
+            markov_states=stack_or_empty(executed_markov_states, (markov_state_dim,), np.float64),
+            embeddings=stack_or_empty(executed_embeddings, (embed_dim,), np.float64),
+            task_targets=stack_or_empty(executed_task_targets, (goal_task_target.shape[0],), np.float64),
+            elapsed_time=np.asarray(executed_elapsed_time, dtype=np.float64),
+            latent_goal_distances=np.asarray(latent_goal_distances, dtype=np.float64),
+            task_target_distances=np.asarray(task_target_distances, dtype=np.float64),
+        )
         metrics = {
             "episode_idx": int(episode_idx),
             "episode_seed": episode_seed,
+            "start_goal_source": "random_endpoint_pairs",
+            "endpoint_pair_path": str(endpoint_pair_path),
+            "endpoint_pair_idx": int(endpoint_pair_idx),
+            "endpoint_pair_metadata": to_jsonable(endpoint_metadata),
             "checkpoint": str(checkpoint_path),
             "dataset_path": str(dataset_path),
             "action_norm_path": str(action_norm_path),
@@ -838,6 +978,9 @@ def main() -> None:
             "control_decimation": control_decimation,
             "control_timestep": float(episode["control_timestep"]),
             "num_executed_steps": int(len(executed_actions_raw)),
+            "num_logged_states": int(len(executed_markov_states)),
+            "executed_actions_path": str(executed_actions_path),
+            "executed_states_path": str(executed_states_path),
             "success": bool(success),
             "stop_reason": stop_reason,
             "latent_goal_distance_initial": float(latent_goal_distances[0]),

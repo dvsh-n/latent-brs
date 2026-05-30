@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and conformalize an OGBench cube latent obstacle classifier from collected obstacle data."""
+"""Train and conformalize an OGBench cube latent obstacle classifier for the half-ellipsoid dataset."""
 
 from __future__ import annotations
 
@@ -28,9 +28,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
-DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8_strtn"
-DEFAULT_DATA_PATH = "ogbench_cube/plan/obstacle_data/obstacle_classifier_data.pt"
-DEFAULT_OUT_DIR = "ogbench_cube/plan/obs_net"
+DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8"
+DEFAULT_DATA_PATH = "ogbench_cube/plan/obstacle_data_3d_ellipsoid_back/obstacle_classifier_data_3d_ellipsoid.pt"
+DEFAULT_OUT_DIR = "ogbench_cube/plan/obs_net_embd_8_back"
 DEFAULT_ACTIVATION = nn.Tanh
 DEFAULT_SOURCE_TRAIN_FRAC = 0.9
 
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def log_progress(message: str) -> None:
-    print(f"[ogbench_cube_obstacle_net] {message}", flush=True)
+    print(f"[ogbench_cube_obstacle_net_3d_ellipsoid] {message}", flush=True)
 
 
 def save_json(path: Path, payload: dict[str, Any]) -> None:

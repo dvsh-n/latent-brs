@@ -24,14 +24,14 @@ from scipy.ndimage import gaussian_filter1d
 from tqdm.auto import tqdm
 from ogbench.manipspace import lie
 
-DEFAULT_OUTDIR = "ogbench_cube/data/test_data_depth"
-DEFAULT_OUTPUT_NAME = "ogbench_cube_test_depth.h5"
+DEFAULT_OUTDIR = "ogbench_cube/data/train_data_2"
+DEFAULT_OUTPUT_NAME = "ogbench_cube_train_2.h5"
 DEFAULT_ENV_NAME = "cube-single-v0"
 DEFAULT_SIM_FREQ_HZ = 500.0
 DEFAULT_CONTROL_DECIMATION = 25
 VISUALIZE_TARGET = False
 DETERMINISTIC_ARM_START = True
-SAVE_DEPTH = True
+SAVE_DEPTH = False
 XY_SAMPLING_BOUNDS = np.asarray([[0.30, -0.25], [0.5, 0.25]], dtype=np.float32) # x (front back), y (left right), [x_min, y_min] and [x_max, y_max]
 Z_SAMPLING_BOUNDS = np.asarray([0.02, 0.30], dtype=np.float32)
 THETA_SAMPLING_BOUNDS = np.asarray([0.0, 2.0 * np.pi], dtype=np.float32)
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-transitions",
         type=int,
-        default=None,
+        default=600_000,
         help="Collect variable-length trajectories until this many action transitions are stored.",
     )
     parser.add_argument(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample one OGBench start/goal pair around a center obstacle and save a 3D plot."""
+"""Sample OGBench start/goal pairs around a centered half-ellipsoid obstacle and save a 3D plot."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import torch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from tqdm.auto import tqdm
 
-from ogbench_cube.plan.obs_data_collect import (
+from ogbench_cube.plan.obs_data_collect_3d_ellipsoid import (
     DEFAULT_CAMERA,
     DEFAULT_CONTROL_DECIMATION,
     DEFAULT_ENV_NAME,
@@ -33,9 +33,9 @@ from ogbench_cube.plan.obs_data_collect import (
     synthesize_grasped_state,
 )
 
-DEFAULT_OUT_DIR = Path("ogbench_cube/plan/random_endpoint_pairs")
-DEFAULT_PLOT_NAME = "start_goal_speed_bump.png"
-DEFAULT_DATASET_NAME = "start_goal_speed_bump.pt"
+DEFAULT_OUT_DIR = Path("ogbench_cube/plan/random_endpoint_pairs_3d_ellipsoid_gamed")
+DEFAULT_PLOT_NAME = "start_goal_3d_ellipsoid.png"
+DEFAULT_DATASET_NAME = "start_goal_3d_ellipsoid.pt"
 DEFAULT_NUM_POINTS = 1024
 DEFAULT_IMAGE_WIDTH = 224
 DEFAULT_IMAGE_HEIGHT = 224
@@ -46,11 +46,16 @@ Y_BOUNDS = (-0.25, 0.25)
 TABLE_Z = 0.02
 OBSTACLE_BASE_Z = 0.0
 
-LEFT_BAND = (-0.2, -0.15)
-RIGHT_BAND = (0.15, 0.2)
+LEFT_BAND = (-0.2, -0.12)
+RIGHT_BAND = (0.12, 0.2)
+LEFT_X_BOUNDS = (0.425, 0.475)
+RIGHT_X_BOUNDS = (0.35, 0.4)
 
-OBSTACLE_Y_BOUNDS = (-0.04, 0.04)
-OBSTACLE_PEAK_Z = 0.06
+OBSTACLE_CENTER_X = 0.4375
+OBSTACLE_CENTER_Y = 0.0
+OBSTACLE_RADIUS_X = 0.04
+OBSTACLE_RADIUS_Y = 0.08
+OBSTACLE_PEAK_Z = 0.055
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +79,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--settle-steps", type=int, default=DEFAULT_SETTLE_STEPS)
     parser.add_argument("--grasp-contact-threshold", type=float, default=0.5)
     parser.add_argument("--grasp-alignment-threshold", type=float, default=0.03)
+    parser.add_argument("--start-x-min", type=float, default=float(LEFT_X_BOUNDS[0]))
+    parser.add_argument("--start-x-max", type=float, default=float(LEFT_X_BOUNDS[1]))
+    parser.add_argument("--goal-x-min", type=float, default=float(RIGHT_X_BOUNDS[0]))
+    parser.add_argument("--goal-x-max", type=float, default=float(RIGHT_X_BOUNDS[1]))
     return parser.parse_args()
 
 
@@ -108,18 +117,31 @@ def sample_points(
     return np.stack((x, y, z), axis=1)
 
 
-def half_ellipse_height(
+def validate_bounds(bounds: tuple[float, float], *, name: str) -> tuple[float, float]:
+    lower = float(bounds[0])
+    upper = float(bounds[1])
+    if not lower < upper:
+        raise ValueError(f"{name} must satisfy min < max, got {bounds}.")
+    return lower, upper
+
+
+def half_ellipsoid_height(
+    x_values: np.ndarray,
     y_values: np.ndarray,
     *,
-    y_bounds: tuple[float, float],
+    center_x: float,
+    center_y: float,
+    radius_x: float,
+    radius_y: float,
     base_z: float,
     peak_z: float,
 ) -> np.ndarray:
+    x_values = np.asarray(x_values, dtype=np.float64)
     y_values = np.asarray(y_values, dtype=np.float64)
-    center_y = 0.5 * (float(y_bounds[0]) + float(y_bounds[1]))
-    half_width = 0.5 * (float(y_bounds[1]) - float(y_bounds[0]))
-    normalized = (y_values - center_y) / half_width
-    profile = np.sqrt(np.clip(1.0 - normalized**2, 0.0, None))
+    normalized = ((x_values - float(center_x)) / float(radius_x)) ** 2 + (
+        (y_values - float(center_y)) / float(radius_y)
+    ) ** 2
+    profile = np.sqrt(np.clip(1.0 - normalized, 0.0, None))
     return float(base_z) + (float(peak_z) - float(base_z)) * profile
 
 
@@ -133,19 +155,34 @@ def save_plot(
     y_values = np.linspace(float(Y_BOUNDS[0]), float(Y_BOUNDS[1]), num=160, dtype=np.float64)
     grid_x, grid_y = np.meshgrid(x_values, y_values)
 
-    obstacle_y_values = np.linspace(
-        float(OBSTACLE_Y_BOUNDS[0]),
-        float(OBSTACLE_Y_BOUNDS[1]),
+    obstacle_x_values = np.linspace(
+        float(OBSTACLE_CENTER_X - OBSTACLE_RADIUS_X),
+        float(OBSTACLE_CENTER_X + OBSTACLE_RADIUS_X),
         num=80,
         dtype=np.float64,
     )
-    obstacle_grid_x, obstacle_grid_y = np.meshgrid(x_values, obstacle_y_values)
-    obstacle_z = half_ellipse_height(
+    obstacle_y_values = np.linspace(
+        float(OBSTACLE_CENTER_Y - OBSTACLE_RADIUS_Y),
+        float(OBSTACLE_CENTER_Y + OBSTACLE_RADIUS_Y),
+        num=120,
+        dtype=np.float64,
+    )
+    obstacle_grid_x, obstacle_grid_y = np.meshgrid(obstacle_x_values, obstacle_y_values)
+    obstacle_z = half_ellipsoid_height(
+        obstacle_grid_x,
         obstacle_grid_y,
-        y_bounds=OBSTACLE_Y_BOUNDS,
+        center_x=OBSTACLE_CENTER_X,
+        center_y=OBSTACLE_CENTER_Y,
+        radius_x=OBSTACLE_RADIUS_X,
+        radius_y=OBSTACLE_RADIUS_Y,
         base_z=OBSTACLE_BASE_Z,
         peak_z=OBSTACLE_PEAK_Z,
     )
+    obstacle_mask = (
+        ((obstacle_grid_x - float(OBSTACLE_CENTER_X)) / float(OBSTACLE_RADIUS_X)) ** 2
+        + ((obstacle_grid_y - float(OBSTACLE_CENTER_Y)) / float(OBSTACLE_RADIUS_Y)) ** 2
+    ) <= 1.0
+    obstacle_z = np.where(obstacle_mask, obstacle_z, np.nan)
 
     plane_z = np.full_like(grid_x, TABLE_Z, dtype=np.float64)
 
@@ -198,13 +235,13 @@ def save_plot(
     ax.set_zlim(0.0, 0.30)
     ax.view_init(elev=28, azim=-25)
     ax.legend(loc="upper left")
-    ax.set_title("OGBench start/goal sampler with center speed-bump obstacle")
+    ax.set_title("OGBench start/goal sampler with centered half-ellipsoid obstacle")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(path, bbox_inches="tight")
-    # plt.show()
-    plt.close(fig)
+    plt.show()
+    # plt.close(fig)
 
 
 def render_grasped_images(
@@ -234,9 +271,11 @@ def render_grasped_images(
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
+    start_x_bounds = validate_bounds((args.start_x_min, args.start_x_max), name="start x bounds")
+    goal_x_bounds = validate_bounds((args.goal_x_min, args.goal_x_max), name="goal x bounds")
 
-    start_points = sample_points(rng, args.num_points, x_bounds=X_BOUNDS, y_bounds=LEFT_BAND)
-    goal_points = sample_points(rng, args.num_points, x_bounds=X_BOUNDS, y_bounds=RIGHT_BAND)
+    start_points = sample_points(rng, args.num_points, x_bounds=start_x_bounds, y_bounds=LEFT_BAND)
+    goal_points = sample_points(rng, args.num_points, x_bounds=goal_x_bounds, y_bounds=RIGHT_BAND)
 
     plot_path = args.out_dir / args.plot_name
     out_path = args.out_dir / args.out_name
@@ -276,11 +315,14 @@ def main() -> None:
             "image_height": int(args.height),
             "x_bounds": np.asarray(X_BOUNDS, dtype=np.float32),
             "y_bounds": np.asarray(Y_BOUNDS, dtype=np.float32),
+            "start_x_bounds": np.asarray(start_x_bounds, dtype=np.float32),
+            "goal_x_bounds": np.asarray(goal_x_bounds, dtype=np.float32),
             "table_z": float(TABLE_Z),
             "obstacle_base_z": float(OBSTACLE_BASE_Z),
             "left_band": np.asarray(LEFT_BAND, dtype=np.float32),
             "right_band": np.asarray(RIGHT_BAND, dtype=np.float32),
-            "obstacle_y_bounds": np.asarray(OBSTACLE_Y_BOUNDS, dtype=np.float32),
+            "obstacle_center_xy": np.asarray([OBSTACLE_CENTER_X, OBSTACLE_CENTER_Y], dtype=np.float32),
+            "obstacle_radius_xy": np.asarray([OBSTACLE_RADIUS_X, OBSTACLE_RADIUS_Y], dtype=np.float32),
             "obstacle_peak_z": float(OBSTACLE_PEAK_Z),
             "fixed_yaw": float(FIXED_YAW),
             "plot_path": str(plot_path),

@@ -33,10 +33,10 @@ from reacher.eval.reacher_policy_viz import (
 
 DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac/best_model/best_model.zip"
 DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac/vecnormalize.pkl"
-DEFAULT_OUTDIR = "reacher/data/obtuse_rollouts"
+DEFAULT_OUTDIR = "reacher/data/crazy_noise_rollouts"
 DEFAULT_OUTPUT_NAME = "reacher_train.h5"
 ROLLOUT_MODES = ("expert", "expert_plus_noise", "obtuse")
-DEFAULT_ROLLOUT_RATIOS = (0.0, 0.0, 1.0)
+DEFAULT_ROLLOUT_RATIOS = (0.0, 1.0, 0.0)
 EXPERT_NOISE_STD = 2.0
 JOINT2_OBTUSE_MARGIN_RAD = 0.35
 
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=5_000,
+        default=1_00,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)

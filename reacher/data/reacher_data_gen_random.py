@@ -1,45 +1,43 @@
 #!/usr/bin/env python3
-"""Collect random-goal DM Control Reacher trajectories into LE-WM HDF5."""
+"""Collect random-action DM Control Reacher trajectories directly into LE-WM HDF5."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
-os.environ.setdefault("MUJOCO_GL", "egl")
+if sys.platform == "darwin":
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+else:
+    os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import h5py
 import imageio.v2 as imageio
 import numpy as np
-from stable_baselines3 import SAC
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from tqdm.auto import tqdm
 
-from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer, require_device
-from reacher.train.reacher_policy_train_random import RandomGoalDmControlGymEnv
+from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
+from reacher.train.reacher_policy_train import DmControlGymEnv
 
-DEFAULT_MODEL_PATH = "reacher/models/reacher-dm-control-sac-random-goal/best_model/best_model.zip"
-DEFAULT_VECNORMALIZE_PATH = "reacher/models/reacher-dm-control-sac-random-goal/vecnormalize.pkl"
-DEFAULT_OUTDIR = "reacher/data/expert_data_50hz"
-DEFAULT_OUTPUT_NAME = "reacher_random_expert.h5"
+DEFAULT_OUTDIR = "reacher/data/random_rollouts"
+DEFAULT_OUTPUT_NAME = "reacher_random.h5"
+DEFAULT_ACTION_NOISE_SCALE = 10.0
+ROLLOUT_MODES = ("random",)
 
+# Local timing/video knobs.
 PHYSICS_FREQ_HZ = 50.0
 CONTROL_FREQ_HZ = 50.0
-STATE_DIM = 8
-QPOS_DIM = 2
-QVEL_DIM = 2
+STATE_DIM = 6
 ACTION_DIM = 2
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--vecnormalize-path", type=Path, default=DEFAULT_VECNORMALIZE_PATH)
     parser.add_argument("--task", choices=("easy", "hard"), default="hard")
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     parser.add_argument("--output-name", default=DEFAULT_OUTPUT_NAME)
@@ -53,96 +51,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=15_000,
+        default=100,
         help="Fallback collection target when --target-transitions is omitted.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--time-limit", type=float, default=10.0)
     parser.add_argument("--physics-freq-hz", type=float, default=PHYSICS_FREQ_HZ)
     parser.add_argument("--control-freq-hz", type=float, default=CONTROL_FREQ_HZ)
-    parser.add_argument("--max-steps-per-episode", type=int, default=100)
-    parser.add_argument("--goal-threshold", type=float, default=0.05)
-    parser.add_argument("--goal-bonus", type=float, default=5.0)
-    parser.add_argument("--max-blank-steps", type=int, default=15)
+    parser.add_argument(
+        "--trajectory-length",
+        "--max-steps-per-episode",
+        dest="trajectory_length",
+        type=int,
+        default=100,
+        help="Number of random control steps to apply per trajectory.",
+    )
     parser.add_argument("--min-steps", type=int, default=3)
     parser.add_argument("--width", type=int, default=224)
     parser.add_argument("--height", type=int, default=224)
     parser.add_argument("--quality", type=int, default=8)
     parser.add_argument("--compression", choices=("none", "lzf", "gzip"), default="lzf")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        default=True,
-        help="Use deterministic policy output by default. Pass --no-deterministic for stochastic rollouts.",
-    )
-    parser.add_argument("--no-deterministic", dest="deterministic", action="store_false")
+    parser.add_argument("--action-noise-scale", type=float, default=DEFAULT_ACTION_NOISE_SCALE)
     parser.add_argument("--action-cost-weight", type=float, default=0.0)
-    parser.add_argument("--action-rate-cost-weight", type=float, default=1e-2)
-    parser.add_argument("--velocity-cost-weight", type=float, default=1e-2)
+    parser.add_argument("--action-rate-cost-weight", type=float, default=0.0)
+    parser.add_argument("--velocity-cost-weight", type=float, default=0.0)
     return parser.parse_args()
 
 
-def get_raw_env(vec_env: VecNormalize) -> RandomGoalDmControlGymEnv:
-    monitor_env = vec_env.venv.envs[0]
-    raw_env = getattr(monitor_env, "env", None)
-    if raw_env is None or not isinstance(raw_env, RandomGoalDmControlGymEnv):
-        raise TypeError("Expected VecNormalize -> DummyVecEnv -> Monitor -> RandomGoalDmControlGymEnv")
-    return raw_env
-
-
-def make_random_eval_env(
-    *,
-    task: str,
-    seed: int,
-    time_limit: float,
-    goal_threshold: float,
-    goal_bonus: float,
-    vecnormalize_path: Path,
-    action_cost_weight: float,
-    action_rate_cost_weight: float,
-    velocity_cost_weight: float,
-) -> VecNormalize:
-    def _factory() -> Monitor:
-        env = RandomGoalDmControlGymEnv(
-            domain_name="reacher",
-            task_name=task,
-            seed=seed,
-            time_limit=time_limit,
-            goal_threshold=goal_threshold,
-            goal_bonus=goal_bonus,
-            action_cost_weight=action_cost_weight,
-            action_rate_cost_weight=action_rate_cost_weight,
-            velocity_cost_weight=velocity_cost_weight,
-            terminate_on_success=False,
-        )
-        env.reset(seed=seed)
-        return Monitor(env)
-
-    base_env = DummyVecEnv([_factory])
-    vec_env = VecNormalize.load(str(vecnormalize_path), base_env)
-    vec_env.training = False
-    vec_env.norm_reward = False
-    return vec_env
-
-
-def get_current_observation(env: RandomGoalDmControlGymEnv) -> np.ndarray:
-    qpos, qvel = env._physics_obs()
-    return env._build_observation(qpos, qvel)
-
-
-def get_dataset_observation(env: RandomGoalDmControlGymEnv) -> np.ndarray:
-    return get_current_observation(env)
-
-
-def hide_target(render_env: RandomGoalDmControlGymEnv) -> None:
-    target_geom_id = render_env._env.physics.model.name2id("target", "geom")
-    render_env._env.physics.model.geom_rgba[target_geom_id] = [0, 0, 0, 0]
-
-
-def reached_goal(env: RandomGoalDmControlGymEnv, threshold: float) -> bool:
-    qpos, _ = env._physics_obs()
-    return bool(env._goal_distance(qpos) <= threshold)
+def hide_target(env: DmControlGymEnv) -> None:
+    target_geom_id = env._env.physics.model.name2id("target", "geom")
+    env._env.physics.model.geom_rgba[target_geom_id] = [0, 0, 0, 0]
 
 
 def compute_control_substeps(physics_freq_hz: float, control_freq_hz: float) -> int:
@@ -157,85 +95,15 @@ def compute_control_substeps(physics_freq_hz: float, control_freq_hz: float) -> 
 
 
 def configure_dm_control_timing(
-    render_env: RandomGoalDmControlGymEnv,
+    env: DmControlGymEnv,
     *,
     physics_timestep: float,
     time_limit: float,
 ) -> None:
-    dm_env = render_env._env
+    dm_env = env._env
     dm_env.physics.model.opt.timestep = physics_timestep
     dm_env._n_sub_steps = 1
     dm_env._step_limit = float("inf") if time_limit == float("inf") else time_limit / physics_timestep
-
-
-def collect_trajectory(
-    *,
-    model: SAC,
-    env: VecNormalize,
-    render_env: RandomGoalDmControlGymEnv,
-    trajectory_seed: int,
-    deterministic: bool,
-    width: int,
-    height: int,
-    max_steps: int,
-    physics_timestep: float,
-    control_substeps: int,
-    time_limit: float,
-    goal_threshold: float,
-    max_blank_steps: int,
- ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
-    env.seed(trajectory_seed)
-    obs = env.reset()
-    configure_dm_control_timing(
-        render_env,
-        physics_timestep=physics_timestep,
-        time_limit=time_limit,
-    )
-    hide_target(render_env)
-    configure_offscreen_framebuffer(render_env, width, height)
-
-    states = [get_dataset_observation(render_env)]
-    actions: list[np.ndarray] = []
-    frames = [render_env._env.physics.render(height=height, width=width, camera_id=0)]
-
-    total_reward = 0.0
-    goal_seen = reached_goal(render_env, goal_threshold)
-    post_goal_steps = 0
-    terminated = False
-
-    action: np.ndarray | None = None
-    for physics_step in range(max_steps):
-        was_already_at_goal = goal_seen
-        if physics_step % control_substeps == 0:
-            action, _ = model.predict(obs, deterministic=deterministic)
-        if action is None:
-            raise RuntimeError("Policy action was not initialized.")
-        obs, rewards, dones, _ = env.step(action)
-        total_reward += float(rewards[0])
-
-        actions.append(np.asarray(action[0], dtype=np.float32))
-        state = get_dataset_observation(render_env)
-        states.append(state)
-        frames.append(render_env._env.physics.render(height=height, width=width, camera_id=0))
-
-        if was_already_at_goal:
-            post_goal_steps += 1
-        elif reached_goal(render_env, goal_threshold):
-            goal_seen = True
-
-        if bool(dones[0]):
-            terminated = True
-            break
-        if goal_seen and post_goal_steps >= max_blank_steps:
-            break
-
-    return (
-        np.stack(states, axis=0),
-        np.stack(actions, axis=0),
-        np.stack(frames, axis=0),
-        total_reward,
-        terminated,
-    )
 
 
 def create_resizable_dataset(
@@ -279,31 +147,88 @@ def should_continue(args: argparse.Namespace, num_trajectories: int, total_trans
     return num_trajectories < args.num_trajectories
 
 
+def collect_random_trajectory(
+    *,
+    env: DmControlGymEnv,
+    trajectory_seed: int,
+    width: int,
+    height: int,
+    trajectory_length: int,
+    action_noise_scale: float,
+    physics_timestep: float,
+    time_limit: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
+    rng = np.random.default_rng(trajectory_seed)
+    obs, _ = env.reset(seed=trajectory_seed)
+    configure_dm_control_timing(
+        env,
+        physics_timestep=physics_timestep,
+        time_limit=time_limit,
+    )
+    hide_target(env)
+    configure_offscreen_framebuffer(env, width, height)
+
+    states = [np.asarray(obs, dtype=np.float32)]
+    actions: list[np.ndarray] = []
+    frames = [env._env.physics.render(height=height, width=width, camera_id=0)]
+
+    total_reward = 0.0
+    terminated = False
+
+    action_low = np.asarray(env.action_space.low, dtype=np.float32)
+    action_high = np.asarray(env.action_space.high, dtype=np.float32)
+    scaled_action_low = action_low * float(action_noise_scale)
+    scaled_action_high = action_high * float(action_noise_scale)
+    for _ in range(trajectory_length):
+        action = rng.uniform(scaled_action_low, scaled_action_high).astype(np.float32)
+        obs, reward, env_terminated, env_truncated, _ = env.step(action)
+        total_reward += float(reward)
+
+        actions.append(action.copy())
+        states.append(np.asarray(obs, dtype=np.float32))
+        frames.append(env._env.physics.render(height=height, width=width, camera_id=0))
+
+        if env_terminated or env_truncated:
+            terminated = bool(env_terminated)
+            break
+
+    return (
+        np.stack(states, axis=0),
+        np.stack(actions, axis=0),
+        np.stack(frames, axis=0),
+        total_reward,
+        terminated,
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.target_transitions is not None and args.target_transitions < 1:
         raise ValueError("--target-transitions must be positive when provided.")
     if args.num_trajectories < 1:
         raise ValueError("--num-trajectories must be positive.")
-    if args.max_steps_per_episode < 1:
-        raise ValueError("--max-steps-per-episode must be positive.")
+    if args.trajectory_length < 1:
+        raise ValueError("--trajectory-length must be positive.")
     if args.physics_freq_hz <= 0.0:
         raise ValueError("--physics-freq-hz must be positive.")
     if args.control_freq_hz <= 0.0:
         raise ValueError("--control-freq-hz must be positive.")
-    if args.max_blank_steps < 0:
-        raise ValueError("--max-blank-steps cannot be negative.")
     if args.min_steps < 1:
         raise ValueError("--min-steps must be positive.")
+    if args.action_noise_scale < 0.0:
+        raise ValueError("--action-noise-scale must be non-negative.")
+    if args.action_cost_weight < 0.0:
+        raise ValueError("--action-cost-weight must be non-negative.")
+    if args.action_rate_cost_weight < 0.0:
+        raise ValueError("--action-rate-cost-weight must be non-negative.")
+    if args.velocity_cost_weight < 0.0:
+        raise ValueError("--velocity-cost-weight must be non-negative.")
 
-    device = require_device(args.device)
     physics_timestep = 1.0 / args.physics_freq_hz
     control_timestep = 1.0 / args.control_freq_hz
     control_substeps = compute_control_substeps(args.physics_freq_hz, args.control_freq_hz)
     video_fps = args.physics_freq_hz
 
-    model_path = args.model_path.expanduser().resolve()
-    vecnormalize_path = args.vecnormalize_path.expanduser().resolve()
     outdir = args.outdir.expanduser().resolve()
     video_dir = outdir / "videos"
     output_path = outdir / args.output_name
@@ -312,19 +237,16 @@ def main() -> None:
     if output_path.exists() and not args.overwrite:
         raise FileExistsError(f"Output file already exists: {output_path}. Pass --overwrite to replace it.")
 
-    env = make_random_eval_env(
-        task=args.task,
+    env = DmControlGymEnv(
+        domain_name="reacher",
+        task_name=args.task,
         seed=args.seed,
         time_limit=args.time_limit,
-        goal_threshold=args.goal_threshold,
-        goal_bonus=args.goal_bonus,
-        vecnormalize_path=vecnormalize_path,
         action_cost_weight=args.action_cost_weight,
         action_rate_cost_weight=args.action_rate_cost_weight,
         velocity_cost_weight=args.velocity_cost_weight,
     )
-    render_env = get_raw_env(env)
-    model = SAC.load(str(model_path), env=env, device=device)
+    env.reset(seed=args.seed)
 
     compression = None if args.compression == "none" else args.compression
     if output_path.exists():
@@ -339,12 +261,9 @@ def main() -> None:
     with h5py.File(output_path, "w") as h5:
         h5.attrs["format"] = "stable_worldmodel_hdf5"
         h5.attrs["source"] = "data/reacher_data_gen_random.py"
-        h5.attrs["state_keys"] = json.dumps(["position(2)", "velocity(2)", "goal_qpos(2)", "goal_delta(2)"])
+        h5.attrs["state_keys"] = json.dumps(["position(2)", "to_target(2)", "velocity(2)"])
         h5.attrs["task"] = args.task
-        h5.attrs["deterministic"] = args.deterministic
         h5.attrs["seed"] = args.seed
-        h5.attrs["model_path"] = str(model_path)
-        h5.attrs["vecnormalize_path"] = str(vecnormalize_path)
         h5.attrs["video_dir"] = str(video_dir)
         h5.attrs["video_resolution"] = json.dumps([args.height, args.width])
         h5.attrs["video_fps"] = video_fps
@@ -355,16 +274,17 @@ def main() -> None:
         h5.attrs["control_substeps"] = control_substeps
         h5.attrs["frames_per_physics_step"] = 1
         h5.attrs["time_limit"] = args.time_limit
-        h5.attrs["goal_threshold"] = args.goal_threshold
-        h5.attrs["goal_bonus"] = args.goal_bonus
-        h5.attrs["max_blank_steps"] = args.max_blank_steps
-        h5.attrs["max_steps_per_episode"] = args.max_steps_per_episode
+        h5.attrs["trajectory_length"] = args.trajectory_length
+        h5.attrs["action_noise_scale"] = args.action_noise_scale
+        h5.attrs["rollout_modes"] = json.dumps(list(ROLLOUT_MODES))
+        h5.attrs["rollout_mode_probabilities"] = json.dumps([1.0])
 
         ep_len_ds = create_resizable_dataset(h5, "ep_len", (), np.int64, chunks=True)
         ep_offset_ds = create_resizable_dataset(h5, "ep_offset", (), np.int64, chunks=True)
         reward_ds = create_resizable_dataset(h5, "reward", (), np.float32, chunks=True)
         seed_ds = create_resizable_dataset(h5, "episode_seed", (), np.int64, chunks=True)
         terminated_ds = create_resizable_dataset(h5, "terminated", (), np.bool_, chunks=True)
+        rollout_mode_ds = create_resizable_dataset(h5, "rollout_mode", (), np.int64, chunks=True)
         pixels_ds = create_resizable_dataset(
             h5,
             "pixels",
@@ -375,8 +295,8 @@ def main() -> None:
         )
         action_ds = create_resizable_dataset(h5, "action", (ACTION_DIM,), np.float32, chunks=True)
         obs_ds = create_resizable_dataset(h5, "observation", (STATE_DIM,), np.float32, chunks=True)
-        qpos_ds = create_resizable_dataset(h5, "qpos", (QPOS_DIM,), np.float32, chunks=True)
-        qvel_ds = create_resizable_dataset(h5, "qvel", (QVEL_DIM,), np.float32, chunks=True)
+        qpos_ds = create_resizable_dataset(h5, "qpos", (2,), np.float32, chunks=True)
+        qvel_ds = create_resizable_dataset(h5, "qvel", (2,), np.float32, chunks=True)
         episode_idx_ds = create_resizable_dataset(h5, "episode_idx", (), np.int64, chunks=True)
         step_idx_ds = create_resizable_dataset(h5, "step_idx", (), np.int64, chunks=True)
 
@@ -387,20 +307,15 @@ def main() -> None:
             while should_continue(args, len(step_counts), int(np.sum(step_counts, dtype=np.int64))):
                 trajectory_seed = args.seed + seed_offset
                 seed_offset += 1
-                states, actions, frames, total_reward, terminated = collect_trajectory(
-                    model=model,
+                states, actions, frames, total_reward, terminated = collect_random_trajectory(
                     env=env,
-                    render_env=render_env,
                     trajectory_seed=trajectory_seed,
-                    deterministic=args.deterministic,
                     width=args.width,
                     height=args.height,
-                    max_steps=args.max_steps_per_episode,
+                    trajectory_length=args.trajectory_length,
+                    action_noise_scale=args.action_noise_scale,
                     physics_timestep=physics_timestep,
-                    control_substeps=control_substeps,
                     time_limit=args.time_limit,
-                    goal_threshold=args.goal_threshold,
-                    max_blank_steps=args.max_blank_steps,
                 )
                 if actions.shape[0] < args.min_steps:
                     skipped_short += 1
@@ -423,10 +338,11 @@ def main() -> None:
                 offset, _ = append_rows(pixels_ds, frames)
                 append_rows(action_ds, padded_actions)
                 append_rows(obs_ds, states)
-                append_rows(qpos_ds, states[:, :QPOS_DIM])
+                append_rows(qpos_ds, states[:, :2])
                 append_rows(qvel_ds, states[:, 4:6])
                 append_rows(episode_idx_ds, np.full((states.shape[0],), episode_idx, dtype=np.int64))
                 append_rows(step_idx_ds, np.arange(states.shape[0], dtype=np.int64))
+                append_rows(rollout_mode_ds, np.zeros((states.shape[0],), dtype=np.int64))
                 append_rows(ep_len_ds, np.asarray([states.shape[0]], dtype=np.int64))
                 append_rows(ep_offset_ds, np.asarray([offset], dtype=np.int64))
                 append_rows(reward_ds, np.asarray([total_reward], dtype=np.float32))
@@ -467,6 +383,8 @@ def main() -> None:
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
         "terminated_episodes": int(np.sum(terminated_flags, dtype=np.int64)),
         "skipped_short_episodes": skipped_short,
+        "random_episodes": len(step_counts),
+        "action_noise_scale": float(args.action_noise_scale),
         "usable_train_windows_default": valid_training_windows(np.asarray(step_counts, dtype=np.int64) + 1)
         if step_counts
         else 0,

@@ -42,9 +42,9 @@ from rope.plan.obstacle_net import (
     to_signed_labels,
 )
 
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_6"
-DEFAULT_DATA_PATH = "reacher/plan/obstacle_data/obstacle_classifier_data.pt"
-DEFAULT_OUT_DIR = "reacher/plan/obs_net_sm_model"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_embd_5"
+DEFAULT_DATA_PATH = "reacher/plan/obstacle_data_joint_box/obstacle_classifier_data.pt"
+DEFAULT_OUT_DIR = "reacher/plan/obs_net_gamed"
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--frame-batch-size", type=int, default=64)
-    parser.add_argument("--hidden-dim", type=int, default=12)
+    parser.add_argument("--hidden-dim", type=int, default=6)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=100)

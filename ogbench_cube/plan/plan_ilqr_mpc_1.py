@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan in OGBench cube pixel space with nominal iLQR MPC over a Markov-state MLP world model."""
+"""Plan from sampled OGBench cube endpoint pairs with nominal iLQR MPC."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
@@ -24,12 +25,14 @@ import torch
 from ogbench.manipspace import lie
 from tqdm.auto import tqdm
 
-from ogbench_cube.data.ogbench_cube_data_gen import LocalCubePlanOracle
+from ogbench_cube.data.ogbench_cube_data_gen import LocalCubePlanOracle, apply_deterministic_arm_start
+from ogbench_cube.plan.obs_data_collect import render_without_target_cube
 from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
 DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_12_strtn"
-DEFAULT_OUT_DIR = "ogbench_cube/plan/ilqr_mpc_mlpdyn"
+DEFAULT_PAIR_PATH = "ogbench_cube/plan/random_endpoint_pairs_height/start_goal_height.pt"
+DEFAULT_OUT_DIR = "ogbench_cube/plan/ilqr_mpc_mlpdyn_1"
 
 DEVICE = "auto"
 HORIZON = 15
@@ -38,7 +41,7 @@ Q_TERMINAL = 15.0
 Q_STAGE = 0.05
 R_CONTROL = 0.5
 VIDEO_FPS = 20
-EPISODE_IDX = 562
+EPISODE_IDX = 0
 MAX_ORACLE_STEPS = 80
 ORACLE_SEGMENT_DT = 0.4
 ORACLE_NOISE = 0.0
@@ -47,14 +50,27 @@ GRASP_CONTACT_THRESHOLD = 0.5
 GRASP_ALIGNMENT_THRESHOLD = 0.03
 
 
+def parse_optional_int(value: str) -> int | None:
+    if value.lower() in {"none", "random"}:
+        return None
+    return int(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=Path(DEFAULT_MODEL_DIR))
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_TEST_DATASET_PATH))
+    parser.add_argument("--pair-path", type=Path, default=Path(DEFAULT_PAIR_PATH))
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--episode-idx", type=int, default=EPISODE_IDX)
+    parser.add_argument("--pair-index", type=parse_optional_int, default=None)
+    parser.add_argument(
+        "--episode-idx",
+        type=parse_optional_int,
+        default=EPISODE_IDX,
+        help="Endpoint-pair episode/index to run. Alias for --pair-index; use 'random' or 'none' for random.",
+    )
     parser.add_argument("--horizon", type=int, default=HORIZON)
     parser.add_argument("--max-mpc-steps", type=int, default=MAX_MPC_STEPS)
     parser.add_argument("--env-max-episode-steps", type=int, default=None)
@@ -228,38 +244,77 @@ def cube_is_grasped(
     return bool(gripper_contact >= contact_threshold and block_alignment <= alignment_threshold)
 
 
-def load_dataset_episode(
-    dataset_path: Path,
-    episode_idx: int,
-) -> dict[str, np.ndarray | int | float | str]:
-    with h5py.File(dataset_path, "r") as h5:
-        ep_len = int(h5["ep_len"][episode_idx])
-        ep_offset = int(h5["ep_offset"][episode_idx])
-        rows = np.arange(ep_offset, ep_offset + ep_len, dtype=np.int64)
-        return {
-            "pixels": np.asarray(h5["pixels"][rows], dtype=np.uint8),
-            "action": np.asarray(h5["action"][rows], dtype=np.float32),
-            "observation": np.asarray(h5["observation"][rows], dtype=np.float32),
-            "qpos": np.asarray(h5["qpos"][rows], dtype=np.float32),
-            "qvel": np.asarray(h5["qvel"][rows], dtype=np.float32),
-            "effector_pos": np.asarray(h5["effector_pos"][rows], dtype=np.float32),
-            "effector_yaw": np.asarray(h5["effector_yaw"][rows], dtype=np.float32),
-            "block_pos": np.asarray(h5["block_pos"][rows], dtype=np.float32),
-            "block_quat": np.asarray(h5["block_quat"][rows], dtype=np.float32),
-            "block_yaw": np.asarray(h5["block_yaw"][rows], dtype=np.float32),
-            "target_block_pos": np.asarray(h5["target_block_pos"][rows], dtype=np.float32),
-            "target_block_yaw": np.asarray(h5["target_block_yaw"][rows], dtype=np.float32),
-            "time": np.asarray(h5["time"][rows], dtype=np.float32),
-            "episode_seed": int(h5["episode_seed"][episode_idx]),
-            "env_name": str(h5.attrs.get("env_name", "cube-single-v0")),
-            "camera": str(h5.attrs.get("camera", "front_pixels")),
-            "width": int(h5["pixels"].shape[2]),
-            "height": int(h5["pixels"].shape[1]),
-            "physics_timestep": float(h5.attrs.get("physics_timestep", 1.0 / 500.0)),
-            "control_timestep": float(h5.attrs.get("control_timestep", 25.0 / 500.0)),
-            "max_episode_steps": int(h5.attrs.get("max_episode_steps", ep_len)),
-            "video_fps": float(h5.attrs.get("video_fps", 1.0 / float(h5.attrs.get("control_timestep", 25.0 / 500.0)))),
-        }
+def load_pair_payload(pair_path: Path) -> dict[str, Any]:
+    if not pair_path.is_file():
+        raise FileNotFoundError(f"Endpoint pair file not found: {pair_path}")
+    # Some endpoint-pair files were pickled with NumPy 2.x module names.
+    import sys
+
+    sys.modules.setdefault("numpy._core", np.core)
+    sys.modules.setdefault("numpy._core.multiarray", np.core.multiarray)
+    sys.modules.setdefault("numpy._core.numeric", np.core.numeric)
+
+    payload = torch.load(pair_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unexpected endpoint pair payload type: {type(payload)}")
+    for section_name in ("start", "goal"):
+        section = payload.get(section_name)
+        if not isinstance(section, dict):
+            raise KeyError(f"Endpoint pair payload missing '{section_name}' section.")
+        for key in ("task_target", "yaw", "pixels"):
+            if key not in section:
+                raise KeyError(f"Endpoint pair section '{section_name}' missing '{key}'.")
+    return payload
+
+
+def select_pair(payload: dict[str, Any], pair_index: int) -> dict[str, np.ndarray | float | int | str]:
+    num_pairs = int(np.asarray(payload["start"]["task_target"]).shape[0])
+    if pair_index < 0 or pair_index >= num_pairs:
+        raise ValueError(f"--pair-index must be in [0, {num_pairs - 1}], got {pair_index}.")
+
+    metadata = payload.get("metadata", {})
+    return {
+        "num_pairs": num_pairs,
+        "env_name": str(metadata.get("env_name", "cube-single-v0")),
+        "camera": str(metadata.get("camera", "front_pixels")),
+        "width": int(metadata.get("image_width", np.asarray(payload["start"]["pixels"]).shape[2])),
+        "height": int(metadata.get("image_height", np.asarray(payload["start"]["pixels"]).shape[1])),
+        "start_pos": np.asarray(payload["start"]["task_target"][pair_index], dtype=np.float32),
+        "goal_pos": np.asarray(payload["goal"]["task_target"][pair_index], dtype=np.float32),
+        "start_yaw": float(np.asarray(payload["start"]["yaw"], dtype=np.float32)[pair_index]),
+        "goal_yaw": float(np.asarray(payload["goal"]["yaw"], dtype=np.float32)[pair_index]),
+        "start_pixel": np.asarray(payload["start"]["pixels"][pair_index], dtype=np.uint8),
+        "goal_pixel": np.asarray(payload["goal"]["pixels"][pair_index], dtype=np.uint8),
+    }
+
+
+def get_qpos_names(env: gymnasium.Env) -> list[str]:
+    model = env.unwrapped._model
+    qpos_names = [f"qpos_{idx}" for idx in range(int(model.nq))]
+    joint_suffixes = {
+        int(mujoco.mjtJoint.mjJNT_FREE): ("x", "y", "z", "qw", "qx", "qy", "qz"),
+        int(mujoco.mjtJoint.mjJNT_BALL): ("qw", "qx", "qy", "qz"),
+        int(mujoco.mjtJoint.mjJNT_SLIDE): ("slide",),
+        int(mujoco.mjtJoint.mjJNT_HINGE): ("hinge",),
+    }
+    for joint_id in range(int(model.njnt)):
+        joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id) or f"joint_{joint_id}"
+        qpos_addr = int(model.jnt_qposadr[joint_id])
+        joint_type = int(model.jnt_type[joint_id])
+        suffixes = joint_suffixes.get(joint_type, ())
+        for offset, suffix in enumerate(suffixes):
+            qpos_idx = qpos_addr + offset
+            if 0 <= qpos_idx < len(qpos_names):
+                qpos_names[qpos_idx] = f"{joint_name}/{suffix}"
+    return qpos_names
+
+
+def qpos_from_info(info: dict[str, np.ndarray]) -> np.ndarray:
+    return np.asarray(info["qpos"], dtype=np.float32)
+
+
+def gripper_height_from_info(info: dict[str, np.ndarray]) -> float:
+    return float(np.asarray(info["proprio/effector_pos"], dtype=np.float32)[2])
 
 
 def make_env(
@@ -326,6 +381,51 @@ def reset_env_to_state(
     mujoco.mj_forward(unwrapped._model, unwrapped._data)
     unwrapped.post_step()
     frame = np.asarray(unwrapped.render(camera=camera), dtype=np.uint8)
+    info = unwrapped.get_step_info()
+    return frame, info
+
+
+def reset_env_to_endpoint_start(
+    env: gymnasium.Env,
+    *,
+    seed: int,
+    start_block_pos: np.ndarray,
+    start_block_yaw: float,
+    target_block_pos: np.ndarray,
+    target_block_yaw: float,
+    camera: str,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    unwrapped = env.unwrapped
+    old_object_bounds = np.asarray(unwrapped._object_sampling_bounds, dtype=np.float64).copy()
+    old_target_bounds = np.asarray(unwrapped._target_sampling_bounds, dtype=np.float64).copy()
+    try:
+        start_xy = np.asarray(start_block_pos[:2], dtype=np.float64)
+        target_xy = np.asarray(target_block_pos[:2], dtype=np.float64)
+        unwrapped._object_sampling_bounds = np.stack((start_xy, start_xy), axis=0)
+        unwrapped._target_sampling_bounds = np.stack((target_xy, target_xy), axis=0)
+        env.reset(seed=seed)
+        apply_deterministic_arm_start(
+            env,
+            mujoco_module=mujoco,
+            lie_module=lie,
+        )
+    finally:
+        unwrapped._object_sampling_bounds = old_object_bounds
+        unwrapped._target_sampling_bounds = old_target_bounds
+
+    object_joint = unwrapped._data.joint("object_joint_0")
+    object_joint.qpos[:3] = np.asarray(start_block_pos, dtype=np.float64)
+    object_joint.qpos[3:] = np.asarray(lie.SO3.from_z_radians(float(start_block_yaw)).wxyz, dtype=np.float64)
+    unwrapped._data.qvel[:] = 0.0
+    restore_target_pose(
+        env,
+        target_block_pos=target_block_pos,
+        target_block_yaw=target_block_yaw,
+    )
+    unwrapped.pre_step()
+    mujoco.mj_forward(unwrapped._model, unwrapped._data)
+    unwrapped.post_step()
+    frame = render_without_target_cube(env, camera)
     info = unwrapped.get_step_info()
     return frame, info
 
@@ -576,44 +676,50 @@ def main() -> None:
     action_mean = train_stats_dataset.action_mean.astype(np.float32)
     action_std = train_stats_dataset.action_std.astype(np.float32)
 
-    with h5py.File(dataset_path, "r") as h5:
-        ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
-
-    valid_episodes = np.flatnonzero(ep_len >= 2)
-    if valid_episodes.size == 0:
-        raise ValueError("Need at least one test trajectory with 2 or more frames.")
-
-    rng = np.random.default_rng(args.seed)
-    if args.episode_idx is None:
-        episode_idx = int(rng.choice(valid_episodes))
+    pair_path = args.pair_path.expanduser().resolve()
+    pair_payload = load_pair_payload(pair_path)
+    num_pairs = int(np.asarray(pair_payload["start"]["task_target"]).shape[0])
+    if args.pair_index is not None and args.episode_idx is not None and int(args.pair_index) != int(args.episode_idx):
+        raise ValueError(
+            f"--pair-index and --episode-idx select the same endpoint-pair index, "
+            f"but got {args.pair_index} and {args.episode_idx}."
+        )
+    selected_index_arg = args.pair_index if args.pair_index is not None else args.episode_idx
+    if selected_index_arg is None:
+        rng = np.random.default_rng(args.seed)
+        pair_index = int(rng.integers(num_pairs))
     else:
-        episode_idx = int(args.episode_idx)
-        if episode_idx < 0 or episode_idx >= ep_len.shape[0]:
-            raise ValueError(f"--episode-idx must be in [0, {ep_len.shape[0] - 1}], got {episode_idx}.")
-        if ep_len[episode_idx] < 2:
-            raise ValueError(f"--episode-idx {episode_idx} must have at least 2 frames, got {ep_len[episode_idx]}.")
+        pair_index = int(selected_index_arg)
+    pair = select_pair(pair_payload, pair_index)
 
-    episode = load_dataset_episode(dataset_path, episode_idx)
-    episode_seed = int(episode["episode_seed"])
-    env_name = str(episode["env_name"])
-    camera = str(episode["camera"])
-    width = int(episode["width"])
-    height = int(episode["height"])
-    physics_timestep = float(episode["physics_timestep"])
-    control_timestep = float(episode["control_timestep"])
-    dataset_max_episode_steps = int(episode["max_episode_steps"])
+    env_name = str(pair["env_name"])
+    camera = str(pair["camera"])
+    width = int(pair["width"])
+    height = int(pair["height"])
+    physics_timestep = 1.0 / 500.0
+    control_timestep = 25.0 / 500.0
+    dataset_max_episode_steps = 150
+    if dataset_path.is_file():
+        with h5py.File(dataset_path, "r") as h5:
+            physics_timestep = float(h5.attrs.get("physics_timestep", physics_timestep))
+            control_timestep = float(h5.attrs.get("control_timestep", control_timestep))
+            dataset_max_episode_steps = int(h5.attrs.get("max_episode_steps", dataset_max_episode_steps))
+
     max_episode_steps = (
         int(args.env_max_episode_steps)
         if args.env_max_episode_steps is not None
         else max(dataset_max_episode_steps, int(args.max_oracle_steps) + int(args.max_mpc_steps) + 1)
     )
-    qpos_np = np.asarray(episode["qpos"], dtype=np.float32)
-    qvel_np = np.asarray(episode["qvel"], dtype=np.float32)
-    target_block_pos_np = np.asarray(episode["target_block_pos"], dtype=np.float32)
-    target_block_yaw_np = np.asarray(episode["target_block_yaw"], dtype=np.float32)
-    dataset_pixels_np = np.asarray(episode["pixels"], dtype=np.uint8)
 
-    run_name = f"{int(time.time())}_episode_{episode_idx:05d}"
+    episode_seed = 0 if args.seed is None else int(args.seed)
+    start_block_pos = np.asarray(pair["start_pos"], dtype=np.float32)
+    goal_block_pos = np.asarray(pair["goal_pos"], dtype=np.float32)
+    start_block_yaw = float(pair["start_yaw"])
+    goal_block_yaw = float(pair["goal_yaw"])
+    pair_start_pixel = np.asarray(pair["start_pixel"], dtype=np.uint8)
+    pair_goal_pixel = np.asarray(pair["goal_pixel"], dtype=np.uint8)
+
+    run_name = f"{int(time.time())}_endpoint_pair_{pair_index:05d}"
     out_dir = out_root / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -625,6 +731,7 @@ def main() -> None:
         width=width,
         height=height,
     )
+    qpos_names = get_qpos_names(env)
     oracle = LocalCubePlanOracle(
         env=env,
         segment_dt=args.oracle_segment_dt,
@@ -632,32 +739,23 @@ def main() -> None:
         noise_smoothing=args.oracle_noise_smoothing,
     )
 
-    start_frame, start_info = reset_env_to_state(
+    goal_frame = pair_goal_pixel.copy()
+
+    start_frame, start_info = reset_env_to_endpoint_start(
         env,
-        seed=episode_seed,
-        qpos=qpos_np[0],
-        qvel=qvel_np[0],
-        target_block_pos=target_block_pos_np[0],
-        target_block_yaw=float(target_block_yaw_np[0, 0]),
+        seed=episode_seed + pair_index + 10_000,
+        start_block_pos=start_block_pos,
+        start_block_yaw=start_block_yaw,
+        target_block_pos=goal_block_pos,
+        target_block_yaw=goal_block_yaw,
         camera=camera,
     )
-    goal_frame, goal_info = reset_env_to_state(
-        env,
-        seed=episode_seed,
-        qpos=qpos_np[-1],
-        qvel=qvel_np[-1],
-        target_block_pos=target_block_pos_np[-1],
-        target_block_yaw=float(target_block_yaw_np[-1, 0]),
-        camera=camera,
-    )
-    current_frame, current_info = reset_env_to_state(
-        env,
-        seed=episode_seed,
-        qpos=qpos_np[0],
-        qvel=qvel_np[0],
-        target_block_pos=target_block_pos_np[0],
-        target_block_yaw=float(target_block_yaw_np[0, 0]),
-        camera=camera,
+    current_frame = start_frame.copy()
+    current_info = start_info
+    print(
+        "Selected endpoint pair "
+        f"{pair_index}: start={np.array2string(start_block_pos, precision=4)}, "
+        f"goal={np.array2string(goal_block_pos, precision=4)}"
     )
 
     goal_emb = encode_single_frame(
@@ -684,19 +782,6 @@ def main() -> None:
     if int(current_state.numel()) != markov_state_dim:
         raise ValueError(f"State dimension mismatch: config says {markov_state_dim}, built {current_state.numel()}.")
 
-    dataset_pixels = preprocess_pixels(
-        dataset_pixels_np,
-        img_size=img_size,
-        pixel_mean=pixel_mean,
-        pixel_std=pixel_std,
-    )
-    true_latents = encode_frames(
-        model,
-        dataset_pixels,
-        device=device,
-        frame_batch_size=args.frame_batch_size,
-    )
-
     save_rgb_image(out_dir / "start_image.png", start_frame)
     save_rgb_image(out_dir / "goal_image.png", goal_frame)
 
@@ -714,8 +799,6 @@ def main() -> None:
     )
 
     goal_state_np = goal_state.detach().cpu().numpy().astype(np.float64)
-    goal_block_pos = np.asarray(goal_info["privileged/target_block_pos"], dtype=np.float32)
-    goal_block_yaw = float(goal_info["privileged/target_block_yaw"][0])
 
     rollout_frames = [current_frame.copy()]
     executed_actions_raw: list[np.ndarray] = []
@@ -729,6 +812,8 @@ def main() -> None:
             goal_block_yaw,
         )
     ]
+    qpos_history = [qpos_from_info(current_info)]
+    gripper_heights = [gripper_height_from_info(current_info)]
     used_oracle_before_mpc = False
     oracle_grasped = cube_is_grasped(
         current_info,
@@ -784,6 +869,8 @@ def main() -> None:
             embedding_goal_distances.append(embedding_goal_distance)
             cube_goal_distances.append(cube_goal_distance)
             cube_yaw_errors.append(cube_yaw_error)
+            qpos_history.append(qpos_from_info(current_info))
+            gripper_heights.append(gripper_height_from_info(current_info))
 
             oracle_grasped = cube_is_grasped(
                 current_info,
@@ -846,6 +933,8 @@ def main() -> None:
             embedding_goal_distances.append(embedding_goal_distance)
             cube_goal_distances.append(cube_goal_distance)
             cube_yaw_errors.append(cube_yaw_error)
+            qpos_history.append(qpos_from_info(current_info))
+            gripper_heights.append(gripper_height_from_info(current_info))
 
             pbar.set_postfix(
                 solve_ms=f"{solve_times_ms[-1]:.1f}",
@@ -869,10 +958,14 @@ def main() -> None:
 
     final_info = current_info
     metrics = {
-        "episode_idx": int(episode_idx),
+        "episode_idx": int(pair_index),
+        "pair_index": int(pair_index),
+        "pair_index_random": selected_index_arg is None,
+        "num_pairs": int(pair["num_pairs"]),
         "episode_seed": episode_seed,
         "checkpoint": str(checkpoint_path),
         "dataset_path": str(dataset_path),
+        "pair_path": str(pair_path),
         "env_name": env_name,
         "camera": camera,
         "img_size": img_size,
@@ -893,14 +986,20 @@ def main() -> None:
         "cube_goal_distance_final": float(cube_goal_distances[-1]),
         "cube_yaw_error_initial": float(cube_yaw_errors[0]),
         "cube_yaw_error_final": float(cube_yaw_errors[-1]),
+        "start_block_pos": start_block_pos.tolist(),
+        "start_block_yaw": start_block_yaw,
         "goal_block_pos": goal_block_pos.tolist(),
         "goal_block_yaw": goal_block_yaw,
         "final_block_pos": np.asarray(final_info["privileged/block_0_pos"], dtype=np.float32).tolist(),
         "final_block_yaw": float(final_info["privileged/block_0_yaw"][0]),
         "final_effector_pos": np.asarray(final_info["proprio/effector_pos"], dtype=np.float32).tolist(),
         "final_effector_yaw": float(final_info["proprio/effector_yaw"][0]),
+        "final_gripper_height": gripper_height_from_info(final_info),
         "final_qpos": np.asarray(final_info["qpos"], dtype=np.float32).tolist(),
         "final_qvel": np.asarray(final_info["qvel"], dtype=np.float32).tolist(),
+        "qpos_names": qpos_names,
+        "qpos_history": [qpos.tolist() for qpos in qpos_history],
+        "gripper_heights": gripper_heights,
         "solve_times_ms": solve_times_ms,
         "ilqr_iterations": ilqr_iterations,
         "ilqr_costs": ilqr_costs,
@@ -910,9 +1009,8 @@ def main() -> None:
         "cube_yaw_errors": cube_yaw_errors,
         "executed_actions_raw": [action.tolist() for action in executed_actions_raw],
         "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
-        "dataset_start_pixel_l2": float(np.linalg.norm(start_frame.astype(np.float32) - dataset_pixels_np[0].astype(np.float32))),
-        "dataset_goal_pixel_l2": float(np.linalg.norm(goal_frame.astype(np.float32) - dataset_pixels_np[-1].astype(np.float32))),
-        "dataset_goal_latent_distance": float(torch.linalg.vector_norm(true_latents[-1] - goal_emb).item()),
+        "pair_start_pixel_l2": float(np.linalg.norm(start_frame.astype(np.float32) - pair_start_pixel.astype(np.float32))),
+        "pair_goal_pixel_l2": float(np.linalg.norm(goal_frame.astype(np.float32) - pair_goal_pixel.astype(np.float32))),
     }
 
     metrics_path = out_dir / "metrics.json"

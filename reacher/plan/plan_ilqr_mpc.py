@@ -28,23 +28,23 @@ from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 from reacher.train.reacher_policy_train import DmControlGymEnv, flatten_observation
 
 DEFAULT_TEST_DATASET_PATH = "reacher/data/test_data_noisy.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_6"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_embd_5"
 DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "cuda"
 HORIZON = 15
 MAX_MPC_STEPS = 100
 Q_TERMINAL = 5.0
-Q_STAGE = 0.005
+Q_STAGE = 0.05
 R_CONTROL = 0.01
 VIDEO_FPS = 60
-EPISODE_IDX = 3781
-# DEFAULT_START_QPOS = np.array([0.146451935172081, -0.7491843104362488], dtype=np.float32)
-# DEFAULT_GOAL_QPOS = np.array([2.4196903705596924, -0.9535070657730103], dtype=np.float32)
-# DEFAULT_START_QPOS = np.array([0.1, -2.0], dtype=np.float32)
-# DEFAULT_GOAL_QPOS = np.array([2.42, -0.95], dtype=np.float32)
-DEFAULT_START_QPOS = None
-DEFAULT_GOAL_QPOS = None
+EPISODE_IDX = 3056
+DEFAULT_START_QPOS = np.array([3.1258087158203125, -2.279094696044922], dtype=np.float32)
+DEFAULT_GOAL_QPOS = np.array([0.370098, -2.092896], dtype=np.float32)
+# DEFAULT_GOAL_QPOS = np.array([0.9, -2.2], dtype=np.float32)
+# DEFAULT_START_QPOS = np.array([2.42, -0.5], dtype=np.float32)
+# DEFAULT_START_QPOS = None
+# DEFAULT_GOAL_QPOS = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,6 +190,12 @@ def save_rollout_video(frames: list[np.ndarray], out_dir: Path, fps: int) -> Pat
 def save_torch_payload(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
+
+
+def save_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
 
 
 def preprocess_pixels(
@@ -707,6 +713,8 @@ def main() -> None:
         default_start_qpos=DEFAULT_START_QPOS,
         default_goal_qpos=DEFAULT_GOAL_QPOS,
     )
+    print(f"start_qpos: {np.array2string(start_qpos, precision=6)}")
+    print(f"goal_qpos: {np.array2string(goal_qpos, precision=6)}")
     run_name = (
         f"{int(time.time())}_episode_custom"
         if start_goal_source == "fixed_qpos"
@@ -972,6 +980,15 @@ def main() -> None:
         },
     }
     save_torch_payload(out_dir / "nominal_rollout.pt", rollout_payload)
+    save_json(
+        out_dir / "executed_qpos.json",
+        {
+            "start_qpos": start_qpos.tolist(),
+            "goal_qpos": goal_qpos.tolist(),
+            "final_qpos": final_qpos.tolist(),
+            "qpos_over_time": np.stack(executed_qpos, axis=0).tolist(),
+        },
+    )
 
     print(f"Saved to: {out_dir}")
 

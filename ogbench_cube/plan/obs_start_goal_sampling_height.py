@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample one OGBench start/goal pair around a center obstacle and save a 3D plot."""
+"""Sample OGBench cube grasped start/goal endpoint pairs from fixed x-bands for height-constrained experiments."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import torch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from tqdm.auto import tqdm
 
-from ogbench_cube.plan.obs_data_collect import (
+from ogbench_cube.plan.obs_data_collect_3d_ellipsoid import (
     DEFAULT_CAMERA,
     DEFAULT_CONTROL_DECIMATION,
     DEFAULT_ENV_NAME,
@@ -33,24 +33,20 @@ from ogbench_cube.plan.obs_data_collect import (
     synthesize_grasped_state,
 )
 
-DEFAULT_OUT_DIR = Path("ogbench_cube/plan/random_endpoint_pairs")
-DEFAULT_PLOT_NAME = "start_goal_speed_bump.png"
-DEFAULT_DATASET_NAME = "start_goal_speed_bump.pt"
+DEFAULT_OUT_DIR = Path("ogbench_cube/plan/random_endpoint_pairs_height")
+DEFAULT_PLOT_NAME = "start_goal_height_bands.png"
+DEFAULT_DATASET_NAME = "start_goal_height.pt"
 DEFAULT_NUM_POINTS = 1024
 DEFAULT_IMAGE_WIDTH = 224
 DEFAULT_IMAGE_HEIGHT = 224
 FIXED_YAW = 0.0
+TABLE_Z = 0.02
 
 X_BOUNDS = (0.30, 0.50)
 Y_BOUNDS = (-0.25, 0.25)
-TABLE_Z = 0.02
-OBSTACLE_BASE_Z = 0.0
-
-LEFT_BAND = (-0.2, -0.15)
-RIGHT_BAND = (0.15, 0.2)
-
-OBSTACLE_Y_BOUNDS = (-0.04, 0.04)
-OBSTACLE_PEAK_Z = 0.06
+START_X_BOUNDS = (0.45, 0.475)
+GOAL_X_BOUNDS = (0.325, 0.35)
+SHARED_Y_BOUNDS = (-0.2, 0.2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,23 +70,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--settle-steps", type=int, default=DEFAULT_SETTLE_STEPS)
     parser.add_argument("--grasp-contact-threshold", type=float, default=0.5)
     parser.add_argument("--grasp-alignment-threshold", type=float, default=0.03)
+    parser.add_argument("--start-x-min", type=float, default=float(START_X_BOUNDS[0]))
+    parser.add_argument("--start-x-max", type=float, default=float(START_X_BOUNDS[1]))
+    parser.add_argument("--goal-x-min", type=float, default=float(GOAL_X_BOUNDS[0]))
+    parser.add_argument("--goal-x-max", type=float, default=float(GOAL_X_BOUNDS[1]))
+    parser.add_argument("--y-min", type=float, default=float(SHARED_Y_BOUNDS[0]))
+    parser.add_argument("--y-max", type=float, default=float(SHARED_Y_BOUNDS[1]))
     return parser.parse_args()
 
 
-def sample_point(
-    rng: np.random.Generator,
-    *,
-    x_bounds: tuple[float, float],
-    y_bounds: tuple[float, float],
-) -> np.ndarray:
-    return np.array(
-        [
-            rng.uniform(float(x_bounds[0]), float(x_bounds[1])),
-            rng.uniform(float(y_bounds[0]), float(y_bounds[1])),
-            TABLE_Z,
-        ],
-        dtype=np.float64,
-    )
+def validate_bounds(bounds: tuple[float, float], *, name: str) -> tuple[float, float]:
+    lower = float(bounds[0])
+    upper = float(bounds[1])
+    if not lower < upper:
+        raise ValueError(f"{name} must satisfy min < max, got {bounds}.")
+    return lower, upper
 
 
 def sample_points(
@@ -100,27 +94,12 @@ def sample_points(
     x_bounds: tuple[float, float],
     y_bounds: tuple[float, float],
 ) -> np.ndarray:
-    if count <= 0:
-        raise ValueError("num-points must be positive.")
+    if int(count) <= 0:
+        raise ValueError("--num-points must be positive.")
     x = rng.uniform(float(x_bounds[0]), float(x_bounds[1]), size=int(count))
     y = rng.uniform(float(y_bounds[0]), float(y_bounds[1]), size=int(count))
     z = np.full((int(count),), TABLE_Z, dtype=np.float64)
     return np.stack((x, y, z), axis=1)
-
-
-def half_ellipse_height(
-    y_values: np.ndarray,
-    *,
-    y_bounds: tuple[float, float],
-    base_z: float,
-    peak_z: float,
-) -> np.ndarray:
-    y_values = np.asarray(y_values, dtype=np.float64)
-    center_y = 0.5 * (float(y_bounds[0]) + float(y_bounds[1]))
-    half_width = 0.5 * (float(y_bounds[1]) - float(y_bounds[0]))
-    normalized = (y_values - center_y) / half_width
-    profile = np.sqrt(np.clip(1.0 - normalized**2, 0.0, None))
-    return float(base_z) + (float(peak_z) - float(base_z)) * profile
 
 
 def save_plot(
@@ -128,25 +107,13 @@ def save_plot(
     *,
     start_points: np.ndarray,
     goal_points: np.ndarray,
+    start_x_bounds: tuple[float, float],
+    goal_x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
 ) -> None:
     x_values = np.linspace(float(X_BOUNDS[0]), float(X_BOUNDS[1]), num=80, dtype=np.float64)
     y_values = np.linspace(float(Y_BOUNDS[0]), float(Y_BOUNDS[1]), num=160, dtype=np.float64)
     grid_x, grid_y = np.meshgrid(x_values, y_values)
-
-    obstacle_y_values = np.linspace(
-        float(OBSTACLE_Y_BOUNDS[0]),
-        float(OBSTACLE_Y_BOUNDS[1]),
-        num=80,
-        dtype=np.float64,
-    )
-    obstacle_grid_x, obstacle_grid_y = np.meshgrid(x_values, obstacle_y_values)
-    obstacle_z = half_ellipse_height(
-        obstacle_grid_y,
-        y_bounds=OBSTACLE_Y_BOUNDS,
-        base_z=OBSTACLE_BASE_Z,
-        peak_z=OBSTACLE_PEAK_Z,
-    )
-
     plane_z = np.full_like(grid_x, TABLE_Z, dtype=np.float64)
 
     fig = plt.figure(figsize=(8.0, 6.0), dpi=180)
@@ -161,21 +128,11 @@ def save_plot(
         antialiased=True,
         shade=False,
     )
-    ax.plot_surface(
-        obstacle_grid_x,
-        obstacle_grid_y,
-        obstacle_z,
-        color="#cc7a00",
-        alpha=0.75,
-        linewidth=0.0,
-        antialiased=True,
-    )
-
     ax.scatter(
         start_points[:, 0],
         start_points[:, 1],
         start_points[:, 2],
-        color="#0072b2",
+        c="#0072b2",
         s=8.0,
         depthshade=False,
         label="start",
@@ -184,25 +141,28 @@ def save_plot(
         goal_points[:, 0],
         goal_points[:, 1],
         goal_points[:, 2],
-        color="#d55e00",
+        c="#d55e00",
         s=8.0,
         depthshade=False,
         label="goal",
     )
-
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
     ax.set_xlim(X_BOUNDS)
     ax.set_ylim(Y_BOUNDS)
     ax.set_zlim(0.0, 0.30)
+    ax.set_xlabel("cube x")
+    ax.set_ylabel("cube y")
+    ax.set_zlabel("cube z")
     ax.view_init(elev=28, azim=-25)
     ax.legend(loc="upper left")
-    ax.set_title("OGBench start/goal sampler with center speed-bump obstacle")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ax.set_title(
+        "OGBench height start/goal endpoint bands\n"
+        f"start x in [{start_x_bounds[0]:.3f}, {start_x_bounds[1]:.3f}], "
+        f"goal x in [{goal_x_bounds[0]:.3f}, {goal_x_bounds[1]:.3f}], "
+        f"y in [{y_bounds[0]:.3f}, {y_bounds[1]:.3f}]"
+    )
     fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
     # plt.show()
     plt.close(fig)
 
@@ -234,14 +194,24 @@ def render_grasped_images(
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
+    start_x_bounds = validate_bounds((args.start_x_min, args.start_x_max), name="start x bounds")
+    goal_x_bounds = validate_bounds((args.goal_x_min, args.goal_x_max), name="goal x bounds")
+    y_bounds = validate_bounds((args.y_min, args.y_max), name="y bounds")
 
-    start_points = sample_points(rng, args.num_points, x_bounds=X_BOUNDS, y_bounds=LEFT_BAND)
-    goal_points = sample_points(rng, args.num_points, x_bounds=X_BOUNDS, y_bounds=RIGHT_BAND)
+    start_points = sample_points(rng, args.num_points, x_bounds=start_x_bounds, y_bounds=y_bounds)
+    goal_points = sample_points(rng, args.num_points, x_bounds=goal_x_bounds, y_bounds=y_bounds)
 
     plot_path = args.out_dir / args.plot_name
     out_path = args.out_dir / args.out_name
+    save_plot(
+        plot_path,
+        start_points=start_points,
+        goal_points=goal_points,
+        start_x_bounds=start_x_bounds,
+        goal_x_bounds=goal_x_bounds,
+        y_bounds=y_bounds,
+    )
 
-    save_plot(plot_path, start_points=start_points, goal_points=goal_points)
     env = make_env(args)
     try:
         reference, _ = capture_grasp_reference(env, args)
@@ -274,14 +244,12 @@ def main() -> None:
             "camera": str(args.camera),
             "image_width": int(args.width),
             "image_height": int(args.height),
-            "x_bounds": np.asarray(X_BOUNDS, dtype=np.float32),
-            "y_bounds": np.asarray(Y_BOUNDS, dtype=np.float32),
+            "workspace_x_bounds": np.asarray(X_BOUNDS, dtype=np.float32),
+            "workspace_y_bounds": np.asarray(Y_BOUNDS, dtype=np.float32),
+            "start_x_bounds": np.asarray(start_x_bounds, dtype=np.float32),
+            "goal_x_bounds": np.asarray(goal_x_bounds, dtype=np.float32),
+            "shared_y_bounds": np.asarray(y_bounds, dtype=np.float32),
             "table_z": float(TABLE_Z),
-            "obstacle_base_z": float(OBSTACLE_BASE_Z),
-            "left_band": np.asarray(LEFT_BAND, dtype=np.float32),
-            "right_band": np.asarray(RIGHT_BAND, dtype=np.float32),
-            "obstacle_y_bounds": np.asarray(OBSTACLE_Y_BOUNDS, dtype=np.float32),
-            "obstacle_peak_z": float(OBSTACLE_PEAK_Z),
             "fixed_yaw": float(FIXED_YAW),
             "plot_path": str(plot_path),
         },

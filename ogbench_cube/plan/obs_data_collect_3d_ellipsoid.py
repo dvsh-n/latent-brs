@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect a balanced OGBench cube obstacle image dataset from synthesized grasped states."""
+"""Collect a balanced OGBench cube half-ellipsoid obstacle image dataset from synthesized grasped states."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from ogbench_cube.data.ogbench_cube_data_gen import (
     sample_valid_reset,
 )
 
-DEFAULT_OUT_DIR = Path("ogbench_cube/plan/obstacle_data")
+DEFAULT_OUT_DIR = Path("ogbench_cube/plan/obstacle_data_3d_ellipsoid_back")
 DEFAULT_CAMERA = "front_pixels"
 DEFAULT_SAMPLES_PER_CLASS = 8192
 DEFAULT_MAX_ORACLE_STEPS = 80
@@ -48,12 +48,15 @@ DEFAULT_ACCEPTANCE_POS_TOL = 0.03
 DEFAULT_ACCEPTANCE_YAW_TOL = 0.25
 DEFAULT_MAX_ATTEMPTS_PER_CLASS = 200_000
 DEFAULT_NON_OBSTACLE_OUTSIDE_Y_PROB = 0.75
-DIAGNOSTIC_PLOT_NAME = "balanced_obstacle_dataset_yz.png"
+DIAGNOSTIC_PLOT_NAME = "balanced_obstacle_dataset_xy.png"
 
 TABLE_Z = 0.02
 OBSTACLE_BASE_Z = 0.0
-OBSTACLE_PEAK_Z = 0.06
-OBSTACLE_Y_BOUNDS = (-0.04, 0.04)
+OBSTACLE_PEAK_Z = 0.055
+OBSTACLE_CENTER_X = 0.35
+OBSTACLE_CENTER_Y = 0.0
+OBSTACLE_RADIUS_X = 0.04
+OBSTACLE_RADIUS_Y = 0.08
 
 
 @dataclass
@@ -107,8 +110,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_NON_OBSTACLE_OUTSIDE_Y_PROB,
         help=(
-            "Probability that a class-0 sample is drawn from outside the obstacle y-band. "
-            "The remaining probability is used for above-cap samples inside the y-band."
+            "Probability that a class-0 sample is drawn from outside the obstacle x/y footprint. "
+            "The remaining probability is used for above-cap samples inside that footprint."
         ),
     )
     parser.add_argument("--max-attempts-per-class", type=int, default=DEFAULT_MAX_ATTEMPTS_PER_CLASS)
@@ -149,34 +152,46 @@ def rotation_z(yaw: float) -> np.ndarray:
     )
 
 
-def half_ellipse_height(
+def half_ellipsoid_height(
+    x_value: float | np.ndarray,
     y_value: float | np.ndarray,
     *,
-    y_bounds: tuple[float, float],
+    center_x: float,
+    center_y: float,
+    radius_x: float,
+    radius_y: float,
     base_z: float,
     peak_z: float,
 ) -> float | np.ndarray:
+    x_values = np.asarray(x_value, dtype=np.float64)
     y_values = np.asarray(y_value, dtype=np.float64)
-    center_y = 0.5 * (float(y_bounds[0]) + float(y_bounds[1]))
-    half_width = 0.5 * (float(y_bounds[1]) - float(y_bounds[0]))
-    normalized = (y_values - center_y) / half_width
-    profile = np.sqrt(np.clip(1.0 - normalized**2, 0.0, None))
+    normalized = ((x_values - float(center_x)) / float(radius_x)) ** 2 + (
+        (y_values - float(center_y)) / float(radius_y)
+    ) ** 2
+    profile = np.sqrt(np.clip(1.0 - normalized, 0.0, None))
     result = float(base_z) + (float(peak_z) - float(base_z)) * profile
-    if np.ndim(y_value) == 0:
+    if np.ndim(x_value) == 0 and np.ndim(y_value) == 0:
         return float(result)
     return result
 
 
 def obstacle_label_from_pose(block_pos: np.ndarray) -> int:
+    x_value = float(block_pos[0])
     y_value = float(block_pos[1])
     z_value = float(block_pos[2])
-    in_y_band = float(OBSTACLE_Y_BOUNDS[0]) <= y_value <= float(OBSTACLE_Y_BOUNDS[1])
-    if not in_y_band:
+    normalized = ((x_value - float(OBSTACLE_CENTER_X)) / float(OBSTACLE_RADIUS_X)) ** 2 + (
+        (y_value - float(OBSTACLE_CENTER_Y)) / float(OBSTACLE_RADIUS_Y)
+    ) ** 2
+    if normalized > 1.0:
         return 0
     ceiling = float(
-        half_ellipse_height(
+        half_ellipsoid_height(
+            x_value,
             y_value,
-            y_bounds=OBSTACLE_Y_BOUNDS,
+            center_x=OBSTACLE_CENTER_X,
+            center_y=OBSTACLE_CENTER_Y,
+            radius_x=OBSTACLE_RADIUS_X,
+            radius_y=OBSTACLE_RADIUS_Y,
             base_z=OBSTACLE_BASE_Z,
             peak_z=OBSTACLE_PEAK_Z,
         )
@@ -282,12 +297,18 @@ def cube_is_grasped(
 def sample_inside_pose(rng: np.random.Generator, height_margin: float) -> tuple[np.ndarray, float]:
     z_min = float(TABLE_Z + height_margin)
     for _ in range(DEFAULT_INSIDE_SAMPLE_ATTEMPTS):
-        x = float(rng.uniform(float(XY_SAMPLING_BOUNDS[0, 0]), float(XY_SAMPLING_BOUNDS[1, 0])))
-        y = float(rng.uniform(float(OBSTACLE_Y_BOUNDS[0]), float(OBSTACLE_Y_BOUNDS[1])))
+        angle = float(rng.uniform(0.0, 2.0 * np.pi))
+        radius_scale = float(np.sqrt(rng.uniform(0.0, 1.0)))
+        x = float(OBSTACLE_CENTER_X + OBSTACLE_RADIUS_X * radius_scale * np.cos(angle))
+        y = float(OBSTACLE_CENTER_Y + OBSTACLE_RADIUS_Y * radius_scale * np.sin(angle))
         z_ceiling = float(
-            half_ellipse_height(
+            half_ellipsoid_height(
+                x,
                 y,
-                y_bounds=OBSTACLE_Y_BOUNDS,
+                center_x=OBSTACLE_CENTER_X,
+                center_y=OBSTACLE_CENTER_Y,
+                radius_x=OBSTACLE_RADIUS_X,
+                radius_y=OBSTACLE_RADIUS_Y,
                 base_z=OBSTACLE_BASE_Z,
                 peak_z=OBSTACLE_PEAK_Z,
             )
@@ -312,38 +333,45 @@ def sample_outside_pose(
     x_bounds = (float(XY_SAMPLING_BOUNDS[0, 0]), float(XY_SAMPLING_BOUNDS[1, 0]))
     z_bounds = (float(Z_SAMPLING_BOUNDS[0]), float(Z_SAMPLING_BOUNDS[1]))
 
-    y_ranges = [
-        (float(XY_SAMPLING_BOUNDS[0, 1]), float(OBSTACLE_Y_BOUNDS[0])),
-        (float(OBSTACLE_Y_BOUNDS[1]), float(XY_SAMPLING_BOUNDS[1, 1])),
-    ]
-    valid_ranges = [(lo, hi) for lo, hi in y_ranges if hi > lo]
-    outside_y_possible = bool(valid_ranges)
+    outside_xy_possible = True
     cap_clearance_possible = z_bounds[1] > float(TABLE_Z + height_margin)
 
-    if not outside_y_possible and not cap_clearance_possible:
+    if not outside_xy_possible and not cap_clearance_possible:
         raise RuntimeError("No feasible non-obstacle sampling strategy is available.")
 
-    if outside_y_possible and cap_clearance_possible:
-        strategy = "outside_y_band" if float(rng.uniform()) < float(outside_y_prob) else "above_cap"
-    elif outside_y_possible:
-        strategy = "outside_y_band"
+    if outside_xy_possible and cap_clearance_possible:
+        strategy = "outside_xy_footprint" if float(rng.uniform()) < float(outside_y_prob) else "above_cap"
+    elif outside_xy_possible:
+        strategy = "outside_xy_footprint"
     else:
         strategy = "above_cap"
 
-    x = float(rng.uniform(*x_bounds))
-
-    if strategy == "outside_y_band":
-        widths = np.asarray([hi - lo for lo, hi in valid_ranges], dtype=np.float64)
-        idx = int(rng.choice(len(valid_ranges), p=widths / widths.sum()))
-        y = float(rng.uniform(valid_ranges[idx][0], valid_ranges[idx][1]))
-        z = float(rng.uniform(*z_bounds))
+    if strategy == "outside_xy_footprint":
+        for _ in range(DEFAULT_INSIDE_SAMPLE_ATTEMPTS):
+            x = float(rng.uniform(*x_bounds))
+            y = float(rng.uniform(float(XY_SAMPLING_BOUNDS[0, 1]), float(XY_SAMPLING_BOUNDS[1, 1])))
+            normalized = ((x - float(OBSTACLE_CENTER_X)) / float(OBSTACLE_RADIUS_X)) ** 2 + (
+                (y - float(OBSTACLE_CENTER_Y)) / float(OBSTACLE_RADIUS_Y)
+            ) ** 2
+            if normalized > 1.0:
+                z = float(rng.uniform(*z_bounds))
+                break
+        else:
+            raise RuntimeError("Could not sample a feasible non-obstacle pose outside the obstacle footprint.")
     else:
         for _ in range(DEFAULT_INSIDE_SAMPLE_ATTEMPTS):
-            y = float(rng.uniform(float(OBSTACLE_Y_BOUNDS[0]), float(OBSTACLE_Y_BOUNDS[1])))
+            angle = float(rng.uniform(0.0, 2.0 * np.pi))
+            radius_scale = float(np.sqrt(rng.uniform(0.0, 1.0)))
+            x = float(OBSTACLE_CENTER_X + OBSTACLE_RADIUS_X * radius_scale * np.cos(angle))
+            y = float(OBSTACLE_CENTER_Y + OBSTACLE_RADIUS_Y * radius_scale * np.sin(angle))
             z_min = float(
-                half_ellipse_height(
+                half_ellipsoid_height(
+                    x,
                     y,
-                    y_bounds=OBSTACLE_Y_BOUNDS,
+                    center_x=OBSTACLE_CENTER_X,
+                    center_y=OBSTACLE_CENTER_Y,
+                    radius_x=OBSTACLE_RADIUS_X,
+                    radius_y=OBSTACLE_RADIUS_Y,
                     base_z=OBSTACLE_BASE_Z,
                     peak_z=OBSTACLE_PEAK_Z,
                 )
@@ -567,8 +595,8 @@ def save_balanced_dataset_diagnostic(
     safe_mask = ~obstacle_mask
 
     ax.scatter(
+        block_pos[safe_mask, 0],
         block_pos[safe_mask, 1],
-        block_pos[safe_mask, 2],
         s=18.0,
         c="#009e73",
         alpha=0.7,
@@ -576,34 +604,22 @@ def save_balanced_dataset_diagnostic(
         label="non-obstacle",
     )
     ax.scatter(
+        block_pos[obstacle_mask, 0],
         block_pos[obstacle_mask, 1],
-        block_pos[obstacle_mask, 2],
         s=18.0,
         c="#d55e00",
         alpha=0.75,
         edgecolors="none",
         label="obstacle",
     )
-    curve_y = np.linspace(float(OBSTACLE_Y_BOUNDS[0]), float(OBSTACLE_Y_BOUNDS[1]), num=256, dtype=np.float64)
-    curve_z = half_ellipse_height(
-        curve_y,
-        y_bounds=OBSTACLE_Y_BOUNDS,
-        base_z=OBSTACLE_BASE_Z,
-        peak_z=OBSTACLE_PEAK_Z,
-    )
-    ax.fill_between(
-        curve_y,
-        float(OBSTACLE_BASE_Z),
-        curve_z,
-        color="#d55e00",
-        alpha=0.08,
-        label="half-ellipse obstacle region",
-    )
-    ax.plot(curve_y, curve_z, color="#4d4d4d", linestyle="--", linewidth=1.2, label="obstacle boundary")
-    ax.axhline(float(TABLE_Z), color="#0072b2", linestyle=":", linewidth=1.2, label="table top")
-    ax.set_title("Balanced obstacle dataset by cube y/z position")
-    ax.set_xlabel("cube y")
-    ax.set_ylabel("cube z")
+    theta = np.linspace(0.0, 2.0 * np.pi, num=256, dtype=np.float64)
+    boundary_x = float(OBSTACLE_CENTER_X) + float(OBSTACLE_RADIUS_X) * np.cos(theta)
+    boundary_y = float(OBSTACLE_CENTER_Y) + float(OBSTACLE_RADIUS_Y) * np.sin(theta)
+    ax.fill(boundary_x, boundary_y, color="#d55e00", alpha=0.08, label="half-ellipsoid footprint")
+    ax.plot(boundary_x, boundary_y, color="#4d4d4d", linestyle="--", linewidth=1.2, label="footprint boundary")
+    ax.set_title("Balanced obstacle dataset by cube x/y position")
+    ax.set_xlabel("cube x")
+    ax.set_ylabel("cube y")
     ax.grid(alpha=0.2)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -668,10 +684,11 @@ def main() -> None:
                 "task_xy_bounds": np.asarray(XY_SAMPLING_BOUNDS, dtype=np.float32),
                 "task_z_bounds": np.asarray(Z_SAMPLING_BOUNDS, dtype=np.float32),
                 "task_yaw_bounds": np.asarray(THETA_SAMPLING_BOUNDS, dtype=np.float32),
-                "obstacle_profile": "half_ellipse",
+                "obstacle_profile": "half_3d_ellipsoid",
                 "obstacle_base_z": float(OBSTACLE_BASE_Z),
                 "obstacle_peak_z": float(OBSTACLE_PEAK_Z),
-                "obstacle_y_bounds": np.asarray(OBSTACLE_Y_BOUNDS, dtype=np.float32),
+                "obstacle_center_xy": np.asarray([OBSTACLE_CENTER_X, OBSTACLE_CENTER_Y], dtype=np.float32),
+                "obstacle_radius_xy": np.asarray([OBSTACLE_RADIUS_X, OBSTACLE_RADIUS_Y], dtype=np.float32),
                 "samples_per_class": int(args.samples_per_class),
                 "settle_steps": int(args.settle_steps),
                 "acceptance_pos_tol": float(args.acceptance_pos_tol),
@@ -685,7 +702,7 @@ def main() -> None:
             "dataset": dataset,
             "reference_grasp": jsonable(reference),
         },
-        out_dir / "obstacle_classifier_data.pt",
+        out_dir / "obstacle_classifier_data_3d_ellipsoid.pt",
     )
 
     save_json(
@@ -703,7 +720,8 @@ def main() -> None:
                 "task_xy_bounds": np.asarray(XY_SAMPLING_BOUNDS, dtype=np.float32),
                 "task_z_bounds": np.asarray(Z_SAMPLING_BOUNDS, dtype=np.float32),
                 "task_yaw_bounds": np.asarray(THETA_SAMPLING_BOUNDS, dtype=np.float32),
-                "obstacle_y_bounds": list(OBSTACLE_Y_BOUNDS),
+                "obstacle_center_xy": [float(OBSTACLE_CENTER_X), float(OBSTACLE_CENTER_Y)],
+                "obstacle_radius_xy": [float(OBSTACLE_RADIUS_X), float(OBSTACLE_RADIUS_Y)],
                 "obstacle_peak_z": float(OBSTACLE_PEAK_Z),
                 "height_margin": float(args.height_margin),
             },
@@ -735,7 +753,7 @@ def main() -> None:
     )
 
     print(f"Saved diagnostic: {out_dir / DIAGNOSTIC_PLOT_NAME}")
-    print(f"Saved dataset:    {out_dir / 'obstacle_classifier_data.pt'}")
+    print(f"Saved dataset:    {out_dir / 'obstacle_classifier_data_3d_ellipsoid.pt'}")
     print(f"Saved summary:    {out_dir / 'summary.json'}")
 
 

@@ -96,6 +96,8 @@ class BaseEnvConfig:
     nominal_task_state: TaskState = field(default_factory=lambda: TaskState.from_array(NOMINAL_TASK_STATE))
     rope_spec: RopeSpec = field(default_factory=RopeSpec)
     enable_proxy_rope: bool = False
+    asset_extra_xml: str = ""
+    worldbody_extra_xml: str = ""
 
 
 @dataclass(frozen=True)
@@ -265,6 +267,8 @@ def build_lab_scene_xml(
     proxy_tendon_xml = ""
     if config.enable_proxy_rope:
         proxy_body_xml, proxy_tendon_xml = build_proxy_rope_xml(config.rope_spec, config.task_bounds)
+    asset_extra_xml = config.asset_extra_xml.rstrip()
+    worldbody_extra_xml = config.worldbody_extra_xml.rstrip()
     return f"""
 <mujoco model="lab_scene_control">
   <compiler angle="radian"/>
@@ -285,6 +289,7 @@ def build_lab_scene_xml(
       rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
     <model name="kuka_iiwa_model" file="{IIWA_MODEL_XML.as_posix()}"/>
+{asset_extra_xml}
   </asset>
 
   <worldbody>
@@ -328,6 +333,7 @@ def build_lab_scene_xml(
             mode="fixed"
             pos="0 0 3.0"
             xyaxes="1 0 0  0 1 0"/>
+{worldbody_extra_xml}
 {proxy_body_xml}
   </worldbody>
 

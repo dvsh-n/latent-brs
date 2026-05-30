@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and conformalize an OGBench cube latent obstacle classifier from collected obstacle data."""
+"""Train and conformalize an OGBench cube latent height-constraint classifier from collected height data."""
 
 from __future__ import annotations
 
@@ -28,9 +28,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
-DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8_strtn"
-DEFAULT_DATA_PATH = "ogbench_cube/plan/obstacle_data/obstacle_classifier_data.pt"
-DEFAULT_OUT_DIR = "ogbench_cube/plan/obs_net"
+DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_12_strtn"
+DEFAULT_DATA_PATH = "ogbench_cube/plan/height_data/height_classifier_data.pt"
+DEFAULT_OUT_DIR = "ogbench_cube/plan/obs_net_height_embd_12_strtn"
 DEFAULT_ACTIVATION = nn.Tanh
 DEFAULT_SOURCE_TRAIN_FRAC = 0.9
 
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def log_progress(message: str) -> None:
-    print(f"[ogbench_cube_obstacle_net] {message}", flush=True)
+    print(f"[ogbench_cube_obstacle_net_height] {message}", flush=True)
 
 
 def save_json(path: Path, payload: dict[str, Any]) -> None:
@@ -124,15 +124,15 @@ def load_world_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Mo
 
 def load_obstacle_dataset(data_path: Path) -> dict[str, Any]:
     if not data_path.is_file():
-        raise FileNotFoundError(f"Obstacle dataset not found: {data_path}")
+        raise FileNotFoundError(f"Height dataset not found: {data_path}")
     payload = torch.load(data_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or "dataset" not in payload:
-        raise ValueError(f"Unexpected obstacle dataset format in {data_path}.")
+        raise ValueError(f"Unexpected height dataset format in {data_path}.")
     dataset = payload["dataset"]
     required = ("pixels", "label")
     missing = [key for key in required if key not in dataset]
     if missing:
-        raise KeyError(f"Obstacle dataset is missing required keys: {missing}")
+        raise KeyError(f"Height dataset is missing required keys: {missing}")
     return payload
 
 
@@ -360,11 +360,11 @@ def score_threshold_metrics(eval_payload: dict[str, Any], labels: np.ndarray, th
     preds_obstacle = scores <= threshold
     pos_mask = labels < 0.0
     neg_mask = ~pos_mask
-    obstacle_coverage = float(np.mean(preds_obstacle[pos_mask])) if np.any(pos_mask) else 0.0
-    outside_activation_rate = float(np.mean(preds_obstacle[neg_mask])) if np.any(neg_mask) else 0.0
+    above_threshold_coverage = float(np.mean(preds_obstacle[pos_mask])) if np.any(pos_mask) else 0.0
+    below_threshold_activation_rate = float(np.mean(preds_obstacle[neg_mask])) if np.any(neg_mask) else 0.0
     return {
-        "obstacle_coverage": obstacle_coverage,
-        "outside_activation_rate": outside_activation_rate,
+        "above_threshold_coverage": above_threshold_coverage,
+        "below_threshold_activation_rate": below_threshold_activation_rate,
         "threshold": float(threshold),
     }
 
@@ -504,7 +504,7 @@ def main() -> None:
         print(f"Model path: {paths.model}")
         return
 
-    log_progress("Loading collected obstacle dataset.")
+    log_progress("Loading collected height dataset.")
     data_payload = load_obstacle_dataset(data_path)
     metadata = data_payload.get("metadata", {})
     dataset = data_payload["dataset"]
@@ -516,7 +516,7 @@ def main() -> None:
     if labels_binary.shape[0] != pixels.shape[0]:
         raise ValueError("Label count does not match pixel count.")
     if not set(np.unique(labels_binary).tolist()).issubset({0, 1}):
-        raise ValueError("Expected binary labels with 1=obstacle and 0=non-obstacle.")
+        raise ValueError("Expected binary labels with 1=above-threshold and 0=below-threshold.")
 
     source_train_idx = (
         np.asarray(dataset["train_idx"], dtype=np.int64)
@@ -535,7 +535,7 @@ def main() -> None:
             source_train_frac=float(args.source_train_frac),
             rng=rng,
         )
-        split_origin = "generated_in_obstacle_net"
+        split_origin = "generated_in_height_net"
 
     train_idx, val_idx = split_stratified_validation(
         source_train_idx,
@@ -666,14 +666,14 @@ def main() -> None:
             "feature_mean": train_mean.numpy().astype(np.float32),
             "feature_std": train_std.numpy().astype(np.float32),
             "score_sign_convention": {
-                "obstacle": "negative",
-                "non_obstacle": "positive",
-                "binary_source_labels": {"obstacle": 1, "non_obstacle": 0},
+                "above_threshold": "negative",
+                "below_threshold": "positive",
+                "binary_source_labels": {"above_threshold": 1, "below_threshold": 0},
             },
             "base_decision_threshold": 0.0,
             "conformal_safe_score_threshold": float(safe_score_threshold),
             "conformal_delta": float(args.delta),
-            "conformal_nonconformity_definition": "max(0, NN(x)) on obstacle calibration samples",
+            "conformal_nonconformity_definition": "max(0, NN(x)) on above-threshold calibration samples",
             "conformal_score_quantile": float(conformal["score_quantile"]),
             "cache_config": asdict(run_config),
             "source_metadata": jsonable(metadata),
@@ -705,7 +705,7 @@ def main() -> None:
                 "base_decision_threshold": 0.0,
                 "safe_score_threshold": float(safe_score_threshold),
                 "delta": float(args.delta),
-                "nonconformity_definition": "max(0, NN(x)) on obstacle calibration samples",
+                "nonconformity_definition": "max(0, NN(x)) on above-threshold calibration samples",
                 "score_quantile": float(conformal["score_quantile"]),
                 "num_obstacle_calibration": int(conformal["num_obstacle_calibration"]),
                 "metrics": {
@@ -739,12 +739,12 @@ def main() -> None:
             "train": int(train_idx.shape[0]),
             "val": int(val_idx.shape[0]),
             "cal": int(calibration_idx.shape[0]),
-            "train_obstacle": int(np.sum(labels_binary[train_idx] == 1)),
-            "train_non_obstacle": int(np.sum(labels_binary[train_idx] == 0)),
-            "val_obstacle": int(np.sum(labels_binary[val_idx] == 1)),
-            "val_non_obstacle": int(np.sum(labels_binary[val_idx] == 0)),
-            "cal_obstacle": int(np.sum(labels_binary[calibration_idx] == 1)),
-            "cal_non_obstacle": int(np.sum(labels_binary[calibration_idx] == 0)),
+            "train_above_threshold": int(np.sum(labels_binary[train_idx] == 1)),
+            "train_below_threshold": int(np.sum(labels_binary[train_idx] == 0)),
+            "val_above_threshold": int(np.sum(labels_binary[val_idx] == 1)),
+            "val_below_threshold": int(np.sum(labels_binary[val_idx] == 0)),
+            "cal_above_threshold": int(np.sum(labels_binary[calibration_idx] == 1)),
+            "cal_below_threshold": int(np.sum(labels_binary[calibration_idx] == 0)),
         },
         "metrics": {
             "train": compact_eval(train_eval),
@@ -755,7 +755,7 @@ def main() -> None:
             "base_decision_threshold": 0.0,
             "safe_score_threshold": float(safe_score_threshold),
             "delta": float(args.delta),
-            "nonconformity_definition": "max(0, NN(x)) on obstacle calibration samples",
+            "nonconformity_definition": "max(0, NN(x)) on above-threshold calibration samples",
             "score_quantile": float(conformal["score_quantile"]),
             "num_obstacle_calibration": int(conformal["num_obstacle_calibration"]),
             "metrics": {
@@ -765,20 +765,20 @@ def main() -> None:
             },
         },
         "score_sign_convention": {
-            "obstacle": "negative",
-            "non_obstacle": "positive",
-            "binary_source_labels": {"obstacle": 1, "non_obstacle": 0},
+            "above_threshold": "negative",
+            "below_threshold": "positive",
+            "binary_source_labels": {"above_threshold": 1, "below_threshold": 0},
         },
     }
     save_json(paths.summary, summary)
 
-    log_progress("Obstacle net complete.")
+    log_progress("Height net complete.")
     print(f"Cache dir:  {paths.cache_dir}")
     print(f"Model path: {paths.model}")
     print(f"Train acc:  {train_eval['accuracy']:.4f}")
     print(f"Val acc:    {val_eval['accuracy']:.4f}")
     print(f"Cal acc:    {cal_eval['accuracy']:.4f}")
-    print("Conformal nonconformity: max(0, NN(x)) on obstacle calibration samples")
+    print("Conformal nonconformity: max(0, NN(x)) on above-threshold calibration samples")
     print(f"Applied safe score threshold: {safe_score_threshold:.6f}")
 
 

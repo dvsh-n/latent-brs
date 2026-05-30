@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Finetune an LE-WM-style JEPA by reusing only a pretrained ViT encoder."""
+"""Train an LE-WM-style JEPA with a Markov latent-state MLP dynamics predictor on real rope data shards."""
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
-import re
 from functools import partial
 from pathlib import Path, PosixPath
+import re
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -21,27 +22,26 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset, random_split
 
-from ogbench_cube.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
+from rope.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "ogbench_cube/data/expert_data/ogbench_cube_expert.h5"
-DEFAULT_INIT_RUN_DIR = "ogbench_cube/models/mlpdyn_embd_8"
-DEFAULT_RUN_DIR = "ogbench_cube/models/mlpdyn_embd_8_strtn"
+DEFAULT_DATASET_GLOB = "rope/data/real_data_new/*.h5"
+DEFAULT_RUN_DIR = "rope/models/mlpdyn_real_2"
 FIXED_FRAMESKIP = 1
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--init-run-dir", type=Path, default=DEFAULT_INIT_RUN_DIR)
+    parser.add_argument("--init-run-dir", type=Path, default=None)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
-    parser.add_argument(
-        "--resume-checkpoint",
-        type=Path,
-        default=None,
-        help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
-    )
-    parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
+    parser.add_argument("--dataset-glob", default=DEFAULT_DATASET_GLOB)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
+    parser.add_argument("--resume", action="store_true", default=False, help="Resume training from run-dir/last.ckpt.")
+    parser.add_argument(
+        "--action-key",
+        default="control",
+        help="Which action tensor to train on from the real-data shards, for example measured_action, action, or control.",
+    )
     parser.add_argument("--output-model-name", default="lewm")
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--train-split", type=float, default=1.0)
@@ -49,24 +49,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=12)
+    parser.add_argument("--embed-dim", type=int, default=32)
     parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
-    parser.add_argument("--action-dim", type=int, default=5)
+    parser.add_argument("--action-dim", type=int, default=14)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
-    parser.add_argument("--predictor-depth", type=int, default=2)
+    parser.add_argument("--predictor-depth", type=int, default=3)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
     parser.add_argument("--sigreg-weight", type=float, default=0.005)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
-    parser.add_argument("--straighten", action="store_true", default=False, help="Apply temporal straightening to encoder latents.")
-    parser.add_argument("--straighten-weight", type=float, default=1e-3)
+    parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
+    parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
-    parser.add_argument("--freeze-projector-epochs", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument(
         "--load-projector",
         action=argparse.BooleanOptionalAction,
@@ -88,35 +86,32 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Keep training dataloader workers alive across epochs. Validation workers stay non-persistent to avoid doubled RAM usage.",
     )
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--gradient-clip-val", type=float, default=1.0)
     parser.add_argument("--accelerator", default="gpu")
     parser.add_argument("--devices", default="auto")
     parser.add_argument("--precision", default="bf16-mixed")
-    parser.add_argument("--save-object-every", type=int, default=1)
+    parser.add_argument("--save-object-every", type=int, default=2)
     args = parser.parse_args()
-    if args.freeze_encoder_epochs < 0:
-        parser.error("--freeze-encoder-epochs must be non-negative.")
-    if args.freeze_projector_epochs < 0:
-        parser.error("--freeze-projector-epochs must be non-negative.")
     args.frameskip = FIXED_FRAMESKIP
     args.markov_state_dim = (args.markov_deriv + 1) * args.embed_dim
     return args
 
 
-class LeWMOGBenchCubeDataset(Dataset):
+class LeWMRopeRealDataset(Dataset):
     def __init__(
         self,
-        dataset_path: Path,
+        dataset_glob: str,
         *,
         markov_deriv: int,
         num_preds: int,
         frameskip: int,
         img_size: int,
         action_dim: int,
+        action_key: str,
     ) -> None:
-        self.dataset_path = dataset_path
+        self.dataset_glob = dataset_glob
         self.markov_deriv = int(markov_deriv)
         self.num_preds = int(num_preds)
         self.frameskip = int(frameskip)
@@ -124,8 +119,9 @@ class LeWMOGBenchCubeDataset(Dataset):
         self.action_steps = self.num_preds
         self.img_size = int(img_size)
         self.action_dim = int(action_dim)
+        self.action_key = str(action_key)
         self.effective_action_dim = self.frameskip * self.action_dim
-        self._h5: h5py.File | None = None
+        self._h5_files: dict[int, h5py.File] = {}
 
         if self.markov_deriv < 0:
             raise ValueError("markov_deriv must be non-negative.")
@@ -134,40 +130,84 @@ class LeWMOGBenchCubeDataset(Dataset):
         if self.frameskip < 1:
             raise ValueError("frameskip must be positive.")
 
-        with h5py.File(self.dataset_path, "r") as h5:
-            self.ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
-            self.ep_offset = np.asarray(h5["ep_offset"][:], dtype=np.int64)
-            if int(h5["action"].shape[-1]) != self.action_dim:
-                raise ValueError(f"Expected action_dim={self.action_dim}, got {h5['action'].shape[-1]}.")
-            finite_actions = np.asarray(h5["action"][:], dtype=np.float32)
-            finite_actions = finite_actions[~np.isnan(finite_actions).any(axis=1)]
-            self.action_mean = finite_actions.mean(axis=0, keepdims=True).astype(np.float32)
-            self.action_std = finite_actions.std(axis=0, keepdims=True).astype(np.float32)
-            self.action_std = np.maximum(self.action_std, 1e-6)
+        shard_paths = [Path(p).expanduser().resolve() for p in sorted(glob.glob(dataset_glob))]
+        if not shard_paths:
+            raise FileNotFoundError(f"No shard files matched: {dataset_glob}")
 
-        self.samples: list[tuple[int, int]] = []
+        self.shard_infos: list[dict[str, object]] = []
+        self.skipped_shards: list[dict[str, str]] = []
+        action_sum = np.zeros((1, self.action_dim), dtype=np.float64)
+        action_sq_sum = np.zeros((1, self.action_dim), dtype=np.float64)
+        action_count = 0
+
+        for shard_path in shard_paths:
+            try:
+                with h5py.File(shard_path, "r") as h5:
+                    if self.action_key not in h5:
+                        raise KeyError(f"Action key not found in shard: {self.action_key}")
+                    if int(h5[self.action_key].shape[-1]) != self.action_dim:
+                        raise ValueError(f"Expected action_dim={self.action_dim}, got {h5[self.action_key].shape[-1]}.")
+                    ep_len = np.asarray(h5["ep_len"][:], dtype=np.int64)
+                    ep_offset = np.asarray(h5["ep_offset"][:], dtype=np.int64)
+                    actions = np.asarray(h5[self.action_key][:], dtype=np.float32)
+            except Exception as exc:
+                self.skipped_shards.append({"path": str(shard_path), "error": repr(exc)})
+                continue
+
+            finite_mask = ~np.isnan(actions).any(axis=1)
+            finite_actions = actions[finite_mask]
+            if finite_actions.size == 0:
+                raise ValueError(f"No finite action rows found in shard: {shard_path}")
+            action_sum += finite_actions.sum(axis=0, keepdims=True, dtype=np.float64)
+            action_sq_sum += np.square(finite_actions, dtype=np.float64).sum(axis=0, keepdims=True)
+            action_count += int(finite_actions.shape[0])
+
+            self.shard_infos.append(
+                {
+                    "path": shard_path,
+                    "ep_len": ep_len,
+                    "ep_offset": ep_offset,
+                }
+            )
+
+        if not self.shard_infos:
+            raise ValueError("No readable shards found.")
+
+        action_mean = action_sum / action_count
+        action_var = np.maximum(action_sq_sum / action_count - np.square(action_mean), 0.0)
+        self.action_mean = action_mean.astype(np.float32)
+        self.action_std = np.maximum(np.sqrt(action_var), 1e-6).astype(np.float32)
+
+        self.samples: list[tuple[int, int, int]] = []
         required_last_frame_offset = (self.num_steps - 1) * self.frameskip
         required_action_end_offset = self.action_steps * self.frameskip
         required_offset = max(required_last_frame_offset, required_action_end_offset)
-        for ep_idx, ep_len in enumerate(self.ep_len.tolist()):
-            max_start = ep_len - 1 - required_offset
-            for start in range(max_start + 1):
-                self.samples.append((ep_idx, start))
+        for shard_idx, shard_info in enumerate(self.shard_infos):
+            ep_len = shard_info["ep_len"]
+            for ep_idx, ep_len_i in enumerate(ep_len.tolist()):
+                max_start = ep_len_i - 1 - required_offset
+                for start in range(max_start + 1):
+                    self.samples.append((shard_idx, ep_idx, start))
         if not self.samples:
             raise ValueError("No valid training windows found. Check frameskip/markov_deriv/num_preds.")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _file(self) -> h5py.File:
-        if self._h5 is None:
-            self._h5 = h5py.File(self.dataset_path, "r")
-        return self._h5
+    def _file(self, shard_idx: int) -> h5py.File:
+        h5 = self._h5_files.get(shard_idx)
+        if h5 is None:
+            shard_path = self.shard_infos[shard_idx]["path"]
+            h5 = h5py.File(shard_path, "r")
+            self._h5_files[shard_idx] = h5
+        return h5
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        h5 = self._file()
-        ep_idx, start = self.samples[index]
-        base = int(self.ep_offset[ep_idx]) + start
+        shard_idx, ep_idx, start = self.samples[index]
+        shard_info = self.shard_infos[shard_idx]
+        h5 = self._file(shard_idx)
+        ep_offset = shard_info["ep_offset"]
+        base = int(ep_offset[ep_idx]) + start
 
         frame_offsets = np.arange(self.num_steps, dtype=np.int64) * self.frameskip
         pixel_rows = base + frame_offsets
@@ -175,7 +215,7 @@ class LeWMOGBenchCubeDataset(Dataset):
         pixels = torch.from_numpy(pixels_np).permute(0, 3, 1, 2).contiguous()
         if self.markov_deriv > 0:
             prev_offsets = np.arange(self.markov_deriv, 0, -1, dtype=np.int64) * self.frameskip
-            prev_rows = int(self.ep_offset[ep_idx]) + np.maximum(start - prev_offsets, 0)
+            prev_rows = int(ep_offset[ep_idx]) + np.maximum(start - prev_offsets, 0)
             prev_pixels_np = np.stack([np.asarray(h5["pixels"][int(row)], dtype=np.uint8) for row in prev_rows], axis=0)
             prev_pixels = torch.from_numpy(prev_pixels_np).permute(0, 3, 1, 2).contiguous()
         else:
@@ -185,7 +225,7 @@ class LeWMOGBenchCubeDataset(Dataset):
         for step in range(self.action_steps):
             action_start = base + step * self.frameskip
             action_stop = action_start + self.frameskip
-            block = np.asarray(h5["action"][action_start:action_stop], dtype=np.float32)
+            block = np.asarray(h5[self.action_key][action_start:action_stop], dtype=np.float32)
             block = (np.nan_to_num(block, nan=0.0) - self.action_mean) / self.action_std
             action_blocks.append(torch.from_numpy(block.reshape(-1)))
 
@@ -197,17 +237,17 @@ class LeWMOGBenchCubeDataset(Dataset):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_h5"] = None
+        state["_h5_files"] = {}
         return state
 
     def __del__(self) -> None:
-        h5 = getattr(self, "_h5", None)
-        if h5 is not None:
+        h5_files = getattr(self, "_h5_files", {})
+        for h5 in h5_files.values():
             try:
                 h5.close()
             except Exception:
                 pass
-            self._h5 = None
+        self._h5_files = {}
 
 
 class ModelObjectCallback(Callback):
@@ -225,31 +265,6 @@ class ModelObjectCallback(Callback):
             return
         self.dirpath.mkdir(parents=True, exist_ok=True)
         torch.save(pl_module.model, self.dirpath / f"{self.filename}_epoch_{epoch}_object.ckpt")
-
-
-class FreezeModuleCallback(Callback):
-    def __init__(self, module_name: str, freeze_epochs: int) -> None:
-        super().__init__()
-        self.module_name = module_name
-        self.freeze_epochs = int(freeze_epochs)
-        self._module_frozen = False
-
-    def _set_module_requires_grad(self, pl_module: pl.LightningModule, enabled: bool) -> None:
-        module = getattr(pl_module.model, self.module_name, None)
-        if module is None:
-            raise AttributeError(f"Expected model.{self.module_name} to exist for finetuning.")
-        module.requires_grad_(enabled)
-
-    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        if self.freeze_epochs <= 0:
-            return
-        self._set_module_requires_grad(pl_module, enabled=False)
-        self._module_frozen = True
-
-    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        if self._module_frozen and trainer.current_epoch >= self.freeze_epochs:
-            self._set_module_requires_grad(pl_module, enabled=True)
-            self._module_frozen = False
 
 
 def temporal_straightening_loss(emb: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -424,25 +439,15 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
     return max(candidates, key=lambda item: item[0])[1]
 
 
-def resolve_init_checkpoint(args: argparse.Namespace) -> Path:
+def resolve_init_checkpoint(args: argparse.Namespace) -> Path | None:
     if args.init_checkpoint is not None:
         checkpoint_path = args.init_checkpoint.expanduser().resolve()
-    else:
+    elif args.init_run_dir is not None:
         checkpoint_path = latest_object_checkpoint(args.init_run_dir.expanduser().resolve()).resolve()
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Init checkpoint not found: {checkpoint_path}")
-    return checkpoint_path
-
-
-def resolve_resume_checkpoint(args: argparse.Namespace, run_dir: Path) -> Path | None:
-    if args.resume_checkpoint is not None:
-        checkpoint_path = args.resume_checkpoint.expanduser().resolve()
     else:
-        checkpoint_path = None
-    if checkpoint_path is None:
         return None
     if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+        raise FileNotFoundError(f"Init checkpoint not found: {checkpoint_path}")
     return checkpoint_path
 
 
@@ -464,30 +469,26 @@ def main() -> None:
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
 
-    dataset_path = args.dataset_path.expanduser().resolve()
     run_dir = args.run_dir.expanduser().resolve()
-    resume_checkpoint_path = resolve_resume_checkpoint(args, run_dir)
-    init_checkpoint_path = None if resume_checkpoint_path is not None else resolve_init_checkpoint(args)
+    ckpt_path = run_dir / "last.ckpt"
+    init_checkpoint_path = None if args.resume else resolve_init_checkpoint(args)
+    if args.resume:
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"--resume was set but checkpoint not found: {ckpt_path}")
+    elif run_dir.exists():
+        raise FileExistsError(f"Run dir already exists. Pass --resume to continue training: {run_dir}")
 
-    if not dataset_path.is_file():
-        raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
-    if run_dir.exists() and resume_checkpoint_path is None:
-        raise FileExistsError(f"Run dir already exists: {run_dir}")
-    if not run_dir.exists() and resume_checkpoint_path is not None:
-        raise FileNotFoundError(f"Run dir does not exist for resume: {run_dir}")
-
-    spt.set(cache_dir=str(run_dir))
-
-    dataset = LeWMOGBenchCubeDataset(
-        dataset_path,
+    dataset = LeWMRopeRealDataset(
+        args.dataset_glob,
         markov_deriv=args.markov_deriv,
         num_preds=args.num_preds,
         frameskip=args.frameskip,
         img_size=args.img_size,
         action_dim=args.action_dim,
+        action_key=args.action_key,
     )
-    if len(dataset) < 2:
-        raise ValueError(f"Need at least 2 valid training windows for train/val splitting, got {len(dataset)}.")
+    if len(dataset) < 1:
+        raise ValueError("Need at least 1 valid training window.")
     train_len = int(len(dataset) * args.train_split)
     val_len = len(dataset) - train_len
     if train_len < 1:
@@ -516,9 +517,11 @@ def main() -> None:
     )
 
     world_model = build_model(args)
-    if resume_checkpoint_path is None:
+    if init_checkpoint_path is not None:
         pretrained_model = load_pretrained_model(init_checkpoint_path)
         pretrained_encoder = getattr(pretrained_model, "encoder", None)
+        if pretrained_encoder is None:
+            raise AttributeError("Source checkpoint does not contain model.encoder.")
         try:
             world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
         except RuntimeError as exc:
@@ -553,37 +556,48 @@ def main() -> None:
         hparams=sanitize_hparams(args),
     )
 
-    if resume_checkpoint_path is None:
+    spt.set(cache_dir=str(run_dir))
+    if args.resume:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
         run_dir.mkdir(parents=True, exist_ok=False)
-        config = vars(args).copy()
-        config["init_checkpoint"] = str(init_checkpoint_path)
-        config["run_dir"] = str(run_dir)
-        with (run_dir / "config.json").open("w") as f:
-            json.dump(config, f, indent=2, default=str)
+
+    config = vars(args).copy()
+    config["run_dir"] = str(run_dir)
+    config["dataset_glob"] = args.dataset_glob
+    config["resume_checkpoint"] = str(ckpt_path) if args.resume else None
+    config["init_checkpoint"] = str(init_checkpoint_path) if init_checkpoint_path is not None else None
+    config["readable_shards"] = [str(info["path"]) for info in dataset.shard_infos]
+    config["skipped_shards"] = dataset.skipped_shards
+    with (run_dir / "config.json").open("w") as f:
+        json.dump(config, f, indent=2, default=str)
+
+    if init_checkpoint_path is not None:
+        loaded_modules = ["encoder"]
+        if args.load_projector:
+            loaded_modules.append("projector")
+        if args.load_mlpdyn:
+            loaded_modules.append("predictor")
+
+        reinitialized_modules = ["action_encoder", "pred_proj"]
+        if not args.load_projector:
+            reinitialized_modules.insert(0, "projector")
+        if not args.load_mlpdyn:
+            reinitialized_modules.insert(1 if not args.load_projector else 0, "predictor")
 
         init_report = {
             "init_checkpoint": str(init_checkpoint_path),
-            "loaded_modules": ["encoder"],
-            "reinitialized_modules": ["projector", "predictor", "action_encoder", "pred_proj"],
-            "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
-            "freeze_projector_epochs": int(args.freeze_projector_epochs),
+            "loaded_modules": loaded_modules,
+            "reinitialized_modules": reinitialized_modules,
+            "load_projector": bool(args.load_projector),
+            "load_mlpdyn": bool(args.load_mlpdyn),
+            "action_key": str(args.action_key),
+            "action_dim": int(args.action_dim),
         }
         with (run_dir / "init_report.json").open("w") as f:
             json.dump(init_report, f, indent=2)
-    else:
-        resume_report = {
-            "resume_checkpoint": str(resume_checkpoint_path),
-            "run_dir": str(run_dir),
-            "sigreg_weight": float(args.sigreg_weight),
-            "freeze_encoder_epochs": int(args.freeze_encoder_epochs),
-            "freeze_projector_epochs": int(args.freeze_projector_epochs),
-        }
-        with (run_dir / "resume_report.json").open("w") as f:
-            json.dump(resume_report, f, indent=2)
 
     callbacks: list[Callback] = [
-        FreezeModuleCallback("encoder", args.freeze_encoder_epochs),
-        FreezeModuleCallback("projector", args.freeze_projector_epochs),
         ModelCheckpoint(
             dirpath=run_dir,
             filename=f"{args.output_model_name}" + "_{epoch:03d}",
@@ -608,7 +622,7 @@ def main() -> None:
     data_module = spt.data.DataModule(train=train_loader, val=val_loader)
     if hasattr(torch.serialization, "add_safe_globals"):
         torch.serialization.add_safe_globals([PosixPath])
-    trainer.fit(module, datamodule=data_module, ckpt_path=str(resume_checkpoint_path) if resume_checkpoint_path else None)
+    trainer.fit(module, datamodule=data_module, ckpt_path=str(ckpt_path) if args.resume else None)
 
 
 if __name__ == "__main__":
