@@ -3,12 +3,16 @@
 
 import argparse
 import json
+import os
 import torch
 import h5py
 import re
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/latent_brs_matplotlib")
+Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
 # Imports from your rope training framework as seen in mlpdyn_eval.py
 from rope.train.mlpdyn_train import (
@@ -18,8 +22,9 @@ from rope.train.mlpdyn_train import (
     required_markov_history,
 )
 
-DEFAULT_DATASET_PATH = "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
-DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
+# DEFAULT_DATASET_PATH = "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
+DEFAULT_DATASET_PATH = "rope/data/test_data_noshadow_noisy_onestep.h5"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft_3"
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
@@ -134,7 +139,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
-    parser.add_argument("--out-file", type=Path, default="rope/eval/rope_one_step_error_data.pt")
+    parser.add_argument("--out-file", type=Path, default="rope/eval/rope_one_step_error_data_new_model_augment.pt")
     parser.add_argument("--frame-batch-size", type=int, default=32)
     
     # Command line overrides mimicking the config fields
@@ -148,7 +153,7 @@ def main():
     with open(args.model_dir / "config.json") as f:
         config = json.load(f)
     
-    for k in ["markov_deriv", "num_preds", "frameskip", "img_size", "action_dim"]:
+    for k in ["markov_deriv", "frameskip", "img_size", "action_dim"]:
         val = config.get(k)
         if val is not None:
             setattr(args, k, val)
@@ -168,6 +173,14 @@ def main():
     num_steps = 1 + int(args.num_preds)
     required_offset = max((num_steps - 1) * int(args.frameskip), int(args.num_preds) * int(args.frameskip))
     valid_indices = np.flatnonzero(ep_len - 1 - required_offset >= 0)
+    if valid_indices.size == 0:
+        raise ValueError(
+            "No valid one-step windows found. "
+            f"min_ep_len={int(np.min(ep_len)) if ep_len.size else 'n/a'}, "
+            f"max_ep_len={int(np.max(ep_len)) if ep_len.size else 'n/a'}, "
+            f"num_preds={args.num_preds}, frameskip={args.frameskip}, required_offset={required_offset}. "
+            "For a noisy one-step file with two-frame episodes, use --num-preds=1."
+        )
 
     all_x, all_a, all_e = [], [], []
     for idx in tqdm(valid_indices, desc="Generating Errors"):
@@ -177,6 +190,12 @@ def main():
             all_x.append(data["x_t"])
             all_a.append(data["a_t"])
             all_e.append(data["error"])
+
+    if not all_x:
+        raise ValueError(
+            "No prediction errors were generated after processing valid episodes. "
+            "Check that each episode has at least two frames after frameskip and that action dimensions match the model."
+        )
 
     torch.save({"x_t": torch.cat(all_x), "a_t": torch.cat(all_a), "error": torch.cat(all_e)}, args.out_file)
     print(f"Saved {len(torch.cat(all_x))} transitions to {args.out_file}")

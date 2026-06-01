@@ -1,0 +1,40 @@
+q_learned: 0.0
+model_dir: reacher/models/mlpdyn_ft_6
+use_constant_covariance: true
+constant_covariance_path: reacher/eval/fixed_error_covariance.pt
+dataset_path: reacher/data/test_data_50hz/reacher_test.h5
+action_stats_dataset_path: reacher/data/expert_data_50hz/reacher_expert.h5
+out_dir: reacher/plan/sls_mpc_conformal
+device: auto
+episode_idx: null
+seed: 42
+horizon: 20
+max_mpc_steps: 100
+video_fps: 60
+swap_start_goal: true
+# start_qpos: null
+# goal_qpos: null
+# start_qpos: [0.146451935172081, -0.7491843104362488]
+# goal_qpos: [2.4196903705596924, -0.9535070657730103]
+start_qpos: [0.1, -2.0]
+goal_qpos: [2.42, -0.95]
+goal_threshold: 0.05
+latent_goal_threshold: 0.05
+q_stage: 0.005
+q_terminal: 5.0
+q_stage_delta: 1.0
+q_terminal_delta: 1.0
+r_control: 0.01
+r_control_per_action: null
+# r_control_per_action: [0.01, 0.01]
+u_abs_limit: 2.0
+state_abs_limit: 5.0
+state_delta_abs_limit: 1.0
+enable_obstacle: True
+obstacle_model_path: reacher/models/obs_net/a02f223bea04fa5a/model.pt
+obstacle_margin: 0.0
+obstacle_penalty_weight: 1000.0
+use_latent_ellipsoid_constraint: false
+latent_ellipsoid_path: reacher/eval/latent_ellipsoid/latent_ellipsoid.pt
+latent_ellipsoid_margin: 0.0
+mppi_r_control_per_action: null

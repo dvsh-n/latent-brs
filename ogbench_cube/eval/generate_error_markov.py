@@ -21,7 +21,6 @@ from ogbench.manipspace import lie
 
 # Keep only external imports for OGBench
 from ogbench_cube.train.mlpdyn_train import (
-    LeWMOGBenchCubeDataset,
     build_markov_state,
     preprocess_pixels,
     required_markov_history,
@@ -29,7 +28,20 @@ from ogbench_cube.train.mlpdyn_train import (
 
 # --- Re-defined Constants from mlpdyn_eval to break circular import ---
 DEFAULT_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
+DEFAULT_EXPERT_DATASET_PATH = "ogbench_cube/data/expert_data/ogbench_cube_expert.h5"
 DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8"
+
+
+def load_action_normalization_stats(dataset_path: Path, action_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    with h5py.File(dataset_path, "r") as h5:
+        if int(h5["action"].shape[-1]) != action_dim:
+            raise ValueError(f"Expected action_dim={action_dim}, got {h5['action'].shape[-1]}.")
+        finite_actions = np.asarray(h5["action"][:], dtype=np.float32)
+        finite_actions = finite_actions[~np.isnan(finite_actions).any(axis=1)]
+        action_mean = finite_actions.mean(axis=0, keepdims=True).astype(np.float32)
+        action_std = finite_actions.std(axis=0, keepdims=True).astype(np.float32)
+        action_std = np.maximum(action_std, 1e-6)
+    return action_mean, action_std
 
 def hide_target_cube(env: gymnasium.Env) -> None:
     for geom_ids in env.unwrapped._cube_target_geom_ids_list:
@@ -85,7 +97,7 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
         raise FileNotFoundError(f"No checkpoints found in {model_dir}")
     return max(candidates, key=lambda item: item[0])[1]
 
-def load_episode_standalone(dataset_path, episode_idx, args, dataset, env, camera):
+def load_episode_standalone(dataset_path, episode_idx, args, action_mean, action_std, env, camera):
     with h5py.File(dataset_path, "r") as h5:
         ep_len = int(h5["ep_len"][episode_idx])
         ep_offset = int(h5["ep_offset"][episode_idx])
@@ -104,7 +116,7 @@ def load_episode_standalone(dataset_path, episode_idx, args, dataset, env, camer
         pixels = preprocess_pixels(pixels.unsqueeze(0), args.img_size)[0]
 
         actions = np.asarray(h5["action"][rows], dtype=np.float32)
-        actions = (np.nan_to_num(actions, nan=0.0) - dataset.action_mean) / dataset.action_std
+        actions = (np.nan_to_num(actions, nan=0.0) - action_mean) / action_std
         actions = torch.from_numpy(actions).float()
         
     return pixels, actions
@@ -164,6 +176,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
+    parser.add_argument("--expert-dataset-path", type=Path, default=DEFAULT_EXPERT_DATASET_PATH)
     parser.add_argument("--out-file", type=Path, default="ogbench_cube/eval/ogbench_one_step_error_data_embed_8.pt")
     parser.add_argument("--frame-batch-size", type=int, default=128)
     args = parser.parse_args()
@@ -203,20 +216,21 @@ def main():
     history_len = required_markov_history(args.markov_deriv)
     valid_indices = np.flatnonzero(ep_len - 1 - (history_len - 1 + args.num_preds) * args.frameskip >= 0)
 
-    dataset = LeWMOGBenchCubeDataset(
-        str(args.dataset_path),
-        markov_deriv=args.markov_deriv,
-        num_preds=args.num_preds,
-        frameskip=args.frameskip,
-        img_size=args.img_size,
-        action_dim=args.action_dim,
-    )
+    action_mean, action_std = load_action_normalization_stats(args.expert_dataset_path, args.action_dim)
     env = gymnasium.make(env_name, terminate_at_goal=False, mode="data_collection", width=width, height=height)
 
     all_x, all_a, all_e = [], [], []
     try:
         for idx in tqdm(valid_indices, desc="Generating Errors"):
-            px, act = load_episode_standalone(args.dataset_path, idx, args, dataset, env, camera)
+            px, act = load_episode_standalone(
+                args.dataset_path,
+                idx,
+                args,
+                action_mean,
+                action_std,
+                env,
+                camera,
+            )
             data = extract_errors(model, px, act, args, device)
             if data is not None:
                 all_x.append(data["x_t"])

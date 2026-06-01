@@ -1,0 +1,58 @@
+# sls_mppi_config.yaml
+q_learned: 4.59367561340332 # Update this with the value from conformal_config.json
+model_dir: "ogbench_cube/models/mlpdyn_embd_12_strtn"
+# model_dir: "ogbench_cube/models/mlpdyn_embd_8"
+# error_model_ckpt: "ogbench_cube/models/err_pred_logs/cube_experiment_embed_8/version_5/checkpoints/best-error-model-epoch=6344.ckpt"
+use_constant_covariance: True
+constant_covariance_path: "ogbench_cube/eval/fixed_error_covariance_12_strtn.pt"
+state_region_path: "ogbench_cube/eval/latent_ellipsoid"
+enable_obstacle: True
+# obstacle_model_path: "ogbench_cube/models/og_obstacle/obs_net/610a61f1df1307fa/model.pt"
+# obstacle_model_path: "ogbench_cube/models/obs_net/610a61f1df1307fa/model.pt"
+# obstacle_model_path: "ogbench_cube/models/obs_net_small/7b9441ea22420e3b/model.pt"
+# obstacle_model_path: "ogbench_cube/models/obs_net_embd12_strtn/40bdfaee0cec3f64/model.pt"
+# obstacle_model_path: "ogbench_cube/models/obs_net_small/7b9441ea22420e3b/model.pt"
+# obstacle_model_path: "ogbench_cube/models/obs_net_embd_8_back/be6d7840183a2948/model.pt"
+# obstacle_model_path: "ogbench_cube/models/obs_front_8/8e6abf01d565ab33/model.pt"
+obstacle_model_path: "ogbench_cube/models/obs_front_12_strtn/c25ce90b4621a243/model.pt"
+obstacle_margin: 0.0
+mppi_obstacle_margin: 0.0
+obstacle_penalty_weight: 100.0
+# dataset_path: "ogbench_cube/plan/start_goal_speed_bump.pt"
+# dataset_path: "ogbench_cube/plan/start_goal_speed_bump_new.pt"
+dataset_path: "ogbench_cube/plan/start_goal.pt"
+action_stats_dataset_path: "ogbench_cube/data/expert_data/ogbench_cube_expert.h5"
+out_dir: "ogbench_cube/plan/sls_mppi_conformal_fixed_grasp"
+device: "auto"
+horizon: 5
+mppi_horizon: 200
+max_mpc_steps: 800
+max_oracle_steps: 80
+video_fps: 20
+episode_idx: 0
+seed: 42
+visualize_success_colors: false
+terminate_on_ogbench_success: true
+fixed_grasp_raw_u4: null
+fixed_grasp_normalized_u4: null
+mppi_samples: 512
+mppi_update_iter: 5
+mppi_reward_weight: 30.0
+mppi_noise_level: 0.20
+mppi_beta_filter: 0.6
+mppi_q_stage: 0.500
+mppi_q_stage_pos: 15.00
+mppi_q_stage_vel: 0.100
+mppi_q_terminal: 100.0
+mppi_state_region_penalty: 10.0
+mppi_r_control: 0.1
+mppi_r_control_u4: 0.1
+mppi_goal_epsilon: 2.0
+mppi_recede_min_horizon: 1
+bootstrap_mppi_steps: 5
+q_stage: 0.02
+q_stage_pos: 0.02
+q_stage_vel: 1.0
+q_terminal: 1.0
+r_control: 10.0
+r_control_u4: 10.0

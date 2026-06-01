@@ -3,19 +3,32 @@
 
 import argparse
 import json
+import os
+import tempfile
 import torch
 import h5py
 import re
 import numpy as np
 from pathlib import Path
+import sys
 from tqdm import tqdm
+
+if "MPLCONFIGDIR" not in os.environ or not os.access(os.environ["MPLCONFIGDIR"], os.W_OK):
+    mpl_config_dir = Path(tempfile.gettempdir()) / f"matplotlib-{os.getuid()}"
+    mpl_config_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(mpl_config_dir)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Keep only external imports
 from reacher.train.mlpdyn_train import LeWMReacherDataset
 
 # --- Re-defined Constants from mlpdyn_eval to break circular import ---
-DEFAULT_DATASET_PATH = "reacher/data/test_data_50hz_random/reacher_test.h5"
-DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_8_epoch3"
+DEFAULT_DATASET_PATH = "reacher/data/test_data_50hz/reacher_test.h5"
+DEFAULT_ACTION_STATS_DATASET_PATH = "reacher/data/expert_data_50hz/reacher_expert.h5"
+DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_ft_5"
 
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
@@ -28,16 +41,19 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
         raise FileNotFoundError(f"No checkpoints found in {model_dir}")
     return max(candidates, key=lambda item: item[0])[1]
 
-def load_episode_standalone(dataset_path, episode_idx, args):
+def load_action_normalization_stats(dataset_path: Path, action_dim: int) -> tuple[np.ndarray, np.ndarray]:
     dataset = LeWMReacherDataset(
         dataset_path,
-        history_size=args.history_size,
-        num_preds=args.num_preds,
-        frameskip=args.frameskip,
-        img_size=args.img_size,
-        action_dim=args.action_dim,
+        history_size=1,
+        num_preds=1,
+        frameskip=1,
+        img_size=224,
+        action_dim=action_dim,
     )
+    return dataset.action_mean.astype(np.float32), dataset.action_std.astype(np.float32)
 
+
+def load_episode_standalone(dataset_path, episode_idx, args, action_mean, action_std):
     with h5py.File(dataset_path, "r") as h5:
         ep_len = int(h5["ep_len"][episode_idx])
         ep_offset = int(h5["ep_offset"][episode_idx])
@@ -56,9 +72,7 @@ def load_episode_standalone(dataset_path, episode_idx, args):
         pixels = (pixels - p_mean) / p_std
 
         actions = np.asarray(h5["action"][rows], dtype=np.float32)
-        a_mean = getattr(dataset, "action_mean", 0.0)
-        a_std = getattr(dataset, "action_std", 1.0)
-        actions = (np.nan_to_num(actions, nan=0.0) - a_mean) / a_std
+        actions = (np.nan_to_num(actions, nan=0.0) - action_mean) / action_std
         
     return pixels, torch.from_numpy(actions).float()
 
@@ -107,7 +121,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
-    parser.add_argument("--out-file", type=Path, default="lewm_one_step_error_data_rand_8-3.pt")
+    parser.add_argument("--action-stats-dataset-path", type=Path, default=DEFAULT_ACTION_STATS_DATASET_PATH)
+    parser.add_argument("--out-file", type=Path, default="reacher/eval/reacher_one_step_error_data_9.pt")
     parser.add_argument("--frame-batch-size", type=int, default=128)
     
     # Add these as command-line arguments so they have safe defaults
@@ -135,6 +150,7 @@ def main():
         device = torch.device("cpu")
 
     model = torch.load(latest_object_checkpoint(args.model_dir), map_location=device, weights_only=False).eval()
+    action_mean, action_std = load_action_normalization_stats(args.action_stats_dataset_path, args.action_dim)
     
     with h5py.File(args.dataset_path, "r") as h5:
         ep_len = h5["ep_len"][:]
@@ -143,7 +159,7 @@ def main():
 
     all_x, all_a, all_e = [], [], []
     for idx in tqdm(valid_indices, desc="Generating Errors"):
-        px, act = load_episode_standalone(args.dataset_path, idx, args)
+        px, act = load_episode_standalone(args.dataset_path, idx, args, action_mean, action_std)
         data = extract_errors(model, px, act, args, device)
         all_x.append(data["x_t"]); all_a.append(data["a_t"]); all_e.append(data["error"])
 

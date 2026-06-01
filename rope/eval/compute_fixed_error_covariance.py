@@ -11,8 +11,8 @@ import numpy as np
 import torch
 
 
-DEFAULT_DATA_PATH = "rope/eval/rope_one_step_error_data.pt"
-DEFAULT_OUT_FILE = "rope/eval/fixed_error_covariance.pt"
+DEFAULT_DATA_PATH = "rope/eval/rope_one_step_error_data_new_model.pt"
+DEFAULT_OUT_FILE = "rope/eval/fixed_error_covariance_new_model.pt"
 
 
 def parse_args() -> argparse.Namespace:

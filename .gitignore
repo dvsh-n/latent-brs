@@ -22,6 +22,7 @@ reacher/models/lewm_reacher*/
 *.log
 **/runs/
 **/__pycache__/
+**/.mplconfig/
 reacher/models/sam3
 anutam_stuff/error_model/error_model.egg-info
 anutam_stuff/error_model/lightning_logs
@@ -30,3 +31,4 @@ reacher/plan/sls_mpc_cross_latent
 reacher/data/test_data_50hz
 rope/plan/sls_mpc_conformal
 ogbench_cube/plan/sls_mpc_conformal
+sweeps*

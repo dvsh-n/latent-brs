@@ -1,0 +1,27 @@
+# sls obstacle config
+q_learned: 0.5
+model_dir: "rope/models/mlpdyn_noshadow"
+# error_model_ckpt: "rope/models/err_pred_logs/rope_experiment/version_7/checkpoints/best-error-model-epoch=3781.ckpt"
+use_constant_covariance: True
+constant_covariance_path: "rope/eval/fixed_error_covariance_large.pt"
+
+enable_obstacle: False
+# obstacle_model_path: "rope/models/obs_net_2/9b0213b85f74fd56/model.pt"
+obstacle_model_path: "rope/models/obs_net_tanh/9b0213b85f74fd56/model.pt"
+obstacle_margin: 0.0
+obstacle_penalty_weight: 0.0
+
+dataset_path: "rope/data/obstacle_crossing/rope_obstacle_crossing.h5"
+# dataset_path: "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
+action_stats_dataset_path: "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
+out_dir: "rope/plan/sls_mpc_conformal_obs"
+device: "auto"
+horizon: 15
+max_mpc_steps: 100
+video_fps: 50
+episode_idx: 3
+seed: 42
+
+q_stage: 0.005
+q_terminal: 15.0
+r_control: 0.01

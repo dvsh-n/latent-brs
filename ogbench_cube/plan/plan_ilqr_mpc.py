@@ -28,9 +28,11 @@ from ogbench_cube.data.ogbench_cube_data_gen import LocalCubePlanOracle
 from ogbench_cube.train.mlpdyn_train import LeWMOGBenchCubeDataset, build_markov_state, required_markov_history
 
 DEFAULT_TEST_DATASET_PATH = "ogbench_cube/data/test_data/ogbench_cube_test.h5"
-DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8"
+DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_12_strtn"
 DEFAULT_OUT_DIR = "ogbench_cube/plan/ilqr_mpc_mlpdyn"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# 1378, 1387
 DEVICE = "auto"
 HORIZON = 15
 MAX_MPC_STEPS = 120
@@ -38,7 +40,7 @@ Q_TERMINAL = 5.0
 Q_STAGE = 0.005
 R_CONTROL = 0.1
 VIDEO_FPS = 20
-EPISODE_IDX = 396
+EPISODE_IDX = 1443
 MAX_ORACLE_STEPS = 80
 ORACLE_SEGMENT_DT = 0.4
 ORACLE_NOISE = 0.0
@@ -94,6 +96,33 @@ def load_config(model_dir: Path) -> dict[str, object]:
         raise FileNotFoundError(f"Model config not found: {config_path}")
     with config_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def resolve_dataset_path(path_like: str | Path, *, fallback: str | Path | None = None) -> Path:
+    raw = Path(path_like).expanduser()
+    candidates = [raw if raw.is_absolute() else (REPO_ROOT / raw)]
+
+    raw_str = str(path_like)
+    legacy_prefix = "ogbench/data/"
+    if legacy_prefix in raw_str:
+        rewritten = raw_str.replace(legacy_prefix, "ogbench_cube/data/")
+        rewritten_path = Path(rewritten).expanduser()
+        candidates.append(rewritten_path if rewritten_path.is_absolute() else (REPO_ROOT / rewritten_path))
+
+    if fallback is not None:
+        fallback_path = Path(fallback).expanduser()
+        candidates.append(fallback_path if fallback_path.is_absolute() else (REPO_ROOT / fallback_path))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+
+    return candidates[0].resolve()
 
 
 def require_device(device_arg: str) -> torch.device:
@@ -541,7 +570,7 @@ def main() -> None:
     args = parse_args()
     device = require_device(args.device)
     model_dir = args.model_dir.expanduser().resolve()
-    dataset_path = args.dataset_path.expanduser().resolve()
+    dataset_path = resolve_dataset_path(args.dataset_path, fallback=DEFAULT_TEST_DATASET_PATH)
     out_root = args.out_dir.expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -562,7 +591,10 @@ def main() -> None:
     embed_dim = int(config.get("embed_dim", 24))
     markov_state_dim = int(config.get("markov_state_dim", (markov_deriv + 1) * embed_dim))
 
-    train_dataset_path = Path(str(config.get("dataset_path", dataset_path))).expanduser().resolve()
+    train_dataset_path = resolve_dataset_path(
+        str(config.get("dataset_path", dataset_path)),
+        fallback="ogbench_cube/data/expert_data/ogbench_cube_expert.h5",
+    )
     train_stats_dataset = LeWMOGBenchCubeDataset(
         train_dataset_path,
         markov_deriv=markov_deriv,

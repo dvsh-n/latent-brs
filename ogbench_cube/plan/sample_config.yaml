@@ -1,14 +1,33 @@
 # sls_config.yaml
 q_learned: 4.59367561340332 # Update this with the value from conformal_config.json
-model_dir: "ogbench_cube/models/mlpdyn_embd_8"
-error_model_ckpt: "ogbench_cube/models/err_pred_logs/cube_experiment_embed_8/version_5/checkpoints/best-error-model-epoch=6344.ckpt"
-dataset_path: "ogbench_cube/data/test_data/ogbench_cube_test.h5"
+model_dir: "ogbench_cube/models/mlpdyn_embd_12_strtn"
+# error_model_ckpt: "ogbench_cube/models/err_pred_logs/cube_experiment_embed_8/version_5/checkpoints/best-error-model-epoch=6344.ckpt"
+use_constant_covariance: True
+constant_covariance_path: "ogbench_cube/eval/fixed_error_covariance_12_strtn.pt"
+enable_obstacle: false
+# obstacle_model_path: "ogbench_cube/models/og_obstacle/obs_net/610a61f1df1307fa/model.pt"
+# obstacle_model_path: "ogbench_cube/models/obs_net/610a61f1df1307fa/model.pt"
+# obstacle_model_path: "ogbench_cube/models/obs_net_small/7b9441ea22420e3b/model.pt"
+obstacle_model_path: "ogbench_cube/models/obs_net_embd12_strtn/40bdfaee0cec3f64/model.pt"
+obstacle_margin: 0.0
+obstacle_penalty_weight: 50.0
+# dataset_path: "ogbench_cube/plan/start_goal_speed_bump.pt"
+# dataset_path: "ogbench_cube/plan/start_goal_speed_bump_new.pt"
+dataset_path: "ogbench_cube/plan/start_goal_3d_ellipsoid.pt"
+action_stats_dataset_path: "ogbench_cube/data/expert_data/ogbench_cube_expert.h5"
 out_dir: "ogbench_cube/plan/sls_mpc_conformal"
 device: "auto"
 horizon: 10
-max_mpc_steps: 200
+max_mpc_steps: 100
+max_oracle_steps: 80
 video_fps: 20
-episode_idx: 1498 # 6588  # 6560 6534 6588# Use a number (e.g. 5) or null for random
+episode_idx: 0
 seed: 42
 visualize_success_colors: false
 terminate_on_ogbench_success: true
+debug_solver: false
+max_normalized_action: 5.0
+q_stage: 0.02
+q_terminal: 5.0
+r_control: 0.1
+r_control_u4: 0.1

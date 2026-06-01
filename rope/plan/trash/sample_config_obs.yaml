@@ -1,0 +1,34 @@
+# models 
+# model_dir: "rope/models/mlpdyn_noshadow_ft"
+# error_model_ckpt: "rope/models/err_pred_logs/rope_experiment/version_7/checkpoints/best-error-model-epoch=3781.ckpt"
+# obstacle_model_path: "rope/models/sm_obs_net/9b0213b85f74fd56/model.pt"
+# constant_covariance_path: "rope/eval/fixed_error_covariance.pt"
+
+model_dir: "rope/models/mlpdyn_noshadow_ft_3"
+obstacle_model_path: "rope/models/obs_net_sm_model/a8c9d715613d8f57/model.pt"
+constant_covariance_path: "rope/eval/fixed_error_covariance_new_model.pt"
+
+
+# sls obstacle config
+q_learned: 0.5
+use_constant_covariance: True
+
+enable_obstacle: True
+# obstacle_model_path: "rope/models/obs_net_2/9b0213b85f74fd56/model.pt"
+obstacle_margin: 0.0
+obstacle_penalty_weight: 0.00
+
+dataset_path: "rope/plan/new_random_endpoint_pairs.pt"
+# dataset_path: "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
+action_stats_dataset_path: "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
+out_dir: "rope/plan/sls_mpc_conformal_obs"
+device: "auto"
+horizon: 10
+max_mpc_steps: 100
+video_fps: 30
+episode_idx: 3
+seed: 42
+
+q_stage: 0.005
+q_terminal: 40.0
+r_control: 1.0

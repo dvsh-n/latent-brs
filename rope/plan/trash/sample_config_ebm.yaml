@@ -1,0 +1,17 @@
+# Rope MPPI + SLS planner using an EBM domain constraint.
+q_learned: 0.5
+model_dir: "rope/models/mlpdyn_noshadow_ft"
+error_model_ckpt: "rope/models/err_pred_logs/rope_experiment/version_7/checkpoints/best-error-model-epoch=3781.ckpt"
+use_constant_covariance: True
+constant_covariance_path: "rope/eval/fixed_error_covariance.pt"
+ebm_artifact_path: "rope/models/latent_ebm/model.pt"
+ebm_penalty_weight: 1000.0
+ebm_threshold_scale: 1.0
+dataset_path: "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
+out_dir: "rope/plan/sls_mppi_conformal_ebm"
+device: "auto"
+horizon: 10
+max_mpc_steps: 400
+video_fps: 50
+episode_idx: 999
+seed: 42

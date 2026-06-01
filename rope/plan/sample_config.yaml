@@ -10,8 +10,20 @@ dataset_path: "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
 out_dir: "rope/plan/sls_mpc_conformal"
 device: "auto"
 horizon: 10
+mppi_horizon: 15
 max_mpc_steps: 400
 video_fps: 50
 episode_idx: 999 # 6588  # 6560 6534 6588# Use a number (e.g. 5) or null for random
 seed: 42
-mppi_state_box_penalty: 250.0
+q_stage: 0.005
+q_terminal: 5.0
+r_control: 0.01
+# use_latent_ellipsoid_constraint: True
+# latent_ellipsoid_path: "rope/eval/latent_ellipsoid_noshadow/latent_ellipsoid.pt"
+# latent_ellipsoid_margin: 0.0
+# mppi_stage_weight: 10.0
+# mppi_terminal_weight: 500.0
+# mppi_state_box_penalty: 250.0
+mppi_stage_weight: 0.005
+mppi_terminal_weight: 10.0
+mppi_state_box_penalty: 0.0

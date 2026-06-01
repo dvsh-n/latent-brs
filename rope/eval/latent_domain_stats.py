@@ -27,8 +27,8 @@ from rope.train.mlpdyn_train import build_markov_state, preprocess_pixels, requi
 
 
 DEFAULT_DATASET_PATH = "rope/data/test_data_noshadow/rope_random_cubic_spline.h5"
-DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow_ft"
-DEFAULT_OUT_DIR = "rope/eval/latent_domain_stats"
+DEFAULT_MODEL_DIR = "rope/models/mlpdyn_noshadow"
+DEFAULT_OUT_DIR = "rope/eval/latent_domain_stats_large"
 
 
 @dataclass
