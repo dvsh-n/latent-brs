@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
-DEFAULT_DATASET_PATH = "pusht/data/pusht_lewm_train.h5"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn_lewm_dataset"
+DEFAULT_DATASET_PATH = "pusht/data/pusht_diffusion_train.h5"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_embd_8_md_3"
 FIXED_FRAMESKIP = 1
 
 
@@ -40,8 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=48)
-    parser.add_argument("--markov-deriv", type=int, default=2)
+    parser.add_argument("--embed-dim", type=int, default=8)
+    parser.add_argument("--markov-deriv", type=int, default=3)
     parser.add_argument("--num-preds", type=int, default=4, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
 
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--straighten-weight", type=float, default=1e-3)
 
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=120)
+    parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(

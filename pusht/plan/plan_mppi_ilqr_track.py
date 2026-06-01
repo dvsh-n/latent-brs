@@ -69,10 +69,10 @@ from pusht.plan.plan_ilqr_mpc import (
 )
 from pusht.train.mlpdyn_train import required_markov_history
 
-DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_embd_48"
+DEFAULT_MODEL_DIR = "pusht/models/mlpdyn_embd_8_md_3"
 DEFAULT_OUT_DIR = "pusht/plan/mppi_ilqr_track_mlpdyn"
 DEVICE = "auto"
-MPPI_HORIZON = 45
+MPPI_HORIZON = 250
 ILQR_HORIZON = 15
 MAX_MPC_STEPS = 400
 MPPI_Q_TERMINAL = 10.0
