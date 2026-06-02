@@ -6,6 +6,11 @@ import numpy as np
 
 
 DEFAULT_PUSHT_ENV_ID = "gym_pusht/PushT-v0"
+PUSHT_AGENT_RADIUS = 15.0
+PUSHT_TEE_SCALE = 30.0
+PUSHT_WALL_MIN = 5.0
+PUSHT_WALL_MAX = 506.0
+PUSHT_WALL_RADIUS = 2.0
 
 
 def _import_gymnasium():
@@ -161,6 +166,71 @@ def reset_pusht_env_to_state(env: Any, state: np.ndarray) -> np.ndarray:
     base_env = getattr(env, "unwrapped", env)
     set_pusht_state(base_env, np.asarray(state, dtype=np.float64))
     return np.asarray(base_env._render(visualize=False), dtype=np.uint8)
+
+
+def get_pusht_goal_pose(env: Any) -> np.ndarray:
+    base_env = getattr(env, "unwrapped", env)
+    goal_pose = getattr(base_env, "goal_pose", None)
+    if goal_pose is None:
+        raise AttributeError("PushT env does not expose goal_pose.")
+    return np.asarray(goal_pose, dtype=np.float32).reshape(-1)[:3]
+
+
+def _rotation_matrix(theta: float) -> np.ndarray:
+    c = float(np.cos(theta))
+    s = float(np.sin(theta))
+    return np.asarray([[c, -s], [s, c]], dtype=np.float64)
+
+
+def make_obstacle_pusht_init_state(
+    goal_pose: np.ndarray,
+    *,
+    block_offset: float = 120.0,
+    tilt_deg: float = 10.0,
+    pusher_face_offset: float = PUSHT_AGENT_RADIUS,
+) -> np.ndarray:
+    """Place the T above its goal and the pusher centered on the T's top face."""
+    goal_pose = np.asarray(goal_pose, dtype=np.float64).reshape(-1)
+    if goal_pose.shape[0] < 3:
+        raise ValueError(f"Expected goal_pose with at least 3 values, got shape {goal_pose.shape}.")
+
+    goal_theta = float(goal_pose[2])
+    tilt_rad = float(np.deg2rad(tilt_deg))
+    block_theta = goal_theta + tilt_rad
+    goal_rotation = _rotation_matrix(goal_theta)
+    block_offset = float(block_offset)
+    horizontal_offset = block_offset * float(np.tan(tilt_rad))
+    block_xy = goal_pose[:2] + goal_rotation @ np.asarray([horizontal_offset, -block_offset], dtype=np.float64)
+
+    block_rotation = _rotation_matrix(block_theta)
+    agent_xy = block_xy + block_rotation @ np.asarray([0.0, -float(pusher_face_offset)], dtype=np.float64)
+
+    min_agent_coord = PUSHT_WALL_MIN + PUSHT_WALL_RADIUS + PUSHT_AGENT_RADIUS
+    max_agent_coord = PUSHT_WALL_MAX - PUSHT_WALL_RADIUS - PUSHT_AGENT_RADIUS
+    agent_xy = np.clip(agent_xy, min_agent_coord, max_agent_coord)
+
+    return np.asarray(
+        [agent_xy[0], agent_xy[1], block_xy[0], block_xy[1], block_theta, 0.0, 0.0],
+        dtype=np.float64,
+    )
+
+
+def reset_pusht_env_to_obstacle_init(
+    env: Any,
+    *,
+    block_offset: float = 120.0,
+    tilt_deg: float = 10.0,
+    pusher_face_offset: float = PUSHT_AGENT_RADIUS,
+) -> tuple[np.ndarray, np.ndarray]:
+    goal_pose = get_pusht_goal_pose(env)
+    state = make_obstacle_pusht_init_state(
+        goal_pose,
+        block_offset=block_offset,
+        tilt_deg=tilt_deg,
+        pusher_face_offset=pusher_face_offset,
+    )
+    pixels = reset_pusht_env_to_state(env, state)
+    return pixels, state
 
 
 def get_pusht_block_pose(env: Any) -> np.ndarray:

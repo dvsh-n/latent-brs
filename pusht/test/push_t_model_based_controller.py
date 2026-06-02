@@ -433,17 +433,33 @@ def save_video(path: Path, frames: list[Array], fps: int) -> None:
     imageio.mimwrite(path, frames, fps=fps, quality=8, macro_block_size=1)
 
 
-def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any]:
-    geometry = InsertionGeometry(
+def make_episode_geometry(args: argparse.Namespace, episode_idx: int) -> InsertionGeometry:
+    start_dx = float(args.start_dx)
+    start_dy = float(args.start_dy)
+    start_dtheta = float(args.start_dtheta)
+
+    if args.randomize_start:
+        rng = np.random.default_rng(args.seed + episode_idx)
+        start_dx += float(rng.uniform(-args.start_dx_jitter, args.start_dx_jitter))
+        start_dy += float(rng.uniform(-args.start_dy_jitter, args.start_dy_jitter))
+        start_dtheta = math.radians(
+            float(rng.uniform(args.start_dtheta_min_deg, args.start_dtheta_max_deg))
+        )
+
+    return InsertionGeometry(
         buffer=args.buffer,
         obstacle_width=args.obstacle_width,
         obstacle_height=args.obstacle_height,
         goal_block_y=args.goal_y,
-        start_dx=args.start_dx,
-        start_dy=args.start_dy,
-        start_dtheta=args.start_dtheta,
+        start_dx=start_dx,
+        start_dy=start_dy,
+        start_dtheta=start_dtheta,
         start_agent_y_offset=args.start_agent_y_offset,
     )
+
+
+def rollout_episode(args: argparse.Namespace, episode_idx: int) -> dict[str, Any]:
+    geometry = make_episode_geometry(args, episode_idx)
     config = InsertionMPCConfig(
         horizon=args.horizon,
         max_target_step=args.max_target_step,
@@ -565,9 +581,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obstacle-height", type=float, default=135.0)
     parser.add_argument("--goal-y", type=float, default=330.0)
     parser.add_argument("--start-dx", type=float, default=18.0)
-    parser.add_argument("--start-dy", type=float, default=-115.0)
-    parser.add_argument("--start-dtheta", type=float, default=0.10)
+    parser.add_argument("--start-dy", type=float, default=-155.0)
+    parser.add_argument("--start-dtheta", type=float, default=math.radians(30.0))
     parser.add_argument("--start-agent-y-offset", type=float, default=-70.0)
+    parser.add_argument("--randomize-start", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--start-dx-jitter", type=float, default=8.0)
+    parser.add_argument("--start-dy-jitter", type=float, default=15.0)
+    parser.add_argument("--start-dtheta-min-deg", type=float, default=-30.0)
+    parser.add_argument("--start-dtheta-max-deg", type=float, default=30.0)
 
     parser.add_argument("--horizon", type=int, default=12)
     parser.add_argument("--max-target-step", type=float, default=58.0)
@@ -588,6 +609,18 @@ def main() -> None:
         raise ValueError("--max-steps must be >= 1.")
     if args.horizon < 1:
         raise ValueError("--horizon must be >= 1.")
+    if not 0.0 <= args.start_dtheta <= math.radians(30.0):
+        raise ValueError("--start-dtheta must be between 0 and 30 degrees, in radians.")
+    if args.start_dx_jitter < 0.0:
+        raise ValueError("--start-dx-jitter must be >= 0.")
+    if args.start_dy_jitter < 0.0:
+        raise ValueError("--start-dy-jitter must be >= 0.")
+    if not -30.0 <= args.start_dtheta_min_deg <= 30.0:
+        raise ValueError("--start-dtheta-min-deg must be between -30 and 30.")
+    if not -30.0 <= args.start_dtheta_max_deg <= 30.0:
+        raise ValueError("--start-dtheta-max-deg must be between -30 and 30.")
+    if args.start_dtheta_min_deg > args.start_dtheta_max_deg:
+        raise ValueError("--start-dtheta-min-deg must be <= --start-dtheta-max-deg.")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     summaries = [rollout_episode(args, episode_idx) for episode_idx in tqdm(range(args.episodes), desc="model-based insertion", unit="episode")]

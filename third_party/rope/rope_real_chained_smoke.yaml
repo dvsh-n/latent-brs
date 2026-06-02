@@ -1,0 +1,58 @@
+robot_backend: drake-lcm
+arm_mapping: robot0-left
+
+outdir: rope/data/real_data
+output_name: rope_real_chained_smoke.h5
+overwrite: true
+
+num_trajectories: 1
+seed: 0
+min_steps: 3
+
+num_splines: 10
+segment_duration: 12.0
+control_timestep: 0.05
+midpoint_inflation_scale: 0.0
+min_task_knot_distance: 0.035
+task_reach_bounds: [-0.08, 0.28]
+task_height_bounds: [1.18, 1.33]
+task_width_bounds: [0.22, 0.62]
+plan_retry_attempts: 20
+
+drake_publish_period: 0.005
+home_move_duration: 4.0
+trajectory_hold_duration: 1.0
+trajectory_start_blend_duration: 4.0
+trajectory_start_settle_duration: 0.25
+trajectory_start_ready_tolerance_deg: 0.15
+trajectory_start_ready_velocity_deg_s: 1.0
+trajectory_start_ready_timeout: 5.0
+status_timeout: 5.0
+max_home_x_gap_m: 0.008
+max_home_z_gap_m: 0.004
+
+max_control_joint_step_deg: 9.0
+max_reset_joint_move_deg: 90.0
+max_command_measured_gap_deg: 0.15
+max_real_joint_speed_deg_s: 15.0
+max_real_joint_accel_deg_s2: 30.0
+
+ik_position_tol: 0.001
+ik_max_joint_step_deg: 2.0
+home_q0_deg: [-65.0, 3.0, -167.0, 113.0, 8.0, 5.0, 0.0]
+home_q1_deg: [65.0, 3.0, -13.0, -113.0, -8.0, -5.0, 0.0]
+
+disable_collision_guard: false
+arm_arm_min_distance: 0.06
+collision_control_samples: 5
+collision_reset_samples: 25
+
+enable_camera: true
+camera_backend: ros2-topic
+camera_topic: /realsense/camera/color/image_raw/compressed
+camera_transport: compressed
+camera_topic_timeout: 5.0
+camera_crop_center_x: 0.525
+camera_crop_center_y: 0.5
+camera_crop_zoom: 0.9
+compression: lzf

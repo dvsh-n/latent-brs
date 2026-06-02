@@ -1,0 +1,65 @@
+robot_backend: drake-lcm
+
+outdir: rope/data/real_data_cube
+output_name: rope_real_chained_status1_smoke_cl.h5
+overwrite: true
+
+num_trajectories: 1
+seed: 6969
+min_steps: 3
+
+num_splines: 50
+segment_duration: 10.0
+control_timestep: 0.05
+# trajectory_mode: random-chained
+# For fixed repeated collection, switch to:
+trajectory_mode: fixed-point-to-point
+fixed_execution_controller: closed-loop
+# fixed_task_* is [reach, height, width], mapped to EE Cartesian [x, z, y] offsets from home.
+fixed_task_start: [0.1, 0.8, 0.3]
+fixed_task_goal: [-0.05, 1.1, 0.45]
+fixed_task_epsilon: 0.01
+# In fixed-point-to-point mode, each rollout duration is segment_duration.
+midpoint_inflation_scale: 0.0
+min_task_knot_distance: 0.015
+task_reach_bounds: [-0.1, 0.1]
+task_height_bounds: [0.5, 1.3]
+task_width_bounds: [0.2, 0.5]
+plan_retry_attempts: 20
+
+drake_publish_period: 0.005
+task_cl_kp: [0.2, 0.2, 0.15]
+task_cl_max_correction_m: [0.002, 0.002, 0.002]
+home_move_duration: 10.0
+trajectory_hold_duration: 1.0
+trajectory_start_blend_duration: 4.0
+trajectory_start_settle_duration: 0.25
+trajectory_start_ready_tolerance_deg: 0.15
+trajectory_start_ready_velocity_deg_s: 1.0
+trajectory_start_ready_timeout: 15.0
+status_timeout: 5.0
+
+max_control_joint_step_deg: 9.0
+max_reset_joint_move_deg: 90.0
+max_command_measured_gap_deg: 0.15
+max_real_joint_speed_deg_s: 15.0
+max_real_joint_accel_deg_s2: 30.0
+
+ik_position_tol: 0.001
+ik_max_joint_step_deg: 2.0
+orientation_theta_bound_deg: 3.0
+orientation_constraint_mode: z_axis_down
+fixed_a7_deg: -47.27
+fixed_a7_tolerance_deg: 0.05
+print_ik_checks: true
+home_q0_deg: [-65.0, 3.0, -167.0, 113.0, 8.0, 5.0, -47.27]
+
+enable_camera: true
+camera_backend: ros2-topic
+camera_topic: /realsense/camera/color/image_raw/compressed
+camera_transport: compressed
+camera_topic_timeout: 5.0
+camera_crop_center_x: 0.525
+camera_crop_center_y: 0.5
+camera_crop_zoom: 0.9
+compression: lzf
