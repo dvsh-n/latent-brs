@@ -44,7 +44,7 @@ from rope.plan.obstacle_net import (
 
 DEFAULT_MODEL_DIR = "reacher/models/mlpdyn_embd_5"
 DEFAULT_DATA_PATH = "reacher/plan/obstacle_data_joint_box/obstacle_classifier_data.pt"
-DEFAULT_OUT_DIR = "reacher/plan/obs_net_gamed"
+DEFAULT_OUT_DIR = "reacher/plan/obs_net"
 
 
 def parse_args() -> argparse.Namespace:

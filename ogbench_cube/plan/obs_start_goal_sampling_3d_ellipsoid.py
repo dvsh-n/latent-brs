@@ -33,7 +33,7 @@ from ogbench_cube.plan.obs_data_collect_3d_ellipsoid import (
     synthesize_grasped_state,
 )
 
-DEFAULT_OUT_DIR = Path("ogbench_cube/plan/random_endpoint_pairs_3d_ellipsoid_gamed")
+DEFAULT_OUT_DIR = Path("ogbench_cube/plan/random_endpoint_pairs_3d_ellipsoid")
 DEFAULT_PLOT_NAME = "start_goal_3d_ellipsoid.png"
 DEFAULT_DATASET_NAME = "start_goal_3d_ellipsoid.pt"
 DEFAULT_NUM_POINTS = 1024
