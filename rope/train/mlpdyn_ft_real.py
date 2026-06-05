@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train an LE-WM-style JEPA with a Markov latent-state MLP dynamics predictor on real rope data shards."""
+"""Finetune a real-rope LE-WM-style JEPA on measured task-space actions."""
 
 from __future__ import annotations
 
@@ -26,20 +26,26 @@ from rope.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
 DEFAULT_DATASET_GLOB = "rope/data/real_data/*.h5"
-DEFAULT_RUN_DIR = "rope/models/mlpdyn_real_1"
+DEFAULT_INIT_RUN_DIR = "rope/models/mlpdyn_ft_real"
+DEFAULT_RUN_DIR = "rope/models/mlpdyn_ft_real_1"
 FIXED_FRAMESKIP = 1
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--init-run-dir", type=Path, default=None)
+    parser.add_argument("--init-run-dir", type=Path, default=DEFAULT_INIT_RUN_DIR)
     parser.add_argument("--init-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Resume training from a Lightning checkpoint, restoring optimizer/scheduler state.",
+    )
     parser.add_argument("--dataset-glob", default=DEFAULT_DATASET_GLOB)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--resume", action="store_true", default=True, help="Resume training from run-dir/last.ckpt.")
     parser.add_argument(
         "--action-key",
-        default="control",
+        default="action",
         help="Which action tensor to train on from the real-data shards, for example measured_action, action, or control.",
     )
     parser.add_argument("--output-model-name", default="lewm")
@@ -49,13 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--embed-dim", type=int, default=12)
     parser.add_argument("--markov-deriv", type=int, default=1)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
-    parser.add_argument("--action-dim", type=int, default=14)
+    parser.add_argument("--action-dim", type=int, default=3)
 
     parser.add_argument("--predictor-hidden-width", type=int, default=512)
-    parser.add_argument("--predictor-depth", type=int, default=3)
+    parser.add_argument("--predictor-depth", type=int, default=2)
     parser.add_argument("--predictor-dropout", type=float, default=0.0)
 
     parser.add_argument("--sigreg-weight", type=float, default=0.005)
@@ -64,17 +70,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument(
         "--load-projector",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Load projector weights from the init checkpoint.",
     )
     parser.add_argument(
         "--load-mlpdyn",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Load MLP dynamics weights from the init checkpoint.",
     )
     parser.add_argument("--batch-size", type=int, default=120)
@@ -439,15 +445,22 @@ def latest_object_checkpoint(model_dir: Path) -> Path:
     return max(candidates, key=lambda item: item[0])[1]
 
 
-def resolve_init_checkpoint(args: argparse.Namespace) -> Path | None:
+def resolve_init_checkpoint(args: argparse.Namespace) -> Path:
     if args.init_checkpoint is not None:
         checkpoint_path = args.init_checkpoint.expanduser().resolve()
-    elif args.init_run_dir is not None:
-        checkpoint_path = latest_object_checkpoint(args.init_run_dir.expanduser().resolve()).resolve()
     else:
-        return None
+        checkpoint_path = latest_object_checkpoint(args.init_run_dir.expanduser().resolve()).resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Init checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
+def resolve_resume_checkpoint(args: argparse.Namespace) -> Path | None:
+    if args.resume_checkpoint is None:
+        return None
+    checkpoint_path = args.resume_checkpoint.expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
     return checkpoint_path
 
 
@@ -465,18 +478,27 @@ def load_pretrained_model(checkpoint_path: Path) -> JEPA:
     return source_model
 
 
+def load_module_state(target: torch.nn.Module, source: torch.nn.Module, module_name: str) -> None:
+    try:
+        target.load_state_dict(source.state_dict(), strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to load {module_name} weights from the init checkpoint. "
+            "Check architecture compatibility for this fine-tune run."
+        ) from exc
+
+
 def main() -> None:
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
 
     run_dir = args.run_dir.expanduser().resolve()
-    ckpt_path = run_dir / "last.ckpt"
-    init_checkpoint_path = None if args.resume else resolve_init_checkpoint(args)
-    if args.resume:
-        if not ckpt_path.is_file():
-            raise FileNotFoundError(f"--resume was set but checkpoint not found: {ckpt_path}")
-    elif run_dir.exists():
-        raise FileExistsError(f"Run dir already exists. Pass --resume to continue training: {run_dir}")
+    resume_checkpoint_path = resolve_resume_checkpoint(args)
+    init_checkpoint_path = None if resume_checkpoint_path is not None else resolve_init_checkpoint(args)
+    if run_dir.exists() and resume_checkpoint_path is None:
+        raise FileExistsError(f"Run dir already exists: {run_dir}")
+    if not run_dir.exists() and resume_checkpoint_path is not None:
+        raise FileNotFoundError(f"Run dir does not exist for resume: {run_dir}")
 
     dataset = LeWMRopeRealDataset(
         args.dataset_glob,
@@ -517,28 +539,22 @@ def main() -> None:
     )
 
     world_model = build_model(args)
-    if init_checkpoint_path is not None:
+    if resume_checkpoint_path is None:
         pretrained_model = load_pretrained_model(init_checkpoint_path)
         pretrained_encoder = getattr(pretrained_model, "encoder", None)
         if pretrained_encoder is None:
             raise AttributeError("Source checkpoint does not contain model.encoder.")
-        try:
-            world_model.encoder.load_state_dict(pretrained_encoder.state_dict(), strict=True)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "Failed to load encoder weights from the init checkpoint. "
-                "Check encoder-scale, patch-size, and encoder architecture compatibility."
-            ) from exc
+        load_module_state(world_model.encoder, pretrained_encoder, "encoder")
         if args.load_projector:
             pretrained_projector = getattr(pretrained_model, "projector", None)
             if pretrained_projector is None:
                 raise AttributeError("Source checkpoint does not contain model.projector.")
-            world_model.projector.load_state_dict(pretrained_projector.state_dict(), strict=True)
+            load_module_state(world_model.projector, pretrained_projector, "projector")
         if args.load_mlpdyn:
             pretrained_predictor = getattr(pretrained_model, "predictor", None)
             if pretrained_predictor is None:
                 raise AttributeError("Source checkpoint does not contain model.predictor.")
-            world_model.predictor.load_state_dict(pretrained_predictor.state_dict(), strict=True)
+            load_module_state(world_model.predictor, pretrained_predictor, "predictor")
 
     optimizers = {
         "model_opt": {
@@ -557,22 +573,17 @@ def main() -> None:
     )
 
     spt.set(cache_dir=str(run_dir))
-    if args.resume:
-        run_dir.mkdir(parents=True, exist_ok=True)
-    else:
+    if resume_checkpoint_path is None:
         run_dir.mkdir(parents=True, exist_ok=False)
+        config = vars(args).copy()
+        config["run_dir"] = str(run_dir)
+        config["dataset_glob"] = args.dataset_glob
+        config["init_checkpoint"] = str(init_checkpoint_path)
+        config["readable_shards"] = [str(info["path"]) for info in dataset.shard_infos]
+        config["skipped_shards"] = dataset.skipped_shards
+        with (run_dir / "config.json").open("w") as f:
+            json.dump(config, f, indent=2, default=str)
 
-    config = vars(args).copy()
-    config["run_dir"] = str(run_dir)
-    config["dataset_glob"] = args.dataset_glob
-    config["resume_checkpoint"] = str(ckpt_path) if args.resume else None
-    config["init_checkpoint"] = str(init_checkpoint_path) if init_checkpoint_path is not None else None
-    config["readable_shards"] = [str(info["path"]) for info in dataset.shard_infos]
-    config["skipped_shards"] = dataset.skipped_shards
-    with (run_dir / "config.json").open("w") as f:
-        json.dump(config, f, indent=2, default=str)
-
-    if init_checkpoint_path is not None:
         loaded_modules = ["encoder"]
         if args.load_projector:
             loaded_modules.append("projector")
@@ -596,6 +607,16 @@ def main() -> None:
         }
         with (run_dir / "init_report.json").open("w") as f:
             json.dump(init_report, f, indent=2)
+    else:
+        resume_report = {
+            "resume_checkpoint": str(resume_checkpoint_path),
+            "run_dir": str(run_dir),
+            "sigreg_weight": float(args.sigreg_weight),
+            "action_key": str(args.action_key),
+            "action_dim": int(args.action_dim),
+        }
+        with (run_dir / "resume_report.json").open("w") as f:
+            json.dump(resume_report, f, indent=2)
 
     callbacks: list[Callback] = [
         ModelCheckpoint(
@@ -622,7 +643,7 @@ def main() -> None:
     data_module = spt.data.DataModule(train=train_loader, val=val_loader)
     if hasattr(torch.serialization, "add_safe_globals"):
         torch.serialization.add_safe_globals([PosixPath])
-    trainer.fit(module, datamodule=data_module, ckpt_path=str(ckpt_path) if args.resume else None)
+    trainer.fit(module, datamodule=data_module, ckpt_path=str(resume_checkpoint_path) if resume_checkpoint_path else None)
 
 
 if __name__ == "__main__":

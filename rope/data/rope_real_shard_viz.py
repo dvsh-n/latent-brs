@@ -11,7 +11,7 @@ import imageio.v2 as imageio
 import numpy as np
 
 
-DEFAULT_SHARD_PATH = "rope/data/rope_real_data/rope_real_chained_smoke_cl_shard0023.h5"
+DEFAULT_SHARD_PATH = "rope/data/real_data/rope_real_shard0010.h5"
 DEFAULT_OUT_DIR = "rope/data/rope_real_viz"
 
 

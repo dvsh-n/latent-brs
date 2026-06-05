@@ -98,6 +98,8 @@ class BaseEnvConfig:
     enable_proxy_rope: bool = False
     asset_extra_xml: str = ""
     worldbody_extra_xml: str = ""
+    offscreen_width: int = DEFAULT_RENDER_WIDTH
+    offscreen_height: int = DEFAULT_RENDER_HEIGHT
 
 
 @dataclass(frozen=True)
@@ -280,7 +282,7 @@ def build_lab_scene_xml(
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
     <rgba haze="0.15 0.25 0.35 1"/>
-    <global azimuth="-120" elevation="-20"/>
+    <global azimuth="-120" elevation="-20" offwidth="{int(config.offscreen_width)}" offheight="{int(config.offscreen_height)}"/>
   </visual>
 
   <asset>

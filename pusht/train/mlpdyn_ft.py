@@ -20,18 +20,20 @@ import stable_pretraining as spt
 import torch
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset, random_split
 
 from pusht.shared.models import JEPA, MLP, MLPDynamicsPredictor, SIGReg
 
 
 DEFAULT_DATASET_PATHS = [
+    Path("pusht/data/pusht_diffusion_insertion.h5"),
     Path("pusht/data/pusht_diffusion_train.h5"),
-    Path("pusht/data/pusht_diffusion_edge.h5"),
+    # Path("pusht/data/pusht_diffusion_edge.h5"),
     # Path("pusht/data/pusht_diffusion_random.h5"),
 ]
+DEFAULT_DATASET_FRACTIONS = [1.0, 0.25]
 DEFAULT_INIT_RUN_DIR = "pusht/models/mlpdyn_embd_48"
-DEFAULT_RUN_DIR = "pusht/models/mlpdyn_embd_48_straighten"
+DEFAULT_RUN_DIR = "pusht/models/mlpdyn_embd_8_insert"
 FIXED_FRAMESKIP = 1
 
 
@@ -42,10 +44,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume-checkpoint",
         type=Path,
-        default=None,
+        default="pusht/models/mlpdyn_embd_8_insert/last.ckpt",
         help="Resume training from a Lightning checkpoint (for example, run_dir/last.ckpt) and restore optimizer/scheduler state.",
     )
     parser.add_argument("--dataset-path", type=Path, nargs="+", default=DEFAULT_DATASET_PATHS)
+    parser.add_argument(
+        "--dataset-fraction",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Fraction of each dataset to use. Must match --dataset-path length.",
+    )
+    parser.add_argument(
+        "--dataset-percent",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Percentage of each dataset to use. Must match --dataset-path length.",
+    )
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--output-model-name", default="mlpdyn")
     parser.add_argument("--seed", type=int, default=3072)
@@ -54,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=14)
     parser.add_argument("--encoder-scale", default="tiny")
-    parser.add_argument("--embed-dim", type=int, default=48)
+    parser.add_argument("--embed-dim", type=int, default=8)
     parser.add_argument("--markov-deriv", type=int, default=2)
     parser.add_argument("--num-preds", type=int, default=5, help="Autoregressive rollout horizon.")
     parser.add_argument("--action-dim", type=int, default=2)
@@ -69,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--straighten", action="store_true", default=True, help="Apply temporal straightening to encoder latents.")
     parser.add_argument("--straighten-weight", type=float, default=1e-2)
 
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--freeze-encoder-epochs", type=int, default=0)
     parser.add_argument("--freeze-projector-epochs", type=int, default=0)
     parser.add_argument(
@@ -105,6 +121,18 @@ def parse_args() -> argparse.Namespace:
         parser.error("--freeze-encoder-epochs must be non-negative.")
     if args.freeze_projector_epochs < 0:
         parser.error("--freeze-projector-epochs must be non-negative.")
+    if args.dataset_fraction is not None and args.dataset_percent is not None:
+        parser.error("Use only one of --dataset-fraction or --dataset-percent.")
+    if args.dataset_percent is not None:
+        if any(percent < 0.0 or percent > 100.0 for percent in args.dataset_percent):
+            parser.error("--dataset-percent values must be in [0, 100].")
+        args.dataset_fraction = [percent / 100.0 for percent in args.dataset_percent]
+    elif args.dataset_fraction is None:
+        args.dataset_fraction = DEFAULT_DATASET_FRACTIONS
+    if any(fraction < 0.0 or fraction > 1.0 for fraction in args.dataset_fraction):
+        parser.error("--dataset-fraction values must be in [0, 1].")
+    if len(args.dataset_fraction) != len(args.dataset_path):
+        parser.error("--dataset-fraction/--dataset-percent must match --dataset-path length.")
     args.frameskip = FIXED_FRAMESKIP
     args.markov_state_dim = (args.markov_deriv + 1) * args.embed_dim
     return args
@@ -430,6 +458,36 @@ def resolve_dataset_paths(dataset_paths: list[Path | str]) -> list[Path]:
     return resolved_paths
 
 
+def expand_dataset_fractions(dataset_fractions: list[float], num_datasets: int) -> list[float]:
+    if len(dataset_fractions) != num_datasets:
+        raise ValueError(
+            f"Expected {num_datasets} dataset fractions, got {len(dataset_fractions)}."
+        )
+    return [float(fraction) for fraction in dataset_fractions]
+
+
+def apply_dataset_fractions(
+    datasets: list[Dataset],
+    dataset_fractions: list[float],
+    *,
+    seed: int,
+) -> list[Dataset]:
+    sampled_datasets: list[Dataset] = []
+    for dataset_idx, (dataset, fraction) in enumerate(zip(datasets, dataset_fractions, strict=True)):
+        if fraction >= 1.0:
+            sampled_datasets.append(dataset)
+            continue
+
+        dataset_len = len(dataset)
+        subset_len = int(dataset_len * fraction)
+        if fraction > 0.0 and subset_len < 1:
+            subset_len = 1
+        generator = torch.Generator().manual_seed(seed + dataset_idx)
+        indices = torch.randperm(dataset_len, generator=generator)[:subset_len].tolist()
+        sampled_datasets.append(Subset(dataset, indices))
+    return sampled_datasets
+
+
 def latest_object_checkpoint(model_dir: Path) -> Path:
     pattern = re.compile(r".*_epoch_(\d+)_object\.ckpt$")
     candidates: list[tuple[int, Path]] = []
@@ -505,6 +563,8 @@ def main() -> None:
         )
         for dataset_path in dataset_paths
     ]
+    dataset_fractions = expand_dataset_fractions(args.dataset_fraction, len(datasets))
+    datasets = apply_dataset_fractions(datasets, dataset_fractions, seed=args.seed)
     dataset: Dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
     if len(dataset) < 2:
         raise ValueError(f"Need at least 2 valid training windows for train/val splitting, got {len(dataset)}.")

@@ -14,6 +14,9 @@ models/
 *.h5
 reacher/models/lewm_reacher*/
 *.json
+*.jsonl
+*.pdf
+*.npz
 *.mp4
 *.png
 *.pkl

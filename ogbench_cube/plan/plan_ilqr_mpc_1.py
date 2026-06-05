@@ -803,6 +803,9 @@ def main() -> None:
     rollout_frames = [current_frame.copy()]
     executed_actions_raw: list[np.ndarray] = []
     executed_actions_norm: list[np.ndarray] = []
+    mpc_planned_action_steps: list[int] = []
+    mpc_planned_actions_raw: list[np.ndarray] = []
+    mpc_planned_actions_norm: list[np.ndarray] = []
     latent_goal_distances = [float(torch.linalg.vector_norm(current_state - goal_state).item())]
     embedding_goal_distances = [float(torch.linalg.vector_norm(current_emb - goal_emb).item())]
     cube_goal_distances = [float(np.linalg.norm(np.asarray(current_info["privileged/block_0_pos"]) - goal_block_pos))]
@@ -899,7 +902,13 @@ def main() -> None:
             ilqr_iterations.append(int(n_iters))
             ilqr_costs.append(float(plan_cost))
 
-            u0_norm = u_plan[0].astype(np.float32)
+            u_plan_norm = np.asarray(u_plan, dtype=np.float32)
+            u_plan_raw = normalized_to_raw_action(u_plan_norm, action_mean, action_std)
+            mpc_planned_action_steps.append(int(len(executed_actions_raw)))
+            mpc_planned_actions_norm.append(u_plan_norm.copy())
+            mpc_planned_actions_raw.append(u_plan_raw.copy())
+
+            u0_norm = u_plan_norm[0].astype(np.float32)
             u0_raw = normalized_to_raw_action(u0_norm, action_mean, action_std)
             executed_actions_norm.append(u0_norm.copy())
             executed_actions_raw.append(u0_raw.copy())
@@ -966,11 +975,13 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "dataset_path": str(dataset_path),
         "pair_path": str(pair_path),
+        "planned_actions_path": str(out_dir / "planned_actions.npz"),
         "env_name": env_name,
         "camera": camera,
         "img_size": img_size,
         "horizon": int(args.horizon),
         "max_mpc_steps": int(args.max_mpc_steps),
+        "planned_action_horizon": int(args.horizon),
         "dataset_max_episode_steps": dataset_max_episode_steps,
         "env_max_episode_steps": max_episode_steps,
         "num_executed_steps": int(len(executed_actions_raw)),
@@ -1009,9 +1020,28 @@ def main() -> None:
         "cube_yaw_errors": cube_yaw_errors,
         "executed_actions_raw": [action.tolist() for action in executed_actions_raw],
         "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
+        "mpc_planned_action_steps": mpc_planned_action_steps,
+        "mpc_planned_actions_raw": [plan.tolist() for plan in mpc_planned_actions_raw],
+        "mpc_planned_actions_norm": [plan.tolist() for plan in mpc_planned_actions_norm],
         "pair_start_pixel_l2": float(np.linalg.norm(start_frame.astype(np.float32) - pair_start_pixel.astype(np.float32))),
         "pair_goal_pixel_l2": float(np.linalg.norm(goal_frame.astype(np.float32) - pair_goal_pixel.astype(np.float32))),
     }
+
+    planned_actions_path = out_dir / "planned_actions.npz"
+    np.savez_compressed(
+        planned_actions_path,
+        mpc_planned_action_steps=np.asarray(mpc_planned_action_steps, dtype=np.int64),
+        mpc_planned_actions_raw=(
+            np.stack(mpc_planned_actions_raw).astype(np.float32)
+            if mpc_planned_actions_raw
+            else np.empty((0, int(args.horizon), action_dim), dtype=np.float32)
+        ),
+        mpc_planned_actions_norm=(
+            np.stack(mpc_planned_actions_norm).astype(np.float32)
+            if mpc_planned_actions_norm
+            else np.empty((0, int(args.horizon), action_dim), dtype=np.float32)
+        ),
+    )
 
     metrics_path = out_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as handle:

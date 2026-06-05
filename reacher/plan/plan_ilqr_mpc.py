@@ -33,18 +33,18 @@ DEFAULT_OUT_DIR = "reacher/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "cuda"
 HORIZON = 15
-MAX_MPC_STEPS = 100
+MAX_MPC_STEPS = 50
 Q_TERMINAL = 5.0
 Q_STAGE = 0.05
-R_CONTROL = 0.01
+R_CONTROL = 0.1
 VIDEO_FPS = 60
-EPISODE_IDX = 3056
-DEFAULT_START_QPOS = np.array([3.1258087158203125, -2.279094696044922], dtype=np.float32)
-DEFAULT_GOAL_QPOS = np.array([0.370098, -2.092896], dtype=np.float32)
+EPISODE_IDX = 326
+# DEFAULT_START_QPOS = np.array([3.1258087158203125, -2.279094696044922], dtype=np.float32)
+# DEFAULT_GOAL_QPOS = np.array([0.370098, -2.092896], dtype=np.float32)
 # DEFAULT_GOAL_QPOS = np.array([0.9, -2.2], dtype=np.float32)
 # DEFAULT_START_QPOS = np.array([2.42, -0.5], dtype=np.float32)
-# DEFAULT_START_QPOS = None
-# DEFAULT_GOAL_QPOS = None
+DEFAULT_START_QPOS = None
+DEFAULT_GOAL_QPOS = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -888,6 +888,48 @@ def main() -> None:
     video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
     env.close()
 
+    executed_actions_norm_np = (
+        np.stack(executed_actions_norm, axis=0)
+        if executed_actions_norm
+        else np.empty((0, action_dim), dtype=np.float32)
+    )
+    executed_actions_raw_np = (
+        np.stack(executed_actions_raw, axis=0)
+        if executed_actions_raw
+        else np.empty((0, action_dim), dtype=np.float32)
+    )
+    executed_qpos_np = (
+        np.stack(executed_qpos, axis=0)
+        if executed_qpos
+        else np.empty((0, qpos_np.shape[1]), dtype=np.float32)
+    )
+    executed_qvel_np = (
+        np.stack(executed_qvel, axis=0)
+        if executed_qvel
+        else np.empty((0, qvel_np.shape[1]), dtype=np.float32)
+    )
+    executed_embeddings_np = (
+        np.stack(executed_embeddings, axis=0)
+        if executed_embeddings
+        else np.empty((0, embed_dim), dtype=np.float32)
+    )
+    executed_states_np = (
+        np.stack(executed_states, axis=0)
+        if executed_states
+        else np.empty((0, markov_state_dim), dtype=np.float32)
+    )
+    nominal_state_plans_np = (
+        np.stack(nominal_state_rollouts, axis=0)
+        if nominal_state_rollouts
+        else np.empty((0, args.horizon + 1, markov_state_dim), dtype=np.float64)
+    )
+    nominal_action_plans_np = (
+        np.stack(nominal_action_rollouts, axis=0)
+        if nominal_action_rollouts
+        else np.empty((0, args.horizon, action_dim), dtype=np.float64)
+    )
+    plan_steps_np = np.arange(nominal_action_plans_np.shape[0], dtype=np.int64)
+
     rollout_payload = {
         "metadata": {
             "run_name": run_name,
@@ -927,6 +969,12 @@ def main() -> None:
             "executed_steps": int(len(executed_actions_raw)),
             "stop_reason": stop_reason,
             "video_path": video_path,
+            "artifacts": {
+                "executed_actions_path": str(out_dir / "executed_actions.npz"),
+                "executed_states_path": str(out_dir / "executed_states.npz"),
+                "mpc_plans_path": str(out_dir / "mpc_plans.npz"),
+                "rollout_payload_path": str(out_dir / "nominal_rollout.pt"),
+            },
         },
         "episode_data": {
             "pixels": pixels_np,
@@ -952,33 +1000,52 @@ def main() -> None:
             "final_obs": final_obs,
         },
         "nominal_rollouts": {
-            "state_plans": np.stack(nominal_state_rollouts, axis=0)
-            if nominal_state_rollouts
-            else np.empty((0, args.horizon + 1, markov_state_dim), dtype=np.float64),
-            "action_plans": np.stack(nominal_action_rollouts, axis=0)
-            if nominal_action_rollouts
-            else np.empty((0, args.horizon, action_dim), dtype=np.float64),
+            "state_plans": nominal_state_plans_np,
+            "action_plans": nominal_action_plans_np,
             "solve_times_ms": np.asarray(solve_times_ms, dtype=np.float64),
             "ilqr_iterations": np.asarray(ilqr_iterations, dtype=np.int64),
             "ilqr_costs": np.asarray(ilqr_costs, dtype=np.float64),
         },
         "executed_rollout": {
             "frames": np.stack(rollout_frames, axis=0),
-            "qpos": np.stack(executed_qpos, axis=0),
-            "qvel": np.stack(executed_qvel, axis=0),
-            "embeddings": np.stack(executed_embeddings, axis=0),
-            "states": np.stack(executed_states, axis=0),
-            "actions_raw": np.stack(executed_actions_raw, axis=0)
-            if executed_actions_raw
-            else np.empty((0, action_dim), dtype=np.float32),
-            "actions_norm": np.stack(executed_actions_norm, axis=0)
-            if executed_actions_norm
-            else np.empty((0, action_dim), dtype=np.float32),
+            "qpos": executed_qpos_np,
+            "qvel": executed_qvel_np,
+            "embeddings": executed_embeddings_np,
+            "states": executed_states_np,
+            "actions_raw": executed_actions_raw_np,
+            "actions_norm": executed_actions_norm_np,
             "latent_goal_distances": np.asarray(latent_goal_distances, dtype=np.float64),
             "embedding_goal_distances": np.asarray(embedding_goal_distances, dtype=np.float64),
             "observation_goal_distances": np.asarray(observation_goal_distances, dtype=np.float64),
         },
     }
+    np.savez(
+        out_dir / "executed_actions.npz",
+        actions_norm=executed_actions_norm_np,
+        actions_raw=executed_actions_raw_np,
+    )
+    np.savez(
+        out_dir / "executed_states.npz",
+        markov_states=executed_states_np,
+        embeddings=executed_embeddings_np,
+        qpos=executed_qpos_np,
+        qvel=executed_qvel_np,
+    )
+    np.savez_compressed(
+        out_dir / "mpc_plans.npz",
+        plan_steps=plan_steps_np,
+        nominal_centers=nominal_state_plans_np,
+        nominal_actions=nominal_action_plans_np,
+        executed_markov_states=executed_states_np,
+        goal_state=goal_state_np,
+        start_state=start_state.detach().cpu().numpy().astype(np.float64),
+        state_dim=np.asarray(markov_state_dim, dtype=np.int64),
+        horizon=np.asarray(args.horizon, dtype=np.int64),
+        episode_idx=np.asarray(episode_idx, dtype=np.int64),
+        solve_times_ms=np.asarray(solve_times_ms, dtype=np.float64),
+        ilqr_iterations=np.asarray(ilqr_iterations, dtype=np.int64),
+        ilqr_costs=np.asarray(ilqr_costs, dtype=np.float64),
+    )
     save_torch_payload(out_dir / "nominal_rollout.pt", rollout_payload)
     save_json(
         out_dir / "executed_qpos.json",
@@ -986,7 +1053,7 @@ def main() -> None:
             "start_qpos": start_qpos.tolist(),
             "goal_qpos": goal_qpos.tolist(),
             "final_qpos": final_qpos.tolist(),
-            "qpos_over_time": np.stack(executed_qpos, axis=0).tolist(),
+            "qpos_over_time": executed_qpos_np.tolist(),
         },
     )
 

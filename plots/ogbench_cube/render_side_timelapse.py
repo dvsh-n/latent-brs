@@ -43,7 +43,7 @@ from ogbench_cube.plan.obs_data_collect_3d_ellipsoid import hide_target_cube, ma
 
 
 DEFAULT_ROOT = REPO_ROOT / "plots" / "ogbench_cube"
-DEFAULT_TRAJECTORIES = ("ogbench_cube_safe", "ogbench_cube_unsafe")
+DEFAULT_TRAJECTORIES = ("ogbench_cube_safe", "ogbench_cube_unsafe_2")
 DEFAULT_OUTPUT_NAME = "side_timelapse.png"
 DEFAULT_COMBINED_OUTPUT_NAME = "ogbench_cube_side_timelapse.png"
 DEFAULT_HEIGHT_THRESHOLD = 0.09

@@ -33,12 +33,12 @@ DEFAULT_OUT_DIR = "ogbench_cube/plan/ilqr_mpc_mlpdyn"
 
 DEVICE = "auto"
 HORIZON = 15
-MAX_MPC_STEPS = 100
+MAX_MPC_STEPS = 50
 Q_TERMINAL = 15.0
 Q_STAGE = 0.05
 R_CONTROL = 0.5
 VIDEO_FPS = 20
-EPISODE_IDX = 562
+EPISODE_IDX = 284
 MAX_ORACLE_STEPS = 80
 ORACLE_SEGMENT_DT = 0.4
 ORACLE_NOISE = 0.0
@@ -868,6 +868,7 @@ def main() -> None:
         stop_reason = "max_mpc_steps"
 
     final_info = current_info
+    ilqr_start_frame_idx = None if handoff_step is None else int(handoff_step)
     metrics = {
         "episode_idx": int(episode_idx),
         "episode_seed": episode_seed,
@@ -886,6 +887,10 @@ def main() -> None:
         "used_oracle_before_mpc": bool(used_oracle_before_mpc),
         "oracle_grasped": bool(oracle_grasped),
         "handoff_step": None if handoff_step is None else int(handoff_step),
+        "world_model_ilqr_start_frame_idx": ilqr_start_frame_idx,
+        "world_model_ilqr_start_time_s": None
+        if ilqr_start_frame_idx is None
+        else float(ilqr_start_frame_idx) / float(args.video_fps),
         "stop_reason": stop_reason,
         "latent_goal_distance_initial": float(latent_goal_distances[0]),
         "latent_goal_distance_final": float(latent_goal_distances[-1]),

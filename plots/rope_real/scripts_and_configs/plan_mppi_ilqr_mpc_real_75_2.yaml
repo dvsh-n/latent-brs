@@ -1,0 +1,97 @@
+model_dir: rope/models/mlpdyn_ft_real
+checkpoint:
+stats_dataset_glob: rope/data_real/real_data/rope_real_shard*.h5
+goal_dataset_glob: rope/data_real/real_data/rope_real_shard*.h5
+action_key:
+shard: 75
+waypoint_idx: 2
+out_dir: rope/plan/mppi_ilqr_mpc_real
+device: auto
+
+horizon: 5
+max_mpc_steps: 150
+execute_steps_per_plan: 1
+task_action_min_m: [-0.01010218, -0.00391459, -0.01059198]
+task_action_max_m: [0.00973974, 0.00397003, 0.01060879]
+max_normalized_control: 3.0
+q_terminal: 5.0
+q_stage: 0.5
+r_control: 0.02
+ilqr_max_iters: 12
+ilqr_tol: 0.0001
+ilqr_regularization: 0.00
+
+mppi_horizon: 5
+mppi_samples: 2048
+mppi_update_iter: 6
+mppi_reward_weight: 25.0
+mppi_noise_level: 0.2
+mppi_beta_filter: 0.65
+mppi_q_term: 100.0
+mppi_q: 0.5
+mppi_r: 0.05
+mppi_min_task_delta_m: [0.005, 0.002, 0.005]
+mppi_min_task_delta_penalty: 20.0
+
+pre_command_sleep_s: 0.2
+
+video_fps: 5
+write_hdf5_trajectory: true
+compression: lzf
+optimize_3d_task_actions: true
+
+robot_backend: drake-lcm
+arm_mapping: robot0-left
+task_reach_bounds: [-0.025, 0.28]
+task_height_bounds: [1.18, 1.35]
+task_width_bounds: [0.22, 0.55]
+home_q0_deg: [-65.0, 3.0, -167.0, 113.0, 8.0, 5.0, 0.0]
+home_q1_deg: [65.0, 3.0, -13.0, -113.0, -8.0, -5.0, 0.0]
+
+drake_publish_period: 0.005
+home_move_duration: 12.0
+setup_move_duration: 12.0
+trajectory_hold_duration: 0.25
+trajectory_start_blend_duration: 4.0
+trajectory_start_settle_duration: 0.25
+trajectory_start_ready_tolerance_deg: 0.15
+trajectory_start_ready_velocity_deg_s: 1.0
+trajectory_start_ready_timeout: 15.0
+status_timeout: 5.0
+max_home_x_gap_m: 0.008
+max_home_z_gap_m: 0.004
+
+max_control_joint_step_deg: 9.0
+max_reset_joint_move_deg: 90.0
+max_command_measured_gap_deg: 0.75
+max_real_joint_speed_deg_s: 15.0
+max_task_speed_m_s: 0.01
+min_action_duration: 1.0
+settle_tolerance_deg: 0.50
+settle_velocity_deg_s: 1.0
+settle_timeout: 8.0
+settle_poll_period: 0.05
+
+ik_position_tol: 0.005
+ik_max_joint_step_deg: 8.0
+ik_joint7_min_deg: -140.0
+ik_joint7_max_deg: 140.0
+
+disable_collision_guard: false
+arm_arm_min_distance: 0.06
+collision_control_samples: 5
+collision_reset_samples: 25
+
+enable_camera: true
+camera_index: 4
+camera_device:
+camera_width: 224
+camera_height: 224
+camera_crop_center_x: 0.525
+camera_crop_center_y: 0.5
+camera_crop_zoom: 0.9
+camera_capture_width:
+camera_capture_height:
+camera_warmup_frames: 10
+camera_drop_frames_after_motion: 15
+camera_settle_delay: 0.5

@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obstacle-dir", type=Path, default=Path(DEFAULT_OBSTACLE_DIR))
     parser.add_argument("--obstacle-net-dir", type=Path, default=Path(DEFAULT_OBSTACLE_NET_DIR))
     parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--episode-idx", type=int, default=nominal_planner.EPISODE_IDX)
+    parser.add_argument("--episode-idx", type=int, default=10)
     parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--video-fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--horizon", type=int, default=nominal_planner.HORIZON)

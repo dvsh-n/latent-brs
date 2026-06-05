@@ -17,16 +17,16 @@ from pusht.shared.pusht_env import (
     get_pusht_agent_pos,
     get_pusht_block_pose,
     make_pusht_env,
-    reset_pusht_env_to_obstacle_init,
+    reset_pusht_env_to_obstacle_init as reset_pusht_env_to_insertion_init,
     reset_pusht_env_to_state,
 )
 from pusht.shared.utils import load_expert_policy_bundle, render_frame, select_expert_action
 
 DEFAULT_MODEL_DIR = Path("pusht/models")
 DEFAULT_OUT_DIR = Path("pusht/plan/diffusion_plan")
-DEFAULT_MODE = "noised_obstacle"
+DEFAULT_MODE = "insertion"
 DEFAULT_RENDER_SIZE = 512
-INIT_MODES = ("normal", "edge", "obstacle", "noised_obstacle")
+INIT_MODES = ("normal", "edge", "insertion", "noised_insertion")
 PUSHT_WALL_MIN = 5.0
 PUSHT_WALL_MAX = 506.0
 PUSHT_WALL_RADIUS = 2.0
@@ -34,7 +34,8 @@ PUSHT_AGENT_RADIUS = 15.0
 PUSHT_CANVAS_SIZE = 512.0
 PUSHT_TEE_SCALE = 30.0
 PUSHT_TEE_LENGTH = 4.0
-OBSTACLE_COLOR_RGBA = (255, 140, 0, 210)
+PUSHT_TEE_CAP_TOP_Y = 0.0
+INSERTION_COLOR_RGBA = (255, 140, 0, 210)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,8 +59,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MODE,
         choices=INIT_MODES,
         help=(
-            "Initialization/evaluation mode: normal env reset, edge pusher respawn, obstacle custom init, "
-            "or obstacle custom init with noised expert actions."
+            "Initialization/evaluation mode: normal env reset, edge pusher respawn, insertion custom init, "
+            "or insertion custom init with noised expert actions."
         ),
     )
     parser.add_argument(
@@ -69,47 +70,72 @@ def parse_args() -> argparse.Namespace:
         help="Deprecated alias for --mode edge/normal.",
     )
     parser.add_argument(
-        "--obstacle-init",
+        "--insertion-init",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Alias for --mode obstacle.",
+        dest="insertion_init",
+        help="Alias for --mode insertion.",
     )
     parser.add_argument(
-        "--obstacle-init-block-offset",
+        "--insertion-init-block-offset",
         type=float,
-        default=165.0,
-        help="Distance to move the T from the goal along the negative local vertical symmetry axis.",
+        nargs=2,
+        default=(130.0, 165.0),
+        dest="insertion_init_block_offset",
+        metavar=("MIN", "MAX"),
+        help=(
+            "Range to uniformly sample the distance that moves the T from the goal along the negative local "
+            "vertical symmetry axis."
+        ),
     )
     parser.add_argument(
-        "--obstacle-init-max-tilt-deg",
-        dest="obstacle_init_max_tilt_deg",
+        "--insertion-init-max-tilt-deg",
+        dest="insertion_init_max_tilt_deg",
         type=float,
-        default=20.0,
-        help="Maximum absolute tilt sampled for --obstacle-init, in degrees.",
+        default=30.0,
+        help="Maximum absolute tilt sampled for --insertion-init, in degrees.",
     )
     parser.add_argument(
-        "--obstacle-init-axis-threshold",
+        "--insertion-init-axis-threshold",
         type=float,
         default=10.0,
-        help="Obstacle-init success threshold for block distance to the goal along the sampled tilted axis.",
+        dest="insertion_init_axis_threshold",
+        help="Insertion-init success threshold for block distance to the goal along the sampled tilted axis.",
     )
     parser.add_argument(
-        "--obstacle-init-pusher-face-offset",
+        "--insertion-init-pusher-face-offset",
         type=float,
         default=15.0,
-        help="Distance from the T top face center to the pusher center for --obstacle-init.",
+        dest="insertion_init_pusher_face_offset",
+        help="Distance from the T top face center to the pusher center for --insertion-init.",
     )
     parser.add_argument(
-        "--obstacle-visual-buffer",
+        "--insertion-pusher-top-edge-margin",
+        type=float,
+        default=5.0,
+        dest="insertion_pusher_top_edge_margin",
+        help="Failure margin for insertion modes when the pusher crosses below the T cap top edge.",
+    )
+    parser.add_argument(
+        "--insertion-pusher-top-edge-fail-steps",
+        type=int,
+        default=5,
+        dest="insertion_pusher_top_edge_fail_steps",
+        help="Consecutive env steps below the T cap top edge before insertion modes terminate as failure.",
+    )
+    parser.add_argument(
+        "--insertion-visual-buffer",
         type=float,
         default=12.0,
-        help="Pixel gap between the visual-only orange obstacle and the goal T insertion slot.",
+        dest="insertion_visual_buffer",
+        help="Pixel gap between the visual-only orange insertion guide and the goal T insertion slot.",
     )
     parser.add_argument(
-        "--obstacle-visual-thickness",
+        "--insertion-visual-thickness",
         type=float,
         default=80.0,
-        help="Pixel thickness of the visual-only orange obstacle walls.",
+        dest="insertion_visual_thickness",
+        help="Pixel thickness of the visual-only orange insertion guide walls.",
     )
     parser.add_argument(
         "--control-interval",
@@ -128,19 +154,19 @@ def resolve_mode(args: argparse.Namespace) -> str:
     mode = str(args.mode)
     if args.edge_sample is not None:
         mode = "edge" if args.edge_sample else "normal"
-    if args.obstacle_init and mode != "noised_obstacle":
-        mode = "obstacle"
-    elif args.obstacle_init is False and _is_obstacle_mode(mode):
+    if args.insertion_init and mode != "noised_insertion":
+        mode = "insertion"
+    elif args.insertion_init is False and _is_insertion_mode(mode):
         mode = "normal"
     return mode
 
 
-def _is_obstacle_mode(mode: str) -> bool:
-    return mode in {"obstacle", "noised_obstacle"}
+def _is_insertion_mode(mode: str) -> bool:
+    return mode in {"insertion", "noised_insertion"}
 
 
 def _uses_noised_expert(args: argparse.Namespace, mode: str) -> bool:
-    return bool(args.control_noise or mode == "noised_obstacle")
+    return bool(args.control_noise or mode == "noised_insertion")
 
 
 def maybe_display(frame: np.ndarray, enabled: bool) -> None:
@@ -208,7 +234,7 @@ def _local_rect_to_frame_polygon(
     return [(float(x), float(y)) for x, y in pixels]
 
 
-def _obstacle_visual_rects(*, buffer: float, thickness: float) -> list[tuple[float, float, float, float]]:
+def _insertion_visual_rects(*, buffer: float, thickness: float) -> list[tuple[float, float, float, float]]:
     buffer = float(buffer)
     thickness = float(thickness)
     stem_xmin = -0.5 * PUSHT_TEE_SCALE
@@ -231,7 +257,7 @@ def _obstacle_visual_rects(*, buffer: float, thickness: float) -> list[tuple[flo
     ]
 
 
-def render_obstacle_frame(
+def render_insertion_frame(
     frame: np.ndarray,
     goal_pose: np.ndarray | None,
     *,
@@ -244,9 +270,9 @@ def render_obstacle_frame(
     image = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGBA")
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    for rect in _obstacle_visual_rects(buffer=buffer, thickness=thickness):
+    for rect in _insertion_visual_rects(buffer=buffer, thickness=thickness):
         polygon = _local_rect_to_frame_polygon(np.asarray(goal_pose, dtype=np.float64), rect, frame.shape)
-        draw.polygon(polygon, fill=OBSTACLE_COLOR_RGBA)
+        draw.polygon(polygon, fill=INSERTION_COLOR_RGBA)
     return np.asarray(Image.alpha_composite(image, overlay).convert("RGB"), dtype=np.uint8)
 
 
@@ -322,7 +348,7 @@ def _edge_sample_observation(
     )
 
 
-def _obstacle_init_observation(
+def _insertion_init_observation(
     env: Any,
     observation: dict[str, Any],
     *,
@@ -332,10 +358,10 @@ def _obstacle_init_observation(
     rng: np.random.Generator,
 ) -> tuple[dict[str, Any], np.ndarray, np.ndarray, float]:
     if not isinstance(observation, dict):
-        raise ValueError("--mode obstacle requires dict observations containing agent position fields.")
+        raise ValueError("--mode insertion requires dict observations containing agent position fields.")
 
     tilt_deg = float(rng.uniform(-max_tilt_deg, max_tilt_deg))
-    pixels, state = reset_pusht_env_to_obstacle_init(
+    pixels, state = reset_pusht_env_to_insertion_init(
         env,
         block_offset=block_offset,
         tilt_deg=tilt_deg,
@@ -346,19 +372,27 @@ def _obstacle_init_observation(
     return _refresh_observation(observation, pixels=pixels, agent_pos=agent_pos), agent_pos, block_pose, tilt_deg
 
 
-def _obstacle_init_axis(block_theta: float) -> np.ndarray:
+def _insertion_init_axis(block_theta: float) -> np.ndarray:
     return np.asarray([-np.sin(block_theta), np.cos(block_theta)], dtype=np.float64)
 
 
-def obstacle_init_axis_distance(block_pose: np.ndarray, goal_pose: np.ndarray, axis: np.ndarray) -> float:
+def insertion_init_axis_distance(block_pose: np.ndarray, goal_pose: np.ndarray, axis: np.ndarray) -> float:
     block_xy = np.asarray(block_pose, dtype=np.float64).reshape(-1)[:2]
     goal_xy = np.asarray(goal_pose, dtype=np.float64).reshape(-1)[:2]
     axis = np.asarray(axis, dtype=np.float64)
     norm = float(np.linalg.norm(axis))
     if norm < 1e-9:
-        raise ValueError("obstacle-init axis must have nonzero norm.")
+        raise ValueError("insertion-init axis must have nonzero norm.")
     axis = axis / norm
     return abs(float(np.dot(block_xy - goal_xy, axis)))
+
+
+def pusher_local_y(block_pose: np.ndarray, agent_pos: np.ndarray) -> float:
+    block_pose = np.asarray(block_pose, dtype=np.float64).reshape(-1)
+    agent_pos = np.asarray(agent_pos, dtype=np.float64).reshape(-1)[:2]
+    rotation = _rotation_matrix(float(block_pose[2]))
+    local_xy = rotation.T @ (agent_pos - block_pose[:2])
+    return float(local_xy[1])
 
 
 def extract_goal_pose(env) -> list[float] | None:
@@ -379,18 +413,27 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
         raise ValueError("--control-noise-std must be >= 0.")
     if args.render_size < 1:
         raise ValueError("--render-size must be >= 1.")
-    if args.obstacle_init_block_offset < 0.0:
-        raise ValueError("--obstacle-init-block-offset must be >= 0.")
-    if args.obstacle_init_pusher_face_offset < 0.0:
-        raise ValueError("--obstacle-init-pusher-face-offset must be >= 0.")
-    if args.obstacle_init_max_tilt_deg < 0.0:
-        raise ValueError("--obstacle-init-max-tilt-deg must be >= 0.")
-    if args.obstacle_init_axis_threshold < 0.0:
-        raise ValueError("--obstacle-init-axis-threshold must be >= 0.")
-    if args.obstacle_visual_buffer < 0.0:
-        raise ValueError("--obstacle-visual-buffer must be >= 0.")
-    if args.obstacle_visual_thickness < 0.0:
-        raise ValueError("--obstacle-visual-thickness must be >= 0.")
+    insertion_init_block_offset_range = np.asarray(args.insertion_init_block_offset, dtype=np.float64).reshape(-1)
+    if insertion_init_block_offset_range.shape != (2,):
+        raise ValueError("--insertion-init-block-offset expects exactly two values: MIN MAX.")
+    if np.any(insertion_init_block_offset_range < 0.0):
+        raise ValueError("--insertion-init-block-offset values must be >= 0.")
+    if insertion_init_block_offset_range[1] < insertion_init_block_offset_range[0]:
+        raise ValueError("--insertion-init-block-offset MAX must be >= MIN.")
+    if args.insertion_init_pusher_face_offset < 0.0:
+        raise ValueError("--insertion-init-pusher-face-offset must be >= 0.")
+    if args.insertion_init_max_tilt_deg < 0.0:
+        raise ValueError("--insertion-init-max-tilt-deg must be >= 0.")
+    if args.insertion_init_axis_threshold < 0.0:
+        raise ValueError("--insertion-init-axis-threshold must be >= 0.")
+    if args.insertion_pusher_top_edge_margin < 0.0:
+        raise ValueError("--insertion-pusher-top-edge-margin must be >= 0.")
+    if args.insertion_pusher_top_edge_fail_steps < 1:
+        raise ValueError("--insertion-pusher-top-edge-fail-steps must be >= 1.")
+    if args.insertion_visual_buffer < 0.0:
+        raise ValueError("--insertion-visual-buffer must be >= 0.")
+    if args.insertion_visual_thickness < 0.0:
+        raise ValueError("--insertion-visual-thickness must be >= 0.")
 
     env = make_pusht_env(
         args.env_id,
@@ -404,25 +447,29 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     episode_seed = None if args.seed is None else args.seed + episode_idx
     observation, info = env.reset(seed=episode_seed)
     rng = np.random.default_rng(episode_seed)
-    obstacle_axis = None
-    obstacle_axis_distance = None
-    obstacle_init_sampled_tilt_deg = None
-    obstacle_init_horizontal_displacement = None
-    if _is_obstacle_mode(mode):
-        observation, initial_agent_pos, initial_block_pose, obstacle_init_sampled_tilt_deg = _obstacle_init_observation(
+    insertion_axis = None
+    insertion_axis_distance = None
+    insertion_init_sampled_tilt_deg = None
+    insertion_init_horizontal_displacement = None
+    insertion_init_sampled_block_offset = None
+    if _is_insertion_mode(mode):
+        insertion_init_sampled_block_offset = float(
+            rng.uniform(insertion_init_block_offset_range[0], insertion_init_block_offset_range[1])
+        )
+        observation, initial_agent_pos, initial_block_pose, insertion_init_sampled_tilt_deg = _insertion_init_observation(
             env,
             observation,
-            block_offset=args.obstacle_init_block_offset,
-            max_tilt_deg=args.obstacle_init_max_tilt_deg,
-            pusher_face_offset=args.obstacle_init_pusher_face_offset,
+            block_offset=insertion_init_sampled_block_offset,
+            max_tilt_deg=args.insertion_init_max_tilt_deg,
+            pusher_face_offset=args.insertion_init_pusher_face_offset,
             rng=rng,
         )
-        obstacle_init_horizontal_displacement = float(
-            args.obstacle_init_block_offset * np.tan(np.deg2rad(obstacle_init_sampled_tilt_deg))
+        insertion_init_horizontal_displacement = float(
+            insertion_init_sampled_block_offset * np.tan(np.deg2rad(insertion_init_sampled_tilt_deg))
         )
         goal_pose_np = np.asarray(extract_goal_pose(env), dtype=np.float32)
-        obstacle_axis = _obstacle_init_axis(float(initial_block_pose[2]))
-        obstacle_axis_distance = obstacle_init_axis_distance(initial_block_pose, goal_pose_np, obstacle_axis)
+        insertion_axis = _insertion_init_axis(float(initial_block_pose[2]))
+        insertion_axis_distance = insertion_init_axis_distance(initial_block_pose, goal_pose_np, insertion_axis)
     elif mode == "edge":
         observation, initial_agent_pos, initial_block_pose = _edge_sample_observation(
             env,
@@ -436,12 +483,12 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     goal_pose_for_render = extract_goal_pose(env)
     initial_render_frame = render_frame(env)
     render_frames = [initial_render_frame]
-    obstacle_render_frames = [
-        render_obstacle_frame(
+    insertion_render_frames = [
+        render_insertion_frame(
             initial_render_frame,
             None if goal_pose_for_render is None else np.asarray(goal_pose_for_render, dtype=np.float32),
-            buffer=args.obstacle_visual_buffer,
-            thickness=args.obstacle_visual_thickness,
+            buffer=args.insertion_visual_buffer,
+            thickness=args.insertion_visual_thickness,
         )
     ]
     total_reward = 0.0
@@ -449,6 +496,11 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     steps = 0
     control_updates = 0
     action = None
+    stop_reason = "max_steps"
+    pusher_top_edge_violation_steps = 0
+    pusher_top_edge_margin = float(args.insertion_pusher_top_edge_margin)
+    pusher_top_edge_fail_steps = int(args.insertion_pusher_top_edge_fail_steps)
+    pusher_local_y_at_stop = None
 
     for step_idx in trange(args.max_steps, desc=f"episode {episode_idx}", unit="step"):
         if action is None or step_idx % args.control_interval == 0:
@@ -461,26 +513,47 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
         next_observation, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
         steps += 1
-        if _is_obstacle_mode(mode):
+        if _is_insertion_mode(mode):
             current_block_pose = get_pusht_block_pose(env)
+            current_agent_pos = get_pusht_agent_pos(env)
             goal_pose_np = np.asarray(extract_goal_pose(env), dtype=np.float32)
-            assert obstacle_axis is not None
-            obstacle_axis_distance = obstacle_init_axis_distance(current_block_pose, goal_pose_np, obstacle_axis)
-            success = bool(obstacle_axis_distance <= args.obstacle_init_axis_threshold)
-            stop_episode = success or truncated
+            assert insertion_axis is not None
+            insertion_axis_distance = insertion_init_axis_distance(current_block_pose, goal_pose_np, insertion_axis)
+            success = bool(insertion_axis_distance <= args.insertion_init_axis_threshold)
+            current_pusher_local_y = pusher_local_y(current_block_pose, current_agent_pos)
+            pusher_top_edge_violated = current_pusher_local_y > PUSHT_TEE_CAP_TOP_Y + pusher_top_edge_margin
+            if pusher_top_edge_violated:
+                pusher_top_edge_violation_steps += 1
+            else:
+                pusher_top_edge_violation_steps = 0
+            pusher_crossed_top_edge = pusher_top_edge_violation_steps >= pusher_top_edge_fail_steps
+            if success:
+                stop_reason = "success"
+            elif pusher_crossed_top_edge:
+                stop_reason = "pusher_crossed_top_edge"
+                pusher_local_y_at_stop = current_pusher_local_y
+            elif truncated:
+                stop_reason = "truncated"
+            stop_episode = success or pusher_crossed_top_edge or truncated
         else:
             success = bool(terminated or info.get("is_success", False) or info.get("success", False))
+            if success:
+                stop_reason = "success"
+            elif terminated:
+                stop_reason = "terminated"
+            elif truncated:
+                stop_reason = "truncated"
             stop_episode = bool(terminated or truncated)
 
         if steps % args.control_interval == 0 or stop_episode:
             frame = render_frame(env)
             render_frames.append(frame)
-            obstacle_render_frames.append(
-                render_obstacle_frame(
+            insertion_render_frames.append(
+                render_insertion_frame(
                     frame,
                     None if goal_pose_for_render is None else np.asarray(goal_pose_for_render, dtype=np.float32),
-                    buffer=args.obstacle_visual_buffer,
-                    thickness=args.obstacle_visual_thickness,
+                    buffer=args.insertion_visual_buffer,
+                    thickness=args.insertion_visual_thickness,
                 )
             )
             maybe_display(frame, args.display)
@@ -496,15 +569,15 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
     stored_steps = len(render_frames)
 
     video_path = None
-    obstacle_video_path = None
+    insertion_video_path = None
     if not args.no_video:
         suffix = "" if args.episodes == 1 else f"_episode_{episode_idx:03d}"
         video_path = args.out_dir / f"{Path(args.video_name).stem}{suffix}{Path(args.video_name).suffix}"
-        obstacle_video_path = (
-            args.out_dir / f"{Path(args.video_name).stem}_obstacle{suffix}{Path(args.video_name).suffix}"
+        insertion_video_path = (
+            args.out_dir / f"{Path(args.video_name).stem}_insertion{suffix}{Path(args.video_name).suffix}"
         )
         save_video(video_path, render_frames, max(1, int(args.fps)))
-        save_video(obstacle_video_path, obstacle_render_frames, max(1, int(args.fps)))
+        save_video(insertion_video_path, insertion_render_frames, max(1, int(args.fps)))
 
     return {
         "episode": episode_idx,
@@ -514,6 +587,7 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
         "control_updates": control_updates,
         "total_reward": total_reward,
         "success": success,
+        "stop_reason": stop_reason,
         "mode": mode,
         "control_noise": use_noised_expert,
         "control_noise_std": float(args.control_noise_std),
@@ -523,20 +597,25 @@ def rollout_episode(args: argparse.Namespace, bundle, episode_idx: int) -> dict[
         "final_block_pose": final_block_pose,
         "final_agent_pos": final_agent_pos,
         "edge_sample": mode == "edge",
-        "obstacle_init": _is_obstacle_mode(mode),
-        "noised_obstacle": mode == "noised_obstacle",
-        "obstacle_init_block_offset": float(args.obstacle_init_block_offset),
-        "obstacle_init_horizontal_displacement": obstacle_init_horizontal_displacement,
-        "obstacle_init_max_tilt_deg": float(args.obstacle_init_max_tilt_deg),
-        "obstacle_init_sampled_tilt_deg": obstacle_init_sampled_tilt_deg,
-        "obstacle_init_pusher_face_offset": float(args.obstacle_init_pusher_face_offset),
-        "obstacle_init_axis_threshold": float(args.obstacle_init_axis_threshold),
-        "obstacle_init_axis": obstacle_axis.astype(float).tolist() if obstacle_axis is not None else None,
-        "obstacle_init_axis_distance": float(obstacle_axis_distance) if obstacle_axis_distance is not None else None,
-        "obstacle_visual_buffer": float(args.obstacle_visual_buffer),
-        "obstacle_visual_thickness": float(args.obstacle_visual_thickness),
+        "insertion_init": _is_insertion_mode(mode),
+        "noised_insertion": mode == "noised_insertion",
+        "insertion_init_block_offset": insertion_init_sampled_block_offset,
+        "insertion_init_block_offset_range": insertion_init_block_offset_range.astype(float).tolist(),
+        "insertion_init_horizontal_displacement": insertion_init_horizontal_displacement,
+        "insertion_init_max_tilt_deg": float(args.insertion_init_max_tilt_deg),
+        "insertion_init_sampled_tilt_deg": insertion_init_sampled_tilt_deg,
+        "insertion_init_pusher_face_offset": float(args.insertion_init_pusher_face_offset),
+        "insertion_init_axis_threshold": float(args.insertion_init_axis_threshold),
+        "insertion_init_axis": insertion_axis.astype(float).tolist() if insertion_axis is not None else None,
+        "insertion_init_axis_distance": float(insertion_axis_distance) if insertion_axis_distance is not None else None,
+        "insertion_pusher_top_edge_margin": pusher_top_edge_margin,
+        "insertion_pusher_top_edge_fail_steps": pusher_top_edge_fail_steps,
+        "insertion_pusher_top_edge_violation_steps": pusher_top_edge_violation_steps,
+        "insertion_pusher_local_y_at_stop": pusher_local_y_at_stop,
+        "insertion_visual_buffer": float(args.insertion_visual_buffer),
+        "insertion_visual_thickness": float(args.insertion_visual_thickness),
         "video_path": str(video_path) if video_path is not None else None,
-        "obstacle_video_path": str(obstacle_video_path) if obstacle_video_path is not None else None,
+        "insertion_video_path": str(insertion_video_path) if insertion_video_path is not None else None,
     }
 
 
@@ -557,7 +636,8 @@ def main() -> None:
             f"episode={result['episode']} stored_steps={result['stored_steps']} "
             f"env_steps={result['env_steps']} control_updates={result['control_updates']} "
             f"reward={result['total_reward']:.3f} "
-            f"success={result['success']} video={result['video_path']} obstacle_video={result['obstacle_video_path']}"
+            f"success={result['success']} stop_reason={result['stop_reason']} "
+            f"video={result['video_path']} insertion_video={result['insertion_video_path']}"
         )
     print(f"Saved metrics to {metrics_path}")
 
