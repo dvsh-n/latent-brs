@@ -1,0 +1,1034 @@
+diff --git a/scripts/train/config/prejepa.yaml b/scripts/train/config/prejepa.yaml
+index c5c7d73..4021a3d 100644
+--- a/scripts/train/config/prejepa.yaml
++++ b/scripts/train/config/prejepa.yaml
+@@ -9,6 +9,7 @@ hydra:
+ # --- Run ---
+ output_model_name: pusht_${backbone.type}_p${predictor.size}
+ subdir: null
++resume_ckpt_path: null
+ seed: 42
+ 
+ # --- Data ---
+@@ -16,9 +17,13 @@ dataset_name: pusht_expert_train_video
+ cache_dir: null
+ n_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+ frameskip: 5
++sample_stride: 1
+ 
+ batch_size: 32
+ num_workers: 16
++prefetch_factor: 2
++persistent_workers: true
++pin_memory: true
+ train_split: 0.9
+ 
+ # --- Backbone ---
+diff --git a/scripts/train/prejepa.py b/scripts/train/prejepa.py
+index 6dbc4cd..f7b6e8c 100644
+--- a/scripts/train/prejepa.py
++++ b/scripts/train/prejepa.py
+@@ -237,6 +237,7 @@ def run(cfg):
+         cfg.dataset_name,
+         num_steps=cfg.n_steps,
+         frameskip=cfg.frameskip,
++        sample_stride=cfg.get('sample_stride', 1),
+         transform=None,
+         cache_dir=cfg.get('cache_dir', None),
+         keys_to_load=keys_to_load,
+@@ -286,8 +287,12 @@ def run(cfg):
+         batch_size=cfg.batch_size,
+         num_workers=cfg.num_workers,
+         drop_last=True,
+-        persistent_workers=True,
+-        pin_memory=True,
++        persistent_workers=cfg.num_workers > 0
++        and cfg.get('persistent_workers', True),
++        pin_memory=cfg.get('pin_memory', True),
++        prefetch_factor=cfg.get('prefetch_factor', 2)
++        if cfg.num_workers > 0
++        else None,
+         shuffle=True,
+         generator=rnd_gen,
+     )
+@@ -295,7 +300,12 @@ def run(cfg):
+         val_set,
+         batch_size=cfg.batch_size,
+         num_workers=cfg.num_workers,
+-        pin_memory=True,
++        persistent_workers=cfg.num_workers > 0
++        and cfg.get('persistent_workers', True),
++        pin_memory=cfg.get('pin_memory', True),
++        prefetch_factor=cfg.get('prefetch_factor', 2)
++        if cfg.num_workers > 0
++        else None,
+     )
+ 
+     # --- Model ---
+@@ -385,7 +395,8 @@ def run(cfg):
+         trainer=trainer,
+         module=world_model,
+         data=spt.data.DataModule(train=train_loader, val=val_loader),
+-        ckpt_path=run_dir / f'{cfg.output_model_name}_weights.ckpt',
++        ckpt_path=cfg.get('resume_ckpt_path')
++        or run_dir / f'{cfg.output_model_name}_weights.ckpt',
+     )
+     manager()
+ 
+diff --git a/stable_worldmodel/data/dataset.py b/stable_worldmodel/data/dataset.py
+index 60ce27f..0300880 100644
+--- a/stable_worldmodel/data/dataset.py
++++ b/stable_worldmodel/data/dataset.py
+@@ -34,18 +34,22 @@ class Dataset:
+         frameskip: int = 1,
+         num_steps: int = 1,
+         transform: Callable[[dict], dict] | None = None,
++        sample_stride: int = 1,
+     ) -> None:
+         self.lengths = lengths
+         self.offsets = offsets
+-        self.frameskip = frameskip
+-        self.num_steps = num_steps
+-        self.span = num_steps * frameskip
++        self.frameskip = int(frameskip)
++        self.num_steps = int(num_steps)
++        self.sample_stride = int(sample_stride)
++        if self.sample_stride < 1:
++            raise ValueError('sample_stride must be positive.')
++        self.span = self.num_steps * self.frameskip
+         self.transform = transform
+         self.clip_indices = [
+             (ep, start)
+             for ep, length in enumerate(lengths)
+             if length >= self.span
+-            for start in range(length - self.span + 1)
++            for start in range(0, length - self.span + 1, self.sample_stride)
+         ]
+ 
+     @property
+@@ -121,6 +125,7 @@ class HDF5Dataset(Dataset):
+         name: str,
+         frameskip: int = 1,
+         num_steps: int = 1,
++        sample_stride: int = 1,
+         transform: Callable[[dict], dict] | None = None,
+         keys_to_load: list[str] | None = None,
+         keys_to_cache: list[str] | None = None,
+@@ -142,7 +147,14 @@ class HDF5Dataset(Dataset):
+                 self._cache[key] = f[key][:]
+                 logging.info(f"Cached '{key}' from '{self.h5_path}'")
+ 
+-        super().__init__(lengths, offsets, frameskip, num_steps, transform)
++        super().__init__(
++            lengths,
++            offsets,
++            frameskip,
++            num_steps,
++            transform,
++            sample_stride=sample_stride,
++        )
+ 
+         if keys_to_merge:
+             for target, source in keys_to_merge.items():
+diff --git a/stable_worldmodel/envs/pusht/__init__.py b/stable_worldmodel/envs/pusht/__init__.py
+index 997e0b1..0d9d809 100644
+--- a/stable_worldmodel/envs/pusht/__init__.py
++++ b/stable_worldmodel/envs/pusht/__init__.py
+@@ -1,6 +1,13 @@
+ from .env import PushT
+ from .env_discrete import PushTDiscrete
+-from .expert_policy import WeakPolicy
++from .diffusion_expert_policy import DiffusionExpertPolicy
++from .expert_policy import PushTExpertPolicy, WeakPolicy
+ 
+ 
+-__all__ = ["PushT", "PushTDiscrete", "WeakPolicy"]
++__all__ = [
++    "PushT",
++    "PushTDiscrete",
++    "DiffusionExpertPolicy",
++    "PushTExpertPolicy",
++    "WeakPolicy",
++]
+diff --git a/stable_worldmodel/envs/pusht/expert_policy.py b/stable_worldmodel/envs/pusht/expert_policy.py
+index ecf1622..01290d1 100644
+--- a/stable_worldmodel/envs/pusht/expert_policy.py
++++ b/stable_worldmodel/envs/pusht/expert_policy.py
+@@ -1,8 +1,112 @@
++import pickle
++
+ import numpy as np
+ 
+ from stable_worldmodel.policy import BasePolicy
+ 
+ 
++class SB3Normalizer:
++    """Normalizer using Stable Baselines3 VecNormalize statistics."""
++
++    def __init__(
++        self,
++        stats_path: str,
++        clip_obs: float = 10.0,
++        epsilon: float = 1e-8,
++    ):
++        with open(stats_path, 'rb') as f:
++            vec_normalize = pickle.load(f)
++
++        self.mean = vec_normalize.obs_rms.mean
++        self.var = vec_normalize.obs_rms.var
++        self.epsilon = epsilon
++        self.clip_obs = clip_obs
++
++    def __call__(self, obs: np.ndarray) -> np.ndarray:
++        norm_obs = (obs - self.mean) / np.sqrt(self.var + self.epsilon)
++        return np.clip(norm_obs, -self.clip_obs, self.clip_obs)
++
++
++class PushTExpertPolicy(BasePolicy):
++    """Goal-conditioned SAC expert policy for PushT.
++
++    Loads a Stable Baselines3 SAC checkpoint trained on the 14D
++    observation (7D state + 7D goal_state) produced by
++    ``stable_worldmodel.envs.pusht.sb3_wrapper.PushTSACWrapper``.
++    """
++
++    def __init__(
++        self,
++        ckpt_path: str,
++        vec_normalize_path: str,
++        noise_std: float = 0.0,
++        seed: int | None = None,
++        device: str = 'cpu',
++        **kwargs,
++    ):
++        """
++        Args:
++            ckpt_path: Path to the SB3 ``.zip`` policy checkpoint.
++            vec_normalize_path: Path to the ``.pkl`` VecNormalize stats.
++            noise_std: Std-dev of Gaussian noise added to actions for diversity.
++            seed: Random seed for action noise.
++            device: Device to load the model on.
++        """
++        super().__init__(**kwargs)
++
++        try:
++            import stable_baselines3 as sb3
++        except ImportError:
++            raise ImportError(
++                'stable_baselines3 is required to use PushTExpertPolicy. '
++                "Install it via 'pip install stable-baselines3'."
++            )
++
++        self.model = sb3.SAC.load(ckpt_path, device=device)
++        self.normalizer = SB3Normalizer(vec_normalize_path)
++        self.rng = np.random.default_rng(seed)
++        self.noise_std = noise_std
++        self.type = 'expert'
++
++        if seed is not None:
++            self.model.set_random_seed(seed)
++
++    def set_seed(self, seed: int | None) -> None:
++        self.seed = seed
++        self.rng = np.random.default_rng(seed)
++
++    def set_env(self, env):
++        self.env = env
++
++    def get_action(self, info_dict, **kwargs):
++        assert hasattr(self, 'env'), 'Environment not set for the policy'
++
++        # state: (num_envs, history, 7) — take the latest frame
++        state = info_dict['state']
++        if state.ndim == 3:
++            state = state[:, -1, :]
++        state = state.squeeze()
++        if state.ndim == 1:
++            state = state[None, :]
++
++        # goal_state: (num_envs, history, 7) or (num_envs, 7)
++        goal_state = info_dict['goal_state']
++        if goal_state.ndim == 3:
++            goal_state = goal_state[:, -1, :]
++        goal_state = goal_state.squeeze()
++        if goal_state.ndim == 1:
++            goal_state = goal_state[None, :]
++
++        obs = np.concatenate([state, goal_state], axis=-1).astype(np.float32)
++        normalized_obs = self.normalizer(obs)
++
++        actions, _ = self.model.predict(normalized_obs, deterministic=False)
++        if self.noise_std > 0:
++            noise = self.rng.normal(0, self.noise_std, size=actions.shape)
++            actions = actions + noise
++        return np.clip(actions, -1.0, 1.0).astype(np.float32)
++
++
+ class WeakPolicy(BasePolicy):
+     """Collection policy for PushT environment."""
+ 
+diff --git a/experiments/lewm-pusht/config.json b/experiments/lewm-pusht/config.json
+new file mode 100644
+index 0000000..2e534ee
+--- /dev/null
++++ b/experiments/lewm-pusht/config.json
+@@ -0,0 +1,49 @@
++{
++    "_target_": "stable_worldmodel.wm.lewm.LeWM",
++    "encoder": {
++        "_target_": "stable_pretraining.backbone.utils.vit_hf",
++        "size": "tiny",
++        "patch_size": 14,
++        "image_size": 224,
++        "pretrained": false,
++        "use_mask_token": false
++    },
++    "predictor": {
++        "_target_": "stable_worldmodel.wm.lewm.module.Predictor",
++        "num_frames": 3,
++        "input_dim": 192,
++        "hidden_dim": 192,
++        "output_dim": 192,
++        "depth": 6,
++        "heads": 16,
++        "mlp_dim": 2048,
++        "dim_head": 64,
++        "dropout": 0.1,
++        "emb_dropout": 0.0
++    },
++    "action_encoder": {
++        "_target_": "stable_worldmodel.wm.lewm.module.Embedder",
++        "input_dim": 10,
++        "emb_dim": 192
++    },
++    "projector": {
++        "_target_": "stable_worldmodel.wm.lewm.module.MLP",
++        "input_dim": 192,
++        "output_dim": 192,
++        "hidden_dim": 2048,
++        "norm_fn": {
++            "_target_": "torch.nn.BatchNorm1d",
++            "_partial_": true
++        }
++    },
++    "pred_proj": {
++        "_target_": "stable_worldmodel.wm.lewm.module.MLP",
++        "input_dim": 192,
++        "output_dim": 192,
++        "hidden_dim": 2048,
++        "norm_fn": {
++            "_target_": "torch.nn.BatchNorm1d",
++            "_partial_": true
++        }
++    }
++}
+diff --git a/experiments/lewm-pusht/README.md b/experiments/lewm-pusht/README.md
+new file mode 100644
+index 0000000..ff45e6f
+--- /dev/null
++++ b/experiments/lewm-pusht/README.md
+@@ -0,0 +1,7 @@
++---
++license: mit
++datasets:
++- quentinll/lewm-pusht
++---
++
++Official pretrained model for the PushT manipulation task used in [LeWorldModel](https://huggingface.co/papers/2603.19312).
+\ No newline at end of file
+diff --git a/scripts/expert/train_pusht.py b/scripts/expert/train_pusht.py
+new file mode 100644
+index 0000000..8761490
+--- /dev/null
++++ b/scripts/expert/train_pusht.py
+@@ -0,0 +1,114 @@
++"""Train a goal-conditioned SAC expert policy on PushT."""
++
++import argparse
++from pathlib import Path
++
++import gymnasium as gym
++import torch
++from loguru import logger
++from stable_baselines3 import SAC
++from stable_baselines3.common.callbacks import CheckpointCallback
++from stable_baselines3.common.monitor import Monitor
++from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
++
++import stable_worldmodel  # noqa: F401 — registers swm/* envs
++from stable_worldmodel.envs.pusht.sb3_wrapper import PushTSACWrapper
++
++
++def make_pusht_env(max_episode_steps: int = 200) -> gym.Env:
++    env = gym.make('swm/PushT-v1', max_episode_steps=max_episode_steps)
++    env = PushTSACWrapper(env)
++    return Monitor(env)
++
++
++def train(args: argparse.Namespace) -> None:
++    device = 'cuda' if torch.cuda.is_available() else 'cpu'
++    save_dir = Path(args.save_dir)
++    save_dir.mkdir(parents=True, exist_ok=True)
++
++    logger.info(f'Training PushT SAC expert | Steps: {args.total_timesteps}')
++    logger.info(f'Device: {device} | Save dir: {save_dir} | Workers: {args.num_workers}')
++
++    env_fns = [
++        lambda: make_pusht_env(args.max_episode_steps)
++        for _ in range(args.num_workers)
++    ]
++    if args.num_workers > 1:
++        vec_env = SubprocVecEnv(env_fns)
++    else:
++        vec_env = DummyVecEnv(env_fns)
++    vec_env = VecNormalize(
++        vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0,
++    )
++
++    model = SAC(
++        policy='MlpPolicy',
++        env=vec_env,
++        verbose=1,
++        learning_rate=3e-4,
++        buffer_size=1_000_000,
++        batch_size=args.batch_size,
++        learning_starts=args.learning_starts,
++        ent_coef='auto',
++        policy_kwargs={'net_arch': [512, 512, 512, 512]},
++        device=device,
++        seed=args.seed,
++    )
++
++    checkpoint_callback = CheckpointCallback(
++        save_freq=args.checkpoint_freq,
++        save_path=str(save_dir),
++        name_prefix='sac_pusht',
++    )
++
++    try:
++        model.learn(
++            total_timesteps=args.total_timesteps,
++            callback=checkpoint_callback,
++            progress_bar=True,
++            log_interval=30,
++        )
++        model.save(save_dir / 'expert_policy')
++        vec_env.save(str(save_dir / 'vec_normalize.pkl'))
++        logger.success(f'Training complete. Saved to {save_dir}')
++    except Exception as e:
++        logger.error(f'Training failed: {e}')
++        raise
++    finally:
++        vec_env.close()
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        '--save-dir', type=str, default='./models/sac_pusht',
++        help='Directory to save the trained policy and normalization stats.',
++    )
++    parser.add_argument(
++        '--total-timesteps', type=int, default=5_000_000,
++        help='Total environment steps for training.',
++    )
++    parser.add_argument(
++        '--max-episode-steps', type=int, default=200,
++        help='Max steps per episode in the training env.',
++    )
++    parser.add_argument('--batch-size', type=int, default=4096)
++    parser.add_argument('--learning-starts', type=int, default=10_000)
++    parser.add_argument(
++        '--checkpoint-freq', type=int, default=100_000,
++        help='Save a checkpoint every N environment steps.',
++    )
++    parser.add_argument(
++        '--num-workers', type=int, default=16,
++        help='Number of parallel env workers for data collection.',
++    )
++    parser.add_argument('--seed', type=int, default=0)
++    args = parser.parse_args()
++
++    train(args)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/expert/viz_diffusion_pusht_expert.py b/scripts/expert/viz_diffusion_pusht_expert.py
+new file mode 100644
+index 0000000..7f276eb
+--- /dev/null
++++ b/scripts/expert/viz_diffusion_pusht_expert.py
+@@ -0,0 +1,203 @@
++"""Visualize a trained PushT diffusion expert: roll out episodes, save videos, and print metrics."""
++
++import argparse
++import json
++from pathlib import Path
++
++import gymnasium as gym
++import numpy as np
++import torch
++from loguru import logger
++from PIL import Image
++
++import stable_worldmodel
++
++_ACTION_SCALE = 100.0
++_POLICY_IMAGE_SIZE = 96
++
++# Fixed goal matching the lerobot/pusht training data:
++# block at center (256, 256) with angle pi/4.
++# Format: [agent_x, agent_y, block_x, block_y, block_angle, vel_x, vel_y]
++_FIXED_GOAL_STATE = np.array([256.0, 400.0, 256.0, 256.0, np.pi / 4, 0.0, 0.0])
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        '--model-dir', type=str, default='pusht/models/pusht_diffusion_expert',
++        help='Path to the saved diffusion policy bundle directory.',
++    )
++    parser.add_argument('--episodes', type=int, default=20)
++    parser.add_argument('--max-steps', type=int, default=200)
++    parser.add_argument('--output-dir', type=Path, default=Path('./runs/viz_diffusion_pusht_expert'))
++    parser.add_argument('--seed', type=int, default=1000)
++    parser.add_argument('--fps', type=int, default=10)
++    parser.add_argument('--no-video', action='store_true', help='Skip saving MP4 videos.')
++    parser.add_argument('--device', default='auto', choices=['cpu', 'cuda', 'auto'])
++    return parser.parse_args()
++
++
++def resolve_device(device: str) -> torch.device:
++    if device != 'auto':
++        return torch.device(device)
++    if torch.cuda.is_available():
++        return torch.device('cuda')
++    return torch.device('cpu')
++
++
++def load_bundle(model_dir: str, device: torch.device):
++    from pusht.shared.native_diffusion_policy import (
++        load_native_diffusion_policy_bundle,
++    )
++
++    return load_native_diffusion_policy_bundle(Path(model_dir), device)
++
++
++def save_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
++    import imageio
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    writer = imageio.get_writer(str(path), fps=fps, codec='libx264')
++    for frame in frames:
++        writer.append_data(frame)
++    writer.close()
++
++
++def _resize_hwc(image: np.ndarray, size: int) -> np.ndarray:
++    if image.shape[0] == size and image.shape[1] == size:
++        return image
++    pil = Image.fromarray(image)
++    pil = pil.resize((size, size), Image.Resampling.BILINEAR)
++    return np.asarray(pil, dtype=np.uint8)
++
++
++def rollout_episode(
++    policy,
++    preprocessor,
++    postprocessor,
++    device: torch.device,
++    episode_idx: int,
++    seed: int,
++    max_steps: int,
++) -> dict:
++    env = gym.make('swm/PushT-v1', max_episode_steps=max_steps, render_mode='rgb_array')
++    obs, info = env.reset(seed=seed + episode_idx, options={'goal_state': _FIXED_GOAL_STATE})
++    policy.reset()
++
++    frames = [env.render()]
++    total_reward = 0.0
++    success = False
++    steps = 0
++
++    for _ in range(max_steps):
++        # Build the observation batch for the diffusion policy.
++        pixels = env.render()
++        pixels = _resize_hwc(pixels, _POLICY_IMAGE_SIZE)
++        image_t = (
++            torch.from_numpy(pixels)
++            .permute(2, 0, 1)
++            .contiguous()
++            .float()
++            .div_(255.0)
++            .unsqueeze(0)
++        )
++
++        agent_pos = np.asarray(info['pos_agent'], dtype=np.float32)
++        state_t = torch.from_numpy(agent_pos).unsqueeze(0)
++
++        batch = {
++            'observation.image': image_t,
++            'observation.state': state_t,
++        }
++        batch = preprocessor(batch)
++
++        with torch.no_grad():
++            action_t = policy.select_action(batch)
++        action_abs = postprocessor(action_t)
++        if isinstance(action_abs, torch.Tensor):
++            action_abs = action_abs.detach().cpu().numpy()
++        action_abs = action_abs.reshape(-1)[:2]
++
++        rel_action = np.clip(
++            (action_abs - agent_pos) / _ACTION_SCALE, -1.0, 1.0,
++        ).astype(np.float32)
++
++        obs, reward, terminated, truncated, info = env.step(rel_action)
++        total_reward += float(reward)
++        steps += 1
++        frames.append(env.render())
++
++        if terminated:
++            success = True
++            break
++        if truncated:
++            break
++
++    env.close()
++    return {
++        'episode': episode_idx,
++        'seed': seed + episode_idx,
++        'steps': steps,
++        'total_reward': total_reward,
++        'success': success,
++        'frames': frames,
++    }
++
++
++def main() -> None:
++    args = parse_args()
++    args.output_dir.mkdir(parents=True, exist_ok=True)
++    device = resolve_device(args.device)
++
++    logger.info(f'Loading diffusion expert from: {args.model_dir}')
++    policy, preprocessor, postprocessor = load_bundle(args.model_dir, device)
++
++    results = []
++    for ep in range(args.episodes):
++        result = rollout_episode(
++            policy, preprocessor, postprocessor, device,
++            ep, args.seed, args.max_steps,
++        )
++
++        if not args.no_video:
++            video_path = args.output_dir / f'episode_{ep:03d}.mp4'
++            save_video(video_path, result.pop('frames'), args.fps)
++            result['video_path'] = str(video_path)
++        else:
++            result.pop('frames')
++            result['video_path'] = None
++
++        results.append(result)
++        status = 'SUCCESS' if result['success'] else 'FAIL'
++        logger.info(
++            f"[{status}] episode={ep:3d}  steps={result['steps']:3d}  "
++            f"reward={result['total_reward']:.1f}"
++        )
++
++    successes = sum(r['success'] for r in results)
++    rewards = [r['total_reward'] for r in results]
++    lengths = [r['steps'] for r in results]
++
++    logger.info('--- Summary ---')
++    logger.info(f'Success rate:        {successes}/{args.episodes} ({100 * successes / args.episodes:.1f}%)')
++    logger.info(f'Mean reward:         {np.mean(rewards):.1f} +/- {np.std(rewards):.1f}')
++    logger.info(f'Mean episode length: {np.mean(lengths):.1f} +/- {np.std(lengths):.1f}')
++
++    metrics_path = args.output_dir / 'metrics.json'
++    serializable = list(results)
++    serializable.append({
++        'summary': {
++            'success_rate': successes / args.episodes,
++            'mean_reward': float(np.mean(rewards)),
++            'std_reward': float(np.std(rewards)),
++            'mean_length': float(np.mean(lengths)),
++            'std_length': float(np.std(lengths)),
++        }
++    })
++    with open(metrics_path, 'w') as f:
++        json.dump(serializable, f, indent=2)
++    logger.info(f'Metrics saved to {metrics_path}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/expert/viz_pusht_expert.py b/scripts/expert/viz_pusht_expert.py
+new file mode 100644
+index 0000000..bae33ba
+--- /dev/null
++++ b/scripts/expert/viz_pusht_expert.py
+@@ -0,0 +1,156 @@
++"""Visualize a trained PushT SAC expert: roll out episodes, save videos, and print metrics."""
++
++import argparse
++import json
++from pathlib import Path
++
++import gymnasium as gym
++import numpy as np
++from loguru import logger
++
++import stable_worldmodel  # noqa: F401 — registers swm/* envs
++from stable_worldmodel.envs.pusht.sb3_wrapper import PushTSACWrapper
++from stable_worldmodel.envs.pusht.expert_policy import SB3Normalizer
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        '--ckpt-path', type=str, default='./models/sac_pusht/expert_policy.zip',
++        help='Path to the SB3 SAC .zip checkpoint.',
++    )
++    parser.add_argument(
++        '--vec-normalize-path', type=str, default='./models/sac_pusht/vec_normalize.pkl',
++        help='Path to the VecNormalize .pkl stats.',
++    )
++    parser.add_argument('--episodes', type=int, default=20)
++    parser.add_argument('--max-steps', type=int, default=200)
++    parser.add_argument('--output-dir', type=Path, default=Path('./runs/viz_pusht_expert'))
++    parser.add_argument('--seed', type=int, default=1000)
++    parser.add_argument('--fps', type=int, default=10)
++    parser.add_argument('--no-video', action='store_true', help='Skip saving MP4 videos.')
++    parser.add_argument('--device', default='cpu', choices=['cpu', 'cuda', 'auto'])
++    return parser.parse_args()
++
++
++def load_sac_policy(ckpt_path: str, vec_normalize_path: str, device: str):
++    import stable_baselines3 as sb3
++
++    if device == 'auto':
++        import torch
++        device = 'cuda' if torch.cuda.is_available() else 'cpu'
++
++    model = sb3.SAC.load(ckpt_path, device=device)
++    normalizer = SB3Normalizer(vec_normalize_path)
++    return model, normalizer
++
++
++def save_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
++    import imageio
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    writer = imageio.get_writer(str(path), fps=fps, codec='libx264')
++    for frame in frames:
++        writer.append_data(frame)
++    writer.close()
++
++
++def rollout_episode(
++    model,
++    normalizer: SB3Normalizer,
++    episode_idx: int,
++    seed: int,
++    max_steps: int,
++) -> dict:
++    env = gym.make('swm/PushT-v1', max_episode_steps=max_steps, render_mode='rgb_array')
++    sb3_env = PushTSACWrapper(env)
++
++    obs, info = sb3_env.reset(seed=seed + episode_idx)
++    frames = [env.render()]
++
++    total_reward = 0.0
++    success = False
++    steps = 0
++
++    for _ in range(max_steps):
++        normalized_obs = normalizer(obs[None, :]).astype(np.float32)
++        action, _ = model.predict(normalized_obs, deterministic=True)
++        action = action.squeeze()
++
++        obs, reward, terminated, truncated, info = sb3_env.step(action)
++        total_reward += float(reward)
++        steps += 1
++
++        frames.append(env.render())
++
++        if terminated:
++            success = True
++            break
++        if truncated:
++            break
++
++    env.close()
++    return {
++        'episode': episode_idx,
++        'seed': seed + episode_idx,
++        'steps': steps,
++        'total_reward': total_reward,
++        'success': success,
++        'frames': frames,
++    }
++
++
++def main() -> None:
++    args = parse_args()
++    args.output_dir.mkdir(parents=True, exist_ok=True)
++
++    logger.info(f'Loading SAC expert from: {args.ckpt_path}')
++    model, normalizer = load_sac_policy(args.ckpt_path, args.vec_normalize_path, args.device)
++
++    results = []
++    for ep in range(args.episodes):
++        result = rollout_episode(model, normalizer, ep, args.seed, args.max_steps)
++
++        if not args.no_video:
++            video_path = args.output_dir / f'episode_{ep:03d}.mp4'
++            save_video(video_path, result.pop('frames'), args.fps)
++            result['video_path'] = str(video_path)
++        else:
++            result.pop('frames')
++            result['video_path'] = None
++
++        results.append(result)
++        status = 'SUCCESS' if result['success'] else 'FAIL'
++        logger.info(
++            f"[{status}] episode={ep:3d}  steps={result['steps']:3d}  "
++            f"reward={result['total_reward']:.1f}"
++        )
++
++    # Summary
++    successes = sum(r['success'] for r in results)
++    rewards = [r['total_reward'] for r in results]
++    lengths = [r['steps'] for r in results]
++
++    logger.info('--- Summary ---')
++    logger.info(f'Success rate:       {successes}/{args.episodes} ({100 * successes / args.episodes:.1f}%)')
++    logger.info(f'Mean reward:        {np.mean(rewards):.1f} +/- {np.std(rewards):.1f}')
++    logger.info(f'Mean episode length: {np.mean(lengths):.1f} +/- {np.std(lengths):.1f}')
++
++    metrics_path = args.output_dir / 'metrics.json'
++    serializable = [{k: v for k, v in r.items()} for r in results]
++    serializable.append({
++        'summary': {
++            'success_rate': successes / args.episodes,
++            'mean_reward': float(np.mean(rewards)),
++            'std_reward': float(np.std(rewards)),
++            'mean_length': float(np.mean(lengths)),
++            'std_length': float(np.std(lengths)),
++        }
++    })
++    with open(metrics_path, 'w') as f:
++        json.dump(serializable, f, indent=2)
++    logger.info(f'Metrics saved to {metrics_path}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/stable_worldmodel/envs/pusht/diffusion_expert_policy.py b/stable_worldmodel/envs/pusht/diffusion_expert_policy.py
+new file mode 100644
+index 0000000..b6b6ff4
+--- /dev/null
++++ b/stable_worldmodel/envs/pusht/diffusion_expert_policy.py
+@@ -0,0 +1,160 @@
++"""Diffusion Policy expert for PushT data collection via stable-worldmodel."""
++
++from __future__ import annotations
++
++import copy
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import torch
++from PIL import Image
++
++from stable_worldmodel.policy import BasePolicy
++
++_ACTION_SCALE = 100.0
++_POLICY_IMAGE_SIZE = 96
++
++
++def _load_bundle(model_dir: str | Path, device: torch.device):
++    from pusht.shared.native_diffusion_policy import (
++        load_native_diffusion_policy_bundle,
++    )
++
++    return load_native_diffusion_policy_bundle(Path(model_dir), device)
++
++
++def _resize_hwc_uint8(image: np.ndarray, size: int) -> np.ndarray:
++    """Resize an (H, W, 3) uint8 image to (size, size, 3)."""
++    if image.shape[0] == size and image.shape[1] == size:
++        return image
++    pil = Image.fromarray(image)
++    pil = pil.resize((size, size), Image.Resampling.BILINEAR)
++    return np.asarray(pil, dtype=np.uint8)
++
++
++class DiffusionExpertPolicy(BasePolicy):
++    """Wraps the native PushT diffusion expert for use with ``World.record_dataset``.
++
++    The diffusion policy produces **absolute** 2D position targets and uses
++    an internal action-chunk queue (``n_action_steps``).  This wrapper
++    translates between the SWM vectorised ``info_dict`` format and the native
++    policy's expected inputs/outputs.
++
++    Args:
++        model_dir: Path to the saved diffusion policy bundle (must contain
++            ``config.json``, ``model.safetensors``, and the pre/post-processor
++            ``.safetensors`` files).
++        device: Torch device string (``"cpu"``, ``"cuda"``, ``"auto"``).
++        noise_std: Optional Gaussian noise added to the *relative* actions
++            for trajectory diversity during collection.
++        seed: RNG seed for action noise.
++    """
++
++    def __init__(
++        self,
++        model_dir: str | Path = 'pusht/models/diffusion_pusht',
++        device: str = 'auto',
++        noise_std: float = 0.0,
++        seed: int | None = None,
++        **kwargs: Any,
++    ):
++        super().__init__(**kwargs)
++        self.type = 'diffusion_expert'
++
++        if device == 'auto':
++            device = 'cuda' if torch.cuda.is_available() else 'cpu'
++        self._device = torch.device(device)
++
++        policy, preprocessor, postprocessor = _load_bundle(model_dir, self._device)
++        self._policy_template = policy
++        self._preprocessor = preprocessor
++        self._postprocessor = postprocessor
++
++        self._policies: list = []
++        self._noise_std = noise_std
++        self._rng = np.random.default_rng(seed)
++        self.seed = seed
++
++    def set_seed(self, seed: int | None) -> None:
++        self.seed = seed
++        self._rng = np.random.default_rng(seed)
++
++    def set_env(self, env: Any) -> None:
++        self.env = env
++        n = getattr(env, 'num_envs', 1)
++        self._policies = []
++        for _ in range(n):
++            p = copy.deepcopy(self._policy_template)
++            p.eval()
++            self._policies.append(p)
++
++    # ------------------------------------------------------------------
++    # Action selection
++    # ------------------------------------------------------------------
++
++    def get_action(self, info_dict: dict, **kwargs: Any) -> np.ndarray:
++        assert hasattr(self, 'env'), 'Call set_env() before get_action()'
++
++        n_envs = len(self._policies)
++        act_shape = self.env.action_space.shape
++        actions_out = np.zeros(act_shape, dtype=np.float32)
++
++        # Extract per-env data from the vectorised info_dict.
++        pixels_all = info_dict['pixels']          # (n, [hist,] H, W, 3)
++        pos_agent_all = info_dict['pos_agent']    # (n, [hist,] 2)
++        step_idx_all = info_dict['step_idx']      # (n, [hist]) or (n,)
++
++        for i in range(n_envs):
++            # Detect episode boundary: step_idx == 0 means the env just reset.
++            si = step_idx_all[i]
++            current_step = int(si[-1]) if np.ndim(si) >= 1 else int(si)
++            if current_step == 0:
++                self._policies[i].reset()
++
++            # --- image: take last history frame, resize to 96x96, CHW float ---
++            pix = pixels_all[i]
++            if pix.ndim == 4:            # (hist, H, W, 3)
++                pix = pix[-1]
++            pix = _resize_hwc_uint8(pix, _POLICY_IMAGE_SIZE)
++            image_t = (
++                torch.from_numpy(pix)
++                .permute(2, 0, 1)
++                .contiguous()
++                .float()
++                .div_(255.0)
++                .unsqueeze(0)            # (1, 3, 96, 96)
++            )
++
++            # --- agent position (2,) ---
++            pa = pos_agent_all[i]
++            if np.ndim(pa) == 2:         # (hist, 2)
++                pa = pa[-1]
++            state_t = torch.from_numpy(np.asarray(pa, dtype=np.float32)).unsqueeze(0)  # (1, 2)
++
++            # --- preprocess & select ---
++            batch = {
++                'observation.image': image_t,
++                'observation.state': state_t,
++            }
++            batch = self._preprocessor(batch)
++            action_t = self._policies[i].select_action(batch)  # (1, 2)
++            action_abs = self._postprocessor(action_t)          # absolute position
++
++            if isinstance(action_abs, torch.Tensor):
++                action_abs = action_abs.detach().cpu().numpy()
++            action_abs = action_abs.reshape(-1)[:2]
++
++            # --- absolute -> relative action for swm/PushT-v1 ---
++            agent_pos = np.asarray(pa, dtype=np.float32)
++            rel_action = np.clip(
++                (action_abs - agent_pos) / _ACTION_SCALE, -1.0, 1.0,
++            ).astype(np.float32)
++
++            if self._noise_std > 0:
++                noise = self._rng.normal(0, self._noise_std, size=rel_action.shape)
++                rel_action = np.clip(rel_action + noise, -1.0, 1.0).astype(np.float32)
++
++            actions_out[i] = rel_action
++
++        return actions_out
+diff --git a/stable_worldmodel/envs/pusht/sb3_wrapper.py b/stable_worldmodel/envs/pusht/sb3_wrapper.py
+new file mode 100644
+index 0000000..a80b9d7
+--- /dev/null
++++ b/stable_worldmodel/envs/pusht/sb3_wrapper.py
+@@ -0,0 +1,33 @@
++"""Gymnasium wrapper that flattens PushT for Stable Baselines3 compatibility."""
++
++import gymnasium as gym
++import numpy as np
++from gymnasium import spaces
++
++
++class PushTSACWrapper(gym.Wrapper):
++    """Flattens the PushT dict observation into a goal-conditioned vector.
++
++    SB3 requires a flat Box observation space. This wrapper concatenates
++    the 7D state (agent_xy, block_xy, block_angle, agent_vel) with the
++    7D goal_state to produce a 14D observation.
++    """
++
++    def __init__(self, env: gym.Env):
++        super().__init__(env)
++        self.observation_space = spaces.Box(
++            low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32,
++        )
++
++    def _flatten_obs(self, obs: dict, info: dict) -> np.ndarray:
++        return np.concatenate(
++            [obs['state'], info['goal_state']]
++        ).astype(np.float32)
++
++    def reset(self, **kwargs):
++        obs, info = self.env.reset(**kwargs)
++        return self._flatten_obs(obs, info), info
++
++    def step(self, action):
++        obs, reward, terminated, truncated, info = self.env.step(action)
++        return self._flatten_obs(obs, info), reward, terminated, truncated, info

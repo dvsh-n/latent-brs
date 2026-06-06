@@ -1,0 +1,7 @@
+diff --git a/stable_pretraining/_version.py b/stable_pretraining/_version.py
+new file mode 100644
+index 00000000..e127d4df
+--- /dev/null
++++ b/stable_pretraining/_version.py
+@@ -0,0 +1 @@
++version = "0.1.7.dev29+g6a567ebd4"

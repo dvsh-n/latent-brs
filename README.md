@@ -86,3 +86,8 @@ After pulling parent-repository updates, synchronize submodules with:
 ```bash
 git submodule update --init --recursive
 ```
+
+Local third-party code changes are preserved as parent-repository patches
+instead of being pushed to upstream projects. See
+[`scripts/third_party/README.md`](scripts/third_party/README.md) for the
+push-protection and patch save/apply workflow.

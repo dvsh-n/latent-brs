@@ -1,3 +1,4 @@
 reacher/models/dinowm_noprop/*.ckpt filter=lfs diff=lfs merge=lfs -text
 rope/models/dinowm/*.ckpt filter=lfs diff=lfs merge=lfs -text
 ogbench/models/dinowm_noprop/*.ckpt filter=lfs diff=lfs merge=lfs -text
+third_party_patches/*.patch -whitespace

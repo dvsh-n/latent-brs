@@ -1,0 +1,1093 @@
+diff --git a/config/eval/cube.yaml b/config/eval/cube.yaml
+index 3ba34bf..2410121 100644
+--- a/config/eval/cube.yaml
++++ b/config/eval/cube.yaml
+@@ -57,5 +57,6 @@ eval:
+           value: goal_privileged_block_0_quat
+ 
+ output:
++  system: ogbench
++  dir: ${oc.env:STABLEWM_HOME}/eval_outputs
+   filename: ogb_cube_results.txt
+-
+diff --git a/config/eval/pusht.yaml b/config/eval/pusht.yaml
+index 6584ef0..26ddf25 100644
+--- a/config/eval/pusht.yaml
++++ b/config/eval/pusht.yaml
+@@ -45,4 +45,6 @@ eval:
+           value: goal_state
+           
+ output:
+-  filename: pusht_results.txt
+\ No newline at end of file
++  system: pusht
++  dir: ${oc.env:STABLEWM_HOME}/eval_outputs
++  filename: pusht_results.txt
+diff --git a/config/eval/reacher.yaml b/config/eval/reacher.yaml
+index d0c62dc..7e58baf 100644
+--- a/config/eval/reacher.yaml
++++ b/config/eval/reacher.yaml
+@@ -46,5 +46,6 @@ eval:
+           value: goal_qpos
+ 
+ output:
++  system: reacher
++  dir: ${oc.env:STABLEWM_HOME}/eval_outputs
+   filename: dmc_results.txt
+-
+diff --git a/config/eval/tworoom.yaml b/config/eval/tworoom.yaml
+index dd20571..7127191 100644
+--- a/config/eval/tworoom.yaml
++++ b/config/eval/tworoom.yaml
+@@ -44,4 +44,6 @@ eval:
+           value: goal_proprio
+ 
+ output:
+-  filename: tworoom_results.txt
+\ No newline at end of file
++  system: tworoom
++  dir: ${oc.env:STABLEWM_HOME}/eval_outputs
++  filename: tworoom_results.txt
+diff --git a/eval.py b/eval.py
+index 859afd1..a2651fc 100644
+--- a/eval.py
++++ b/eval.py
+@@ -1,4 +1,5 @@
+ import os
++import re
+ 
+ os.environ["MUJOCO_GL"] = "egl"
+ 
+@@ -39,13 +40,62 @@ def get_episodes_length(dataset, episodes):
+ 
+ def get_dataset(cfg, dataset_name):
+     dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
++    # Allow configs to restrict which columns are materialized. Needed when the
++    # source h5 mixes per-row and per-episode columns (get_row_data would
++    # otherwise try to index a per-episode array with a per-row index and fail).
++    keys_to_load = cfg.dataset.get("keys_to_load", None) if "dataset" in cfg else None
++    if keys_to_load is not None:
++        keys_to_load = list(keys_to_load)
+     dataset = swm.data.HDF5Dataset(
+         dataset_name,
+         keys_to_cache=cfg.dataset.keys_to_cache,
++        keys_to_load=keys_to_load,
+         cache_dir=dataset_path,
+     )
+     return dataset
+ 
++
++def _safe_path_part(value):
++    value = str(value)
++    value = value.replace(os.sep, "_")
++    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "run"
++
++
++def _infer_system_name(cfg):
++    if "output" in cfg and cfg.output.get("system") is not None:
++        return cfg.output.system
++
++    env_name = str(cfg.world.get("env_name", ""))
++    if "PushT" in env_name:
++        return "pusht"
++    if "TwoRoom" in env_name:
++        return "tworoom"
++    if "OGB" in env_name:
++        return "ogbench"
++    if "Reacher" in env_name:
++        return "reacher"
++
++    dataset_name = str(cfg.eval.get("dataset_name", "eval"))
++    return dataset_name.split("/", 1)[0]
++
++
++def get_results_dir(cfg):
++    output_dir = cfg.output.get("dir", None) if "output" in cfg else None
++    if output_dir is None:
++        output_dir = swm.data.utils.get_cache_dir() / "eval_outputs"
++    else:
++        output_dir = Path(os.path.expandvars(str(output_dir))).expanduser()
++
++    system_name = _safe_path_part(_infer_system_name(cfg))
++    solver_target = cfg.solver.get("_target_", "random") if cfg.policy != "random" else "random"
++    solver_name = solver_target.rsplit(".", 1)[-1]
++    run_name = (
++        f"{_safe_path_part(cfg.policy)}"
++        f"_{_safe_path_part(solver_name)}"
++        f"_seed{cfg.seed}"
++    )
++    return output_dir / system_name / run_name
++
+ @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
+ def run(cfg: DictConfig):
+     """Run evaluation of dinowm vs random policy."""
+@@ -55,7 +105,14 @@ def run(cfg: DictConfig):
+ 
+     # create world environment
+     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
+-    world = swm.World(**cfg.world, image_shape=(224, 224))
++    # Render at the native dataset resolution so replay-based init pixels and
++    # simulated pixels share a shape (video_frames is allocated from dataset
++    # pixels); the img_transform will downsample to img_size for the encoder.
++    world_image_size = int(cfg.world.get("image_size", 0) or 0)
++    if world_image_size <= 0:
++        world_image_size = int(cfg.eval.img_size)
++    world_kwargs = {k: v for k, v in cfg.world.items() if k != "image_size"}
++    world = swm.World(**world_kwargs, image_shape=(world_image_size, world_image_size))
+ 
+     # create the transform
+     transform = {
+@@ -99,11 +156,9 @@ def run(cfg: DictConfig):
+     else:
+         policy = swm.policy.RandomPolicy()
+ 
+-    results_path = (
+-        Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
+-        if cfg.policy != "random"
+-        else Path(__file__).parent
+-    )
++    results_path = get_results_dir(cfg)
++    results_path.mkdir(parents=True, exist_ok=True)
++    print(f"Saving videos and metrics to {results_path}")
+ 
+     # sample the episodes and the starting indices
+     episode_len = get_episodes_length(dataset, ep_indices)
+diff --git a/jepa.py b/jepa.py
+index 486fe93..78bbfb8 100644
+--- a/jepa.py
++++ b/jepa.py
+@@ -5,6 +5,9 @@ import torch.nn.functional as F
+ from einops import rearrange
+ from torch import nn
+ 
++from module import VelocityPredictor
++
++
+ def detach_clone(v):
+     return v.detach().clone() if torch.is_tensor(v) else v
+ 
+@@ -44,16 +47,50 @@ class JEPA(nn.Module):
+ 
+         return info
+ 
++    @property
++    def _is_velocity_predictor(self) -> bool:
++        return isinstance(self.predictor, VelocityPredictor)
++
+     def predict(self, emb, act_emb):
+-        """Predict next state embedding
+-        emb: (B, T, D)
+-        act_emb: (B, T, A_emb)
++        """Predict next state embedding.
++
++        For AR predictors: emb (B, T, D), act_emb (B, T, A_emb) -> (B, T, D).
++
++        For VelocityPredictor: emb (B, T, D) with T >= 1, act_emb (B, T, A_emb).
++        We build the augmented state from the last two frames of emb, predict a
++        single next latent, and return the full (B, T, D) sequence with the
++        last slot replaced by the prediction. Callers that only need the final
++        step (e.g. the AR rollout at jepa.py:93-95) slice [:, -1:] anyway.
+         """
++        if self._is_velocity_predictor:
++            d = emb.size(-1)
++            if emb.size(1) >= 2:
++                z_prev = emb[:, -2]
++            else:
++                z_prev = emb[:, -1]
++            z_cur = emb[:, -1]
++            aug = torch.cat([z_cur, z_cur - z_prev], dim=-1)
++            act = act_emb[:, -1]
++            pred_aug = self.predict_velocity(aug, act)
++            z_next = pred_aug[..., :d]
++            out = emb.clone()
++            out[:, -1] = z_next
++            return out
++
+         preds = self.predictor(emb, act_emb)
+         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
+         preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
+         return preds
+ 
++    def predict_velocity(self, aug_state, act_emb):
++        """Single-step prediction for the velocity-augmented predictor.
++
++        aug_state: (B, 2*D)   [z_t, z_t - z_{t-1}]
++        act_emb:   (B, D)     action embedding
++        returns:   (B, 2*D)   [z_{t+1}, z_{t+1} - z_t]
++        """
++        return self.predictor(aug_state, act_emb)
++
+     ####################
+     ## Inference only ##
+     ####################
+@@ -84,42 +121,93 @@ class JEPA(nn.Module):
+         act = rearrange(act_0, "b s ... -> (b s) ...")
+         act_future = rearrange(act_future, "b s ... -> (b s) ...")
+ 
+-        # rollout predictor autoregressively for n_steps
++        if self._is_velocity_predictor:
++            emb = self._rollout_velocity(emb, act_future, n_steps)
++        else:
++            emb = self._rollout_ar(emb, act, act_future, n_steps, history_size)
++
++        # unflatten batch and sample dimensions
++        pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
++        info["predicted_emb"] = pred_rollout
++
++        return info
++
++    def _rollout_ar(self, emb, act, act_future, n_steps, history_size):
+         HS = history_size
+         for t in range(n_steps):
+             act_emb = self.action_encoder(act)
+-            emb_trunc = emb[:, -HS:]  # (BS, HS, D)
+-            act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
+-            pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
+-            emb = torch.cat([emb, pred_emb], dim=1)  # (BS, T+1, D)
++            emb_trunc = emb[:, -HS:]
++            act_trunc = act_emb[:, -HS:]
++            pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]
++            emb = torch.cat([emb, pred_emb], dim=1)
+ 
+-            next_act = act_future[:, t : t + 1, :]  # (BS, 1, action_dim)
+-            act = torch.cat([act, next_act], dim=1)  # (BS, T+1, action_dim)
++            next_act = act_future[:, t : t + 1, :]
++            act = torch.cat([act, next_act], dim=1)
+ 
+         # predict the last state
+-        act_emb = self.action_encoder(act)  # (BS, T, A_emb)
+-        emb_trunc = emb[:, -HS:]  # (BS, HS, D)
+-        act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
+-        pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
++        act_emb = self.action_encoder(act)
++        emb_trunc = emb[:, -HS:]
++        act_trunc = act_emb[:, -HS:]
++        pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]
+         emb = torch.cat([emb, pred_emb], dim=1)
++        return emb
+ 
+-        # unflatten batch and sample dimensions
+-        pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
+-        info["predicted_emb"] = pred_rollout
++    def _rollout_velocity(self, emb, act_future, n_steps):
++        """Single-step velocity rollout matching shared/models.py:474-506.
+ 
+-        return info
++        We warm-start from the encoded context (the initial info["emb"]), seed
++        velocity as zero if only one context frame is available, then iterate
++        the VelocityPredictor n_steps + 1 times (same count as the AR branch
++        above, which does n_steps inside the loop plus one final step).
++        """
++        d = emb.size(-1)
++        if emb.size(1) >= 2:
++            z_prev = emb[:, -2]
++        else:
++            z_prev = emb[:, -1]
++        z_cur = emb[:, -1]
++        vel = z_cur - z_prev
++        aug = torch.cat([z_cur, vel], dim=-1)
++
++        for step in range(n_steps + 1):
++            if step < n_steps:
++                cur_act = act_future[:, step : step + 1, :]
++            else:
++                cur_act = act_future[:, -1:, :]
++
++            act_emb = self.action_encoder(cur_act)[:, 0]
++            pred_aug = self.predict_velocity(aug, act_emb)
++
++            z_next = pred_aug[:, :d]
++            emb = torch.cat([emb, z_next.unsqueeze(1)], dim=1)
++
++            vel = z_next - z_cur
++            aug = torch.cat([z_next, vel], dim=-1)
++            z_cur = z_next
++
++        return emb
+ 
+     def criterion(self, info_dict: dict):
+-        """Compute the cost between predicted embeddings and goal embeddings."""
+-        pred_emb = info_dict["predicted_emb"]  # (B,S, T-1, dim)
+-        goal_emb = info_dict["goal_emb"]  # (B, S, T, dim)
++        """Compute the cost between predicted embeddings and goal embeddings.
++
++        ``predicted_emb`` has shape ``(B, S, T+1, D)``. ``goal_emb`` comes out
++        of ``encode`` with shape ``(B, H_goal, D)`` (no sample dim). We insert
++        the missing sample axis and take the final goal step before comparing
++        against the final predicted step.
++        """
++        pred_emb = info_dict["predicted_emb"]  # (B, S, T+1, D)
++        goal_emb = info_dict["goal_emb"]  # (B, H_goal, D) or (B, S, H_goal, D)
++
++        if goal_emb.ndim == pred_emb.ndim - 1:
++            goal_emb = goal_emb.unsqueeze(1)  # (B, 1, H_goal, D) -> broadcasts over S
++        goal_last = goal_emb[..., -1:, :]  # (B, 1 or S, 1, D)
++        pred_last = pred_emb[..., -1:, :]  # (B, S, 1, D)
+ 
+-        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
++        goal_last = goal_last.expand_as(pred_last)
+ 
+-        # return last-step cost per action candidate
+         cost = F.mse_loss(
+-            pred_emb[..., -1:, :],
+-            goal_emb[..., -1:, :].detach(),
++            pred_last,
++            goal_last.detach(),
+             reduction="none",
+         ).sum(dim=tuple(range(2, pred_emb.ndim)))  # (B, S)
+ 
+diff --git a/module.py b/module.py
+index 16c4907..b95f9d4 100644
+--- a/module.py
++++ b/module.py
+@@ -241,6 +241,67 @@ class MLP(nn.Module):
+         return self.net(x)
+ 
+ 
++def compute_augmented_states(emb: torch.Tensor) -> torch.Tensor:
++    """Build velocity-augmented states x_t = [z_t, z_t - z_{t-1}] from embeddings.
++
++    Args:
++        emb: (B, T, D) encoder embeddings.
++
++    Returns:
++        (B, T, 2*D) augmented states with zero velocity at t=0.
++    """
++    vel = torch.zeros_like(emb)
++    vel[:, 1:] = emb[:, 1:] - emb[:, :-1]
++    return torch.cat([emb, vel], dim=-1)
++
++
++class VelocityPredictor(nn.Module):
++    """Single-step MLP predictor on velocity-augmented latent states.
++
++    Consumes x_t = [z_t, z_t - z_{t-1}] plus an action embedding a_t and
++    predicts x_{t+1} = [z_{t+1}, z_{t+1} - z_t]. Mirrors the predictor trained
++    by train/lewm_train_mlp.py so the object checkpoint can be reloaded under
++    this module path.
++    """
++
++    def __init__(
++        self,
++        *,
++        embed_dim,
++        action_dim=None,
++        hidden_width=1024,
++        depth=4,
++        dropout=0.0,
++    ):
++        super().__init__()
++        if depth < 1:
++            raise ValueError("depth must be at least 1.")
++
++        self.embed_dim = int(embed_dim)
++        self.action_dim = int(action_dim) if action_dim is not None else self.embed_dim
++        aug_dim = 2 * self.embed_dim
++        input_dim = aug_dim + self.action_dim
++
++        layers = []
++        current_dim = input_dim
++        for _ in range(depth):
++            layers.append(nn.Linear(current_dim, hidden_width))
++            layers.append(nn.GELU())
++            if dropout > 0.0:
++                layers.append(nn.Dropout(dropout))
++            current_dim = hidden_width
++        layers.append(nn.Linear(current_dim, aug_dim))
++        self.net = nn.Sequential(*layers)
++
++    def forward(self, aug_state: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
++        """
++        aug_state: (B, 2*D) augmented state [z_t, z_t - z_{t-1}].
++        act_emb:   (B, D)   action embedding at time t.
++        returns:   (B, 2*D) predicted augmented state [z_{t+1}, z_{t+1} - z_t].
++        """
++        return self.net(torch.cat([aug_state, act_emb], dim=-1))
++
++
+ class ARPredictor(nn.Module):
+     """Autoregressive predictor for next-step embedding prediction."""
+ 
+diff --git a/train.py b/train.py
+index 044ebfc..64ba5b1 100644
+--- a/train.py
++++ b/train.py
+@@ -145,7 +145,7 @@ def run(cfg):
+     ##########################
+ 
+     run_id = cfg.get("subdir") or ""
+-    run_dir = Path(swm.data.utils.get_cache_dir(), run_id)
++    run_dir = Path(swm.data.utils.get_cache_dir(sub_folder="checkpoints"), run_id)
+ 
+     logger = None
+     if cfg.wandb.enabled:
+diff --git a/config/eval/reacher_latentbrs.yaml b/config/eval/reacher_latentbrs.yaml
+new file mode 100644
+index 0000000..acc6d12
+--- /dev/null
++++ b/config/eval/reacher_latentbrs.yaml
+@@ -0,0 +1,76 @@
++defaults:
++  - launcher: local
++  - solver: cem
++  - _self_
++
++# Mirrors reacher.yaml but points at the local latent-brs checkpoint and
++# reacher_expert dataset instead of the upstream dmc/reacher_random dataset.
++# Run with:
++#   cd third_party/le-wm && STABLEWM_HOME=<repo>/lewm_home MUJOCO_GL=egl \
++#     python3 eval.py --config-name=reacher_latentbrs
++# The checkpoint is expected at $STABLEWM_HOME/checkpoints/reacher/lewm_vel_object.ckpt
++# (produced by convert_velocity_ckpt.py) and the dataset at
++# $STABLEWM_HOME/reacher_expert.h5 (symlink to data/expert_data/reacher_expert.h5).
++
++world:
++  env_name: swm/ReacherDMControl-v0
++  num_envs: ${eval.num_eval}
++  max_episode_steps: ???
++  # history_size matches train/lewm_train_mlp.py (default 3 frames of context).
++  history_size: 3
++  frame_skip: 1
++  task: qpos_match
++  # Render at the dataset's native resolution so the replay init frames and
++  # the env-rendered frames have a matching shape (eval.py forwards this into
++  # world = swm.World(..., image_shape=(image_size, image_size))).
++  image_size: 252
++
++dataset:
++  stats: ${eval.dataset_name}
++  keys_to_cache:
++    - action
++  # reacher_expert.h5 mixes per-row columns with per-episode columns
++  # (episode_seed, reward, terminated). Restrict to per-row columns so
++  # get_row_data / load_chunk stay consistent.
++  keys_to_load:
++    - action
++    - pixels
++    - qpos
++    - qvel
++    - observation
++    - episode_idx
++    - step_idx
++
++seed: 42
++policy: reacher/lewm_vel
++
++plan_config:
++  horizon: 5
++  receding_horizon: 5
++  # Our model trains on single-step 2-dim actions (frameskip=1, no blocking),
++  # so each planning step corresponds to one environment step.
++  action_block: 1
++
++eval:
++  num_eval: 50
++  goal_offset_steps: 25
++  eval_budget: 50
++  img_size: 224
++  dataset_name: reacher_expert
++  callables:
++    - method: set_state
++      args:
++        qpos:
++          value: qpos
++        qvel:
++          value: qvel
++
++    - method: set_target_qpos
++      args:
++        target_qpos:
++          value: goal_qpos
++
++output:
++  system: reacher
++  dir: ${oc.env:STABLEWM_HOME}/eval_outputs
++  filename: latentbrs_results.txt
+diff --git a/convert_hf_pusht_ckpt.py b/convert_hf_pusht_ckpt.py
+new file mode 100644
+index 0000000..a2b297d
+--- /dev/null
++++ b/convert_hf_pusht_ckpt.py
+@@ -0,0 +1,328 @@
++#!/usr/bin/env python3
++"""Convert LeWM/stable-worldmodel weights into an object checkpoint.
++
++The LeWM evaluation script loads policies through
++``stable_worldmodel.policy.AutoCostModel``. In this checkout that loader expects
++an object checkpoint named ``*_object.ckpt`` under
++``$STABLEWM_HOME/checkpoints``. The Hugging Face repo
++``quentinll/lewm-pusht`` provides the newer ``config.json`` + ``weights.pt``
++format instead.
++
++This script rebuilds the model from either a Hydra-instantiable HF config or a
++stable-worldmodel training config, loads ``weights.pt``/``weights_epoch_*.pt``,
++and saves a loadable object checkpoint, usually:
++
++    $STABLEWM_HOME/checkpoints/pusht/lewm_object.ckpt
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from collections import OrderedDict
++from pathlib import Path
++
++import torch
++from hydra.utils import instantiate
++from omegaconf import DictConfig, OmegaConf
++
++
++LEWM_DIR = Path(__file__).resolve().parent
++REPO_ROOT = LEWM_DIR.parent.parent
++
++# Prefer the checked-out third_party packages when this script is run from the
++# project repo, but still work if the packages are only installed in the venv.
++for rel in ("third_party/stable-worldmodel", "third_party/stable-pretraining"):
++    path = REPO_ROOT / rel
++    if path.exists() and str(path) not in sys.path:
++        sys.path.insert(0, str(path))
++
++
++def default_src_dir() -> Path:
++    return REPO_ROOT / "pusht" / "models" / "lewm-pusht"
++
++
++def default_dst_path() -> Path:
++    try:
++        import stable_worldmodel as swm
++
++        root = swm.data.utils.get_cache_dir(sub_folder="checkpoints")
++    except Exception:
++        root = Path(os.getenv("STABLEWM_HOME", Path.home() / ".stable_worldmodel"))
++        root = root / "checkpoints"
++    return root / "pusht" / "lewm_object.ckpt"
++
++
++def load_state_dict(path: Path) -> dict[str, torch.Tensor]:
++    state = torch.load(path, map_location="cpu")
++    if isinstance(state, dict) and "state_dict" in state:
++        state = state["state_dict"]
++    if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
++        state = state["model"]
++    if not isinstance(state, dict):
++        raise TypeError(f"Expected a state_dict-like object in {path}, got {type(state)!r}")
++    return state
++
++
++def _cfg_get(config: dict, dotted_key: str, default=None):
++    current = config
++    for part in dotted_key.split("."):
++        if not isinstance(current, dict) or part not in current:
++            return default
++        current = current[part]
++    return current
++
++
++def _infer_train_config_kind(config: dict, weights_path: Path) -> str | None:
++    text = " ".join(
++        str(value).lower()
++        for value in (
++            weights_path.parent.name,
++            weights_path.parent.parent.name,
++            config.get("output_model_name", ""),
++            _cfg_get(config, "wm.type", ""),
++        )
++    )
++    if "pldm" in text:
++        return "pldm"
++    if "lewm" in text:
++        return "lewm"
++    if "dinowm" in text or "prejepa" in text:
++        return "dinowm"
++    return None
++
++
++def _build_pldm_or_lewm_from_train_config(config: dict, kind: str) -> torch.nn.Module:
++    import stable_pretraining as spt
++
++    if kind == "pldm":
++        from stable_worldmodel.wm.pldm import PLDM
++        from stable_worldmodel.wm.pldm.module import Embedder, MLP, Predictor
++    elif kind == "lewm":
++        from stable_worldmodel.wm.lewm import LeWM as PLDM
++        from stable_worldmodel.wm.lewm.module import Embedder, MLP, Predictor
++    else:
++        raise ValueError(f"Unsupported training config kind: {kind}")
++
++    wm_cfg = config["wm"]
++    data_cfg = config.get("data", {}).get("dataset", {})
++    img_size = int(config.get("img_size", 224))
++    patch_size = int(config.get("patch_size", 14))
++    encoder_scale = str(config.get("encoder_scale", "tiny"))
++
++    encoder = spt.backbone.utils.vit_hf(
++        encoder_scale,
++        patch_size=patch_size,
++        image_size=img_size,
++        pretrained=False,
++        use_mask_token=False,
++    )
++    hidden_dim = int(encoder.config.hidden_size)
++    embed_dim = int(wm_cfg.get("embed_dim", hidden_dim))
++    frameskip = int(data_cfg.get("frameskip", 1))
++    action_dim = int(wm_cfg.get("action_dim", 2))
++    effective_action_dim = frameskip * action_dim
++
++    predictor = Predictor(
++        num_frames=int(wm_cfg["history_size"]),
++        input_dim=embed_dim,
++        hidden_dim=hidden_dim,
++        output_dim=hidden_dim,
++        **dict(config["predictor"]),
++    )
++    action_encoder = Embedder(input_dim=effective_action_dim, emb_dim=embed_dim)
++    projector = MLP(
++        input_dim=hidden_dim,
++        output_dim=embed_dim,
++        hidden_dim=2048,
++        norm_fn=torch.nn.BatchNorm1d,
++    )
++    predictor_proj = MLP(
++        input_dim=hidden_dim,
++        output_dim=embed_dim,
++        hidden_dim=2048,
++        norm_fn=torch.nn.BatchNorm1d,
++    )
++    return PLDM(
++        encoder=encoder,
++        predictor=predictor,
++        action_encoder=action_encoder,
++        projector=projector,
++        pred_proj=predictor_proj,
++    )
++
++
++def _build_dinowm_from_train_config(config: dict) -> torch.nn.Module:
++    import stable_pretraining as spt
++    import stable_worldmodel as swm
++    from omegaconf import OmegaConf
++    from stable_worldmodel.wm.prejepa.module import CausalPredictor, Embedder
++    from transformers import AutoModel, AutoModelForImageClassification
++    from torch import nn
++
++    encoder_configs = {
++        "resnet": {
++            "prefix": "microsoft/resnet-",
++            "model_class": AutoModelForImageClassification,
++            "embedding_attr": lambda m: m.config.hidden_sizes[-1],
++            "post_init": lambda m: setattr(m.classifier, "1", nn.LayerNorm(m.config.hidden_sizes[-1])),
++            "interpolate_pos_encoding": False,
++        },
++        "vit": {"prefix": "google/vit-"},
++        "dino": {"prefix": "facebook/dino-"},
++        "dinov2": {"prefix": "facebook/dinov2-"},
++        "dinov3": {"prefix": "facebook/dinov3-"},
++        "webssl": {"prefix": "facebook/webssl-"},
++        "mae": {"prefix": "facebook/vit-mae-"},
++        "ijepa": {"prefix": "facebook/ijepa"},
++        "vjepa2": {"prefix": "facebook/vjepa2-vit"},
++        "siglip2": {"prefix": "google/siglip2-"},
++    }
++
++    cfg = OmegaConf.create(config)
++    encoder_cfg = next(
++        (
++            item
++            for item in encoder_configs.values()
++            if str(cfg.backbone.name).startswith(item["prefix"])
++        ),
++        None,
++    )
++    if encoder_cfg is None:
++        raise ValueError(f"Unsupported DINO-WM backbone: {cfg.backbone.name}")
++
++    backbone = encoder_cfg.get("model_class", AutoModel).from_pretrained(cfg.backbone.name)
++    if hasattr(backbone, "vision_model"):
++        backbone = backbone.vision_model
++    if "post_init" in encoder_cfg:
++        encoder_cfg["post_init"](backbone)
++
++    embed_dim = encoder_cfg.get("embedding_attr", lambda m: m.config.hidden_size)(backbone)
++    is_cnn = str(cfg.backbone.name).startswith("microsoft/resnet-")
++    num_patches = 1 if is_cnn else (int(cfg.image_size) // int(cfg.patch_size)) ** 2
++    interp_pos_enc = encoder_cfg.get("interpolate_pos_encoding", True)
++
++    embed_dim += sum(int(value) for value in cfg.wm.get("encoding", {}).values())
++    if cfg.backbone.get("is_video_encoder", False):
++        num_patches += num_patches * (int(cfg.n_steps) // 4)
++
++    predictor_kwargs = {k: v for k, v in dict(cfg.predictor).items() if k != "size"}
++    predictor = CausalPredictor(
++        num_patches=num_patches,
++        num_frames=int(cfg.wm.history_size),
++        dim=int(embed_dim),
++        **predictor_kwargs,
++    )
++    extra_encoders = torch.nn.ModuleDict(
++        OrderedDict(
++            (
++                key,
++                Embedder(
++                    in_chans=int(cfg.extra_dims[key]),
++                    emb_dim=int(emb_dim),
++                ),
++            )
++            for key, emb_dim in cfg.wm.get("encoding", {}).items()
++        )
++    )
++
++    return swm.wm.PreJEPA(
++        encoder=spt.backbone.EvalOnly(backbone),
++        predictor=predictor,
++        extra_encoders=extra_encoders,
++        history_size=int(cfg.wm.history_size),
++        num_pred=int(cfg.wm.num_preds),
++        interpolate_pos_encoding=bool(interp_pos_enc),
++    )
++
++
++def build_model(config: dict, weights_path: Path) -> torch.nn.Module:
++    if "_target_" in config:
++        return instantiate(config)
++
++    kind = _infer_train_config_kind(config, weights_path)
++    if kind is not None:
++        print(f"[convert] detected stable-worldmodel training config: {kind}", flush=True)
++        if kind == "dinowm":
++            return _build_dinowm_from_train_config(config)
++        return _build_pldm_or_lewm_from_train_config(config, kind)
++
++    instantiated = instantiate(DictConfig(config))
++    if isinstance(instantiated, torch.nn.Module):
++        return instantiated
++
++    raise ValueError(
++        "Could not build a model from config. Expected either a Hydra config "
++        "with _target_, or a stable-worldmodel PLDM/LeWM training config."
++    )
++
++
++def convert(config_path: Path, weights_path: Path, dst_path: Path) -> None:
++    if not config_path.exists():
++        raise FileNotFoundError(f"Missing config: {config_path}")
++    if not weights_path.exists():
++        raise FileNotFoundError(f"Missing weights: {weights_path}")
++
++    with config_path.open("r") as f:
++        config = json.load(f)
++
++    print(f"[convert] config:  {config_path}", flush=True)
++    print(f"[convert] weights: {weights_path}", flush=True)
++    model = build_model(config, weights_path)
++
++    state_dict = load_state_dict(weights_path)
++    missing, unexpected = model.load_state_dict(state_dict, strict=False)
++    if missing:
++        raise RuntimeError(f"Missing keys while loading weights: {missing[:20]}")
++    if unexpected:
++        raise RuntimeError(f"Unexpected keys while loading weights: {unexpected[:20]}")
++
++    model.eval()
++    model.requires_grad_(False)
++
++    dst_path.parent.mkdir(parents=True, exist_ok=True)
++    torch.save(model, dst_path)
++    print(f"[convert] wrote:   {dst_path}", flush=True)
++    print(f"[convert] class:   {type(model).__module__}.{type(model).__name__}", flush=True)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--src-dir",
++        type=Path,
++        default=default_src_dir(),
++        help="Directory containing HF config.json and weights.pt.",
++    )
++    parser.add_argument(
++        "--config",
++        type=Path,
++        default=None,
++        help="Explicit path to config.json. Defaults to --src-dir/config.json.",
++    )
++    parser.add_argument(
++        "--weights",
++        type=Path,
++        default=None,
++        help="Explicit path to weights.pt. Defaults to --src-dir/weights.pt.",
++    )
++    parser.add_argument(
++        "--dst",
++        type=Path,
++        default=default_dst_path(),
++        help="Destination object checkpoint path.",
++    )
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    config_path = args.config or args.src_dir / "config.json"
++    weights_path = args.weights or args.src_dir / "weights.pt"
++    convert(config_path=config_path, weights_path=weights_path, dst_path=args.dst)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/convert_velocity_ckpt.py b/convert_velocity_ckpt.py
+new file mode 100644
+index 0000000..5895ba4
+--- /dev/null
++++ b/convert_velocity_ckpt.py
+@@ -0,0 +1,248 @@
++#!/usr/bin/env python3
++"""Convert a shared.models JEPA checkpoint into one using le-wm's own classes.
++
++The training script ``train/lewm_train_mlp.py`` saves the full ``JEPA`` module
++via ``torch.save(model, path)``. Those pickles reference
++``shared.models.VelocityPredictor`` / ``shared.models.JEPA`` etc, so le-wm's
++``eval.py`` (which runs from ``third_party/le-wm`` with only ``module`` and
++``jepa`` on ``sys.path``) cannot unpickle them directly without the whole repo
++on ``sys.path``.
++
++This script loads the source checkpoint with the repo root temporarily on
++``sys.path``, reinstantiates each component using le-wm's own
++``module.py`` / ``jepa.py`` classes, copies the ``state_dict`` over, and
++re-saves a new ``_object.ckpt`` under ``STABLEWM_HOME`` so
++``swm.policy.AutoCostModel`` can load it with no external imports.
++
++Supports both ``ARPredictor`` (legacy) and ``VelocityPredictor`` sources.
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++import sys
++from pathlib import Path
++
++import torch
++import torch.nn as nn
++
++LEWM_DIR = Path(__file__).resolve().parent
++REPO_ROOT = LEWM_DIR.parent.parent
++
++# Make le-wm's own modules importable as 'module' / 'jepa' (the names that
++# will be baked into the new pickle via __module__).
++if str(LEWM_DIR) not in sys.path:
++    sys.path.insert(0, str(LEWM_DIR))
++
++# Make shared.models importable so we can load the source checkpoint.
++if str(REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT))
++
++
++import module as lewm_module  # noqa: E402  (local le-wm module.py)
++import jepa as lewm_jepa  # noqa: E402  (local le-wm jepa.py)
++
++
++def _introspect_velocity_predictor(src_pred: nn.Module) -> dict:
++    embed_dim = int(src_pred.embed_dim)
++    action_dim = int(getattr(src_pred, "action_dim", embed_dim))
++    linears = [m for m in src_pred.net if isinstance(m, nn.Linear)]
++    hidden_width = int(linears[0].out_features)
++    depth = len(linears) - 1
++    has_dropout = any(isinstance(m, nn.Dropout) for m in src_pred.net)
++    dropout = float(getattr(src_pred, "_dropout", 0.1)) if has_dropout else 0.0
++    return dict(
++        embed_dim=embed_dim,
++        action_dim=action_dim,
++        hidden_width=hidden_width,
++        depth=depth,
++        dropout=dropout,
++    )
++
++
++def _introspect_ar_predictor(src_pred: nn.Module) -> dict:
++    pos = src_pred.pos_embedding
++    num_frames = int(pos.shape[1])
++    input_dim = int(pos.shape[2])
++    transformer = src_pred.transformer
++    depth = len(transformer.layers)
++    first_attn = transformer.layers[0].attn
++    to_qkv = first_attn.to_qkv.weight
++    inner_dim = int(to_qkv.shape[0]) // 3
++    to_out = first_attn.to_out[0] if isinstance(first_attn.to_out, nn.Sequential) else None
++    if to_out is None:
++        raise RuntimeError("Unexpected ARPredictor attention.to_out layout.")
++    hidden_dim = int(to_out.out_features)
++    dim_head = inner_dim // first_attn.heads
++    heads = int(first_attn.heads)
++    mlp_linear = transformer.layers[0].mlp.net[1]
++    mlp_dim = int(mlp_linear.out_features)
++    output_proj = transformer.output_proj
++    if isinstance(output_proj, nn.Linear):
++        output_dim = int(output_proj.out_features)
++    else:
++        output_dim = hidden_dim
++    return dict(
++        num_frames=num_frames,
++        input_dim=input_dim,
++        hidden_dim=hidden_dim,
++        output_dim=output_dim,
++        depth=depth,
++        heads=heads,
++        dim_head=dim_head,
++        mlp_dim=mlp_dim,
++        dropout=0.0,
++        emb_dropout=0.0,
++    )
++
++
++def _introspect_embedder(src_emb: nn.Module) -> dict:
++    input_dim = int(src_emb.patch_embed.in_channels)
++    smoothed_dim = int(src_emb.patch_embed.out_channels)
++    first_linear = src_emb.embed[0]
++    last_linear = src_emb.embed[-1]
++    emb_dim = int(last_linear.out_features)
++    mlp_scale = int(first_linear.out_features // emb_dim)
++    return dict(
++        input_dim=input_dim,
++        smoothed_dim=smoothed_dim,
++        emb_dim=emb_dim,
++        mlp_scale=mlp_scale,
++    )
++
++
++def _rebuild_mlp(src_mlp: nn.Module) -> nn.Module:
++    linears = [m for m in src_mlp.net if isinstance(m, nn.Linear)]
++    input_dim = int(linears[0].in_features)
++    hidden_dim = int(linears[0].out_features)
++    output_dim = int(linears[-1].out_features)
++    norm_module = src_mlp.net[1]
++    if isinstance(norm_module, nn.BatchNorm1d):
++        norm_fn = nn.BatchNorm1d
++    elif isinstance(norm_module, nn.LayerNorm):
++        norm_fn = nn.LayerNorm
++    elif isinstance(norm_module, nn.Identity):
++        norm_fn = None
++    else:
++        norm_fn = type(norm_module)
++    act_module = src_mlp.net[2]
++    act_fn = type(act_module)
++    return lewm_module.MLP(
++        input_dim=input_dim,
++        hidden_dim=hidden_dim,
++        output_dim=output_dim,
++        norm_fn=norm_fn,
++        act_fn=act_fn,
++    )
++
++
++def _rebuild_predictor(src_pred: nn.Module) -> nn.Module:
++    name = type(src_pred).__name__
++    if name == "VelocityPredictor":
++        kwargs = _introspect_velocity_predictor(src_pred)
++        return lewm_module.VelocityPredictor(**kwargs)
++    if name == "ARPredictor":
++        kwargs = _introspect_ar_predictor(src_pred)
++        return lewm_module.ARPredictor(**kwargs)
++    raise RuntimeError(f"Unsupported predictor class: {name}")
++
++
++def _rebuild_embedder(src_emb: nn.Module) -> nn.Module:
++    kwargs = _introspect_embedder(src_emb)
++    return lewm_module.Embedder(**kwargs)
++
++
++def convert(src_path: Path, dst_path: Path) -> None:
++    print(f"[convert] loading source: {src_path}", flush=True)
++    src = torch.load(src_path, map_location="cpu", weights_only=False)
++
++    print(f"[convert] source predictor: {type(src.predictor).__name__}", flush=True)
++
++    new_predictor = _rebuild_predictor(src.predictor)
++    if isinstance(src.action_encoder, nn.Identity):
++        new_action_encoder = nn.Identity()
++    else:
++        new_action_encoder = _rebuild_embedder(src.action_encoder)
++    new_projector = _rebuild_mlp(src.projector)
++    if isinstance(src.pred_proj, nn.Identity):
++        new_pred_proj = None
++    else:
++        new_pred_proj = _rebuild_mlp(src.pred_proj)
++
++    new_model = lewm_jepa.JEPA(
++        encoder=src.encoder,
++        predictor=new_predictor,
++        action_encoder=new_action_encoder,
++        projector=new_projector,
++        pred_proj=new_pred_proj,
++    )
++
++    target_sd = src.state_dict()
++    missing, unexpected = new_model.load_state_dict(target_sd, strict=False)
++    if missing:
++        print(f"[convert] WARNING missing keys: {missing[:10]}{'...' if len(missing) > 10 else ''}", flush=True)
++    if unexpected:
++        print(
++            f"[convert] WARNING unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}",
++            flush=True,
++        )
++
++    new_model.eval()
++    new_model.requires_grad_(False)
++
++    dst_path.parent.mkdir(parents=True, exist_ok=True)
++    torch.save(new_model, dst_path)
++    print(f"[convert] wrote: {dst_path}", flush=True)
++
++    print(
++        "[convert] new classes:",
++        type(new_model).__module__ + "." + type(new_model).__name__,
++        "|",
++        type(new_predictor).__module__ + "." + type(new_predictor).__name__,
++        flush=True,
++    )
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--src",
++        type=Path,
++        required=True,
++        help="Path to the source *_object.ckpt produced by train/lewm_train_mlp.py (or equivalent).",
++    )
++    parser.add_argument(
++        "--dst",
++        type=Path,
++        default=None,
++        help=(
++            "Destination path for the converted _object.ckpt. "
++            "Defaults to $STABLEWM_HOME/checkpoints/reacher/lewm_vel_object.ckpt."
++        ),
++    )
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    src_path = args.src.expanduser().resolve()
++    if not src_path.is_file():
++        raise FileNotFoundError(f"Source checkpoint not found: {src_path}")
++
++    if args.dst is not None:
++        dst_path = args.dst.expanduser().resolve()
++    else:
++        home = os.environ.get("STABLEWM_HOME")
++        if home is None:
++            raise RuntimeError(
++                "No --dst provided and STABLEWM_HOME is unset. "
++                "Either pass --dst or export STABLEWM_HOME=<repo>/lewm_home."
++            )
++        dst_path = Path(home, "checkpoints", "reacher", "lewm_vel_object.ckpt").resolve()
++
++    convert(src_path, dst_path)
++
++
++if __name__ == "__main__":
++    main()

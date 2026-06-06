@@ -1,0 +1,25 @@
+diff --git a/PyHJ/data/utils/segtree.py b/PyHJ/data/utils/segtree.py
+index 063675c5..e18addfa 100644
+--- a/PyHJ/data/utils/segtree.py
++++ b/PyHJ/data/utils/segtree.py
+@@ -1,7 +1,19 @@
++import os
+ from typing import Optional, Union
+ 
+ import numpy as np
+-from numba import njit
++
++if os.environ.get("PYHJ_DISABLE_NUMBA_SEGTREE", "").lower() in {"1", "true", "yes"}:
++    def njit(*decorator_args, **_decorator_kwargs):
++        if decorator_args and callable(decorator_args[0]) and len(decorator_args) == 1:
++            return decorator_args[0]
++
++        def _decorate(fn):
++            return fn
++
++        return _decorate
++else:
++    from numba import njit
+ 
+ 
+ class SegmentTree:
