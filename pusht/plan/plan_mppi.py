@@ -15,25 +15,20 @@ from typing import Any, Callable
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GPU_SLS_CANDIDATES = (
-    REPO_ROOT / "gpu_sls" / "src",
-    REPO_ROOT / "third_party" / "gpu_sls" / "src",
-)
-GPU_SLS_SRC = next((path for path in GPU_SLS_CANDIDATES if path.is_dir()), None)
+GPU_SLS_SRC = REPO_ROOT / "third_party" / "gpu_sls" / "src"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if GPU_SLS_SRC is None:
-    searched = ", ".join(str(path) for path in GPU_SLS_CANDIDATES)
-    raise RuntimeError(f"Could not find gpu_sls source directory. Searched: {searched}")
-if str(GPU_SLS_SRC) not in sys.path:
+if GPU_SLS_SRC.is_dir() and str(GPU_SLS_SRC) not in sys.path:
     sys.path.insert(0, str(GPU_SLS_SRC))
 
 import h5py
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+import jax.numpy as jnp
 import jax
 
+from gpu_sls.mppi_planner import MPPIPlanner
 from pusht.plan.plan_ilqr_mpc import (
     CONTROL_MAX_NORM,
     CONTROL_MIN_NORM,
@@ -92,28 +87,11 @@ JAX_PLATFORM = "auto"
 JAX_FALLBACK_ENV = "PUSHT_MPPI_JAX_FALLBACK"
 
 
-def load_mppi_planner_class():
-    try:
-        from gpu_sls.mppi_planner import MPPIPlanner
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Failed to import gpu_sls.mppi_planner. Ensure gpu_sls is installed "
-            f"or available at {GPU_SLS_SRC}, and install its dependencies such as equinox and optax."
-        ) from exc
-    return MPPIPlanner
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=Path(DEFAULT_MODEL_DIR))
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=Path(DEFAULT_DATASET_PATH))
-    parser.add_argument(
-        "--action-stats-dataset-path",
-        type=Path,
-        default=None,
-        help="Dataset used to compute action mean/std. Defaults to the model config, then the benchmark dataset.",
-    )
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR))
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--episode-idx", type=int, default=EPISODE_IDX)
@@ -177,6 +155,13 @@ def build_batched_jax_dynamics(
     return jax_dynamics
 
 
+def is_wrapped_keyboard_interrupt(exc: BaseException) -> bool:
+    text = "".join(traceback.format_exception_only(type(exc), exc))
+    return "KeyboardInterrupt" in text and (
+        "CpuCallback error calling callback" in text or "jax.pure_callback failed" in text
+    )
+
+
 def make_mppi_rollout_and_eval(
     jax_dynamics_fn: Callable[[Any, Any, float, float], Any],
     *,
@@ -229,27 +214,6 @@ def shift_warmstart(U: Any) -> Any:
     return jnp.concatenate([U[1:], U[-1:]], axis=0)
 
 
-def resolve_action_stats_dataset_paths(
-    model_config: dict[str, object],
-    fallback_dataset_path: Path,
-    action_stats_dataset_path: Path | None = None,
-) -> list[Path]:
-    if action_stats_dataset_path is not None:
-        return resolve_dataset_paths(action_stats_dataset_path, fallback_dataset_path)
-    try:
-        return resolve_dataset_paths(model_config.get("dataset_path"), fallback_dataset_path)
-    except FileNotFoundError as exc:
-        if not fallback_dataset_path.is_file():
-            raise
-        print(
-            "Configured PushT training dataset path(s) were missing; "
-            f"using benchmark dataset for action statistics instead: {fallback_dataset_path}",
-            flush=True,
-        )
-        print(f"Original dataset resolution error: {exc}", flush=True)
-        return [fallback_dataset_path]
-
-
 def main() -> None:
     args = parse_args()
     device = require_device(args.device)
@@ -282,14 +246,7 @@ def main() -> None:
             f"This PushT MPC planner currently supports frameskip=1 only, but the model config has frameskip={frameskip}."
         )
 
-    action_stats_dataset_path = (
-        args.action_stats_dataset_path.expanduser().resolve() if args.action_stats_dataset_path is not None else None
-    )
-    train_dataset_paths = resolve_action_stats_dataset_paths(
-        model_config,
-        dataset_path,
-        action_stats_dataset_path=action_stats_dataset_path,
-    )
+    train_dataset_paths = resolve_dataset_paths(model_config.get("dataset_path"), dataset_path)
     pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
     pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
     action_mean, action_std = load_action_stats(train_dataset_paths, action_dim)
@@ -393,7 +350,6 @@ def main() -> None:
     }
     action_lower_lim = jnp.full((action_dim,), CONTROL_MIN_NORM, dtype=jnp.float32)
     action_upper_lim = jnp.full((action_dim,), CONTROL_MAX_NORM, dtype=jnp.float32)
-    MPPIPlanner = load_mppi_planner_class()
     planner = MPPIPlanner(
         config=mppi_config,
         model_rollout_fn=mppi_rollout_fn,
@@ -425,6 +381,7 @@ def main() -> None:
     mppi_plan_rewards: list[float] = []
     stop_reason = "max_mpc_steps"
     video_path: str | None = None
+    metrics_path = out_dir / "metrics.json"
     final_block = dataset_row_to_block_pose(state_np[0], env_state_np[0], state_format)
     final_agent = env_state_np[0, :2].astype(np.float32)
     goal_block = dataset_row_to_block_pose(state_np[-1], env_state_np[-1], state_format)
@@ -435,13 +392,82 @@ def main() -> None:
     prev_u = jnp.zeros((args.horizon, action_dim), dtype=jnp.float32)
     goal_state_jax = jnp.asarray(goal_state.detach().cpu().numpy().astype(np.float32))
     jax_key = jax.random.PRNGKey(0 if args.seed is None else int(args.seed))
+    action_low, action_high = pusht_agent_action_bounds()
+
+    def scalar_or_nan(values: list[float], index: int) -> float:
+        return values[index] if values else float("nan")
+
+    def save_outputs() -> dict[str, Any]:
+        nonlocal video_path
+        metrics = {
+            "episode_idx": episode_idx,
+            "planner": "mppi",
+            "model_dir": str(model_dir),
+            "checkpoint": str(checkpoint_path),
+            "config_path": str(model_dir / "config.json"),
+            "dataset_path": str(dataset_path),
+            "train_dataset_paths": [str(path) for path in train_dataset_paths],
+            "dataset_state_format": state_format,
+            "markov_deriv": markov_deriv,
+            "action_history_size": 1,
+            "state_space": "latent_plus_finite_differences",
+            "markov_state_dim": markov_state_dim,
+            "frameskip": frameskip,
+            "horizon": args.horizon,
+            "max_mpc_steps": args.max_mpc_steps,
+            "stop_reason": stop_reason,
+            "num_mpc_steps": len(executed_actions_norm),
+            "action_space": "normalized_dataset_action_then_raw_then_absolute_env_target",
+            "control_bound_low_norm": CONTROL_MIN_NORM,
+            "control_bound_high_norm": CONTROL_MAX_NORM,
+            "env_action_scale": ENV_ACTION_SCALE,
+            "action_target_low": action_low.tolist(),
+            "action_target_high": action_high.tolist(),
+            "num_action_clips": num_action_clips,
+            "start_agent_pos": env_state_np[0, :2].tolist(),
+            "goal_block_pose": goal_block.tolist(),
+            "goal_pose": goal_pose.tolist() if goal_pose is not None else None,
+            "final_agent_pos": final_agent.tolist(),
+            "final_block_pose": final_block.tolist(),
+            "goal_proprio": proprio_np[-1].tolist(),
+            "latent_goal_distance_initial": scalar_or_nan(latent_goal_distances, 0),
+            "latent_goal_distance_final": scalar_or_nan(latent_goal_distances, -1),
+            "block_goal_distance_initial": scalar_or_nan(block_goal_distances, 0),
+            "block_goal_distance_final": scalar_or_nan(block_goal_distances, -1),
+            "latent_goal_distances": latent_goal_distances,
+            "block_goal_distances": block_goal_distances,
+            "solve_times_ms": solve_times_ms,
+            "mppi_samples": args.mppi_samples,
+            "mppi_update_iters": args.mppi_update_iters,
+            "mppi_reward_weight": args.mppi_reward_weight,
+            "mppi_noise_level": args.mppi_noise_level,
+            "mppi_noise_decay": args.mppi_noise_decay,
+            "mppi_beta_filter": args.mppi_beta_filter,
+            "jax_platform": jax_platform,
+            "mppi_q_stage": args.q_stage,
+            "mppi_q_terminal": args.q_terminal,
+            "mppi_r_control": args.r_control,
+            "mppi_plan_rewards": mppi_plan_rewards,
+            "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
+            "executed_actions_raw": [action.tolist() for action in executed_actions_raw],
+            "executed_actions_env": [action.tolist() for action in executed_actions_env],
+            "video_path": video_path,
+        }
+        with metrics_path.open("w", encoding="utf-8") as handle:
+            json.dump(metrics, handle, indent=2)
+
+        if rollout_frames and video_path is None:
+            video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps))
+            metrics["video_path"] = video_path
+            with metrics_path.open("w", encoding="utf-8") as handle:
+                json.dump(metrics, handle, indent=2)
+        return metrics
 
     plan_env = make_planning_env(width=width, height=height)
     viz_env = make_visualization_env(width=width, height=height)
     try:
         set_goal_pose(plan_env, goal_pose)
         set_goal_pose(viz_env, goal_pose)
-        action_low, action_high = pusht_agent_action_bounds()
         hidden_start = reset_env_to_state(plan_env, env_state_np[0])
         visible_start = reset_env_to_state(viz_env.unwrapped, env_state_np[0])
 
@@ -538,74 +564,22 @@ def main() -> None:
                     break
         except KeyboardInterrupt:
             stop_reason = "keyboard_interrupt"
+        except Exception as exc:
+            if not is_wrapped_keyboard_interrupt(exc):
+                raise
+            stop_reason = "keyboard_interrupt"
         finally:
             pbar.close()
 
         final_block = current_block_pose(plan_env)
         final_agent = current_agent_pos(plan_env)
-        video_path = str(save_rollout_video(rollout_frames, out_dir, fps=args.video_fps)) if rollout_frames else None
+    except KeyboardInterrupt:
+        stop_reason = "keyboard_interrupt"
     finally:
         plan_env.close()
         viz_env.close()
 
-    metrics = {
-        "episode_idx": episode_idx,
-        "planner": "mppi",
-        "model_dir": str(model_dir),
-        "checkpoint": str(checkpoint_path),
-        "config_path": str(model_dir / "config.json"),
-        "dataset_path": str(dataset_path),
-        "train_dataset_paths": [str(path) for path in train_dataset_paths],
-        "action_stats_dataset_path": str(action_stats_dataset_path) if action_stats_dataset_path is not None else None,
-        "dataset_state_format": state_format,
-        "markov_deriv": markov_deriv,
-        "action_history_size": 1,
-        "state_space": "latent_plus_finite_differences",
-        "markov_state_dim": markov_state_dim,
-        "frameskip": frameskip,
-        "horizon": args.horizon,
-        "max_mpc_steps": args.max_mpc_steps,
-        "stop_reason": stop_reason,
-        "num_mpc_steps": len(executed_actions_norm),
-        "action_space": "normalized_dataset_action_then_raw_then_absolute_env_target",
-        "control_bound_low_norm": CONTROL_MIN_NORM,
-        "control_bound_high_norm": CONTROL_MAX_NORM,
-        "env_action_scale": ENV_ACTION_SCALE,
-        "action_target_low": action_low.tolist(),
-        "action_target_high": action_high.tolist(),
-        "num_action_clips": num_action_clips,
-        "start_agent_pos": env_state_np[0, :2].tolist(),
-        "goal_block_pose": goal_block.tolist(),
-        "goal_pose": goal_pose.tolist() if goal_pose is not None else None,
-        "final_agent_pos": final_agent.tolist(),
-        "final_block_pose": final_block.tolist(),
-        "goal_proprio": proprio_np[-1].tolist(),
-        "latent_goal_distance_initial": latent_goal_distances[0],
-        "latent_goal_distance_final": latent_goal_distances[-1],
-        "block_goal_distance_initial": block_goal_distances[0],
-        "block_goal_distance_final": block_goal_distances[-1],
-        "latent_goal_distances": latent_goal_distances,
-        "block_goal_distances": block_goal_distances,
-        "solve_times_ms": solve_times_ms,
-        "mppi_samples": args.mppi_samples,
-        "mppi_update_iters": args.mppi_update_iters,
-        "mppi_reward_weight": args.mppi_reward_weight,
-        "mppi_noise_level": args.mppi_noise_level,
-        "mppi_noise_decay": args.mppi_noise_decay,
-        "mppi_beta_filter": args.mppi_beta_filter,
-        "jax_platform": jax_platform,
-        "mppi_q_stage": args.q_stage,
-        "mppi_q_terminal": args.q_terminal,
-        "mppi_r_control": args.r_control,
-        "mppi_plan_rewards": mppi_plan_rewards,
-        "executed_actions_norm": [action.tolist() for action in executed_actions_norm],
-        "executed_actions_raw": [action.tolist() for action in executed_actions_raw],
-        "executed_actions_env": [action.tolist() for action in executed_actions_env],
-        "video_path": video_path,
-    }
-    metrics_path = out_dir / "metrics.json"
-    with metrics_path.open("w", encoding="utf-8") as handle:
-        json.dump(metrics, handle, indent=2)
+    metrics = save_outputs()
 
     print(
         json.dumps(
