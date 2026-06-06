@@ -191,15 +191,29 @@ class ILQRPolicyAdapter:
         ilqr_max_iters: int,
         ilqr_tol: float,
         ilqr_regularization: float,
+        lpb_barrier: Any | None = None,
+        lpb_weight: float = 0.0,
+        lpb_stage_only: bool = True,
     ) -> None:
         action_dim = int(config.get("action_dim", 2))
         embed_dim = int(config.get("embed_dim", 18))
-        markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
-        dynamics = ilqr_base.MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
+        history_size = int(config.get("history_size", 1))
+        if history_size == 1:
+            markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
+            dynamics = ilqr_base.MarkovDynamicsTorch(model, markov_state_dim, action_dim, device)
+            state_mode = "markov_embedding_delta"
+        elif history_size == 2:
+            dynamics = History2DynamicsTorch(model, embed_dim, action_dim, device)
+            state_mode = "history2_embedding_pair"
+        else:
+            raise ValueError(f"Unsupported ILQR model history_size={history_size}; expected 1 or 2.")
         self.model = model
         self.device = device
         self.action_mean = action_mean
         self.action_std = action_std
+        self.embed_dim = embed_dim
+        self.history_size = history_size
+        self.state_mode = state_mode
         self.solver = ilqr_base.ILQRMPCSolver(
             dynamics,
             horizon=horizon,
@@ -210,21 +224,34 @@ class ILQRPolicyAdapter:
             tol=ilqr_tol,
             regularization=ilqr_regularization,
             device=device,
+            lpb_barrier=lpb_barrier,
+            lpb_weight=lpb_weight,
+            lpb_stage_only=lpb_stage_only,
         )
         self.goal_state: np.ndarray | None = None
         self.previous_embedding: torch.Tensor | None = None
         self.current_embedding: torch.Tensor | None = None
 
+    def set_lpb_enabled(self, enabled: bool) -> None:
+        self.solver.lpb_enabled = bool(enabled) and self.solver.lpb_barrier is not None and self.solver.lpb_weight > 0.0
+
     def reset(self, *, start_embedding: torch.Tensor, goal_embedding: torch.Tensor) -> None:
-        self.previous_embedding = None
+        self.previous_embedding = None if self.history_size == 1 else start_embedding
         self.current_embedding = start_embedding
-        goal_state = ilqr_base.make_markov_state(goal_embedding)
+        if self.history_size == 1:
+            goal_state = ilqr_base.make_markov_state(goal_embedding)
+        else:
+            goal_state = torch.cat((goal_embedding, goal_embedding), dim=-1)
         self.goal_state = goal_state.detach().cpu().numpy().astype(np.float64)
 
     def get_action(self, current_embedding: torch.Tensor) -> tuple[np.ndarray, dict[str, float]]:
         if self.goal_state is None:
             raise RuntimeError("ILQRPolicyAdapter.reset() must be called before get_action().")
-        current_state = ilqr_base.make_markov_state(current_embedding, self.previous_embedding)
+        if self.history_size == 1:
+            current_state = ilqr_base.make_markov_state(current_embedding, self.previous_embedding)
+        else:
+            previous = self.previous_embedding if self.previous_embedding is not None else current_embedding
+            current_state = torch.cat((previous, current_embedding), dim=-1)
         current_state_np = current_state.detach().cpu().numpy().astype(np.float64)
         _, u_plan, solve_time, n_iters, plan_cost = self.solver.solve(current_state_np, self.goal_state)
         u0_norm = u_plan[0].astype(np.float32)
@@ -235,7 +262,45 @@ class ILQRPolicyAdapter:
             "solve_time_ms": float(solve_time * 1000.0),
             "ilqr_iterations": float(n_iters),
             "plan_cost": float(plan_cost),
+            **self.solver.last_lpb_diagnostics,
         }
+
+
+class History2DynamicsTorch:
+    """One-step dynamics for the non-Markov history-2 MLP ablation."""
+
+    def __init__(self, model: torch.nn.Module, embed_dim: int, action_dim: int, device: torch.device) -> None:
+        predictor = model.predictor
+        if predictor.history_size != 2 or predictor.action_history_size != 1 or predictor.num_preds != 1:
+            raise ValueError(
+                "History-2 iLQR expects an MLP dynamics model with "
+                "history_size=2, action_history_size=1, and num_preds=1."
+            )
+        if type(model.action_encoder).__name__ != "Identity":
+            raise ValueError("This planner assumes an identity action encoder.")
+        if int(predictor.embed_dim) != int(embed_dim):
+            raise ValueError(f"Predictor embedding dim mismatch: expected {embed_dim}, got {predictor.embed_dim}.")
+        if int(predictor.action_dim) != int(action_dim):
+            raise ValueError(f"Predictor action dim mismatch: expected {action_dim}, got {predictor.action_dim}.")
+
+        self.predictor = predictor.to(device)
+        self.state_dim = int(2 * embed_dim)
+        self.embed_dim = int(embed_dim)
+        self.action_dim = int(action_dim)
+        self.device = device
+
+    def step(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        squeeze = x.ndim == 1
+        if squeeze:
+            x = x.unsqueeze(0)
+            u = u.unsqueeze(0)
+        prev = x[..., : self.embed_dim]
+        current = x[..., self.embed_dim :]
+        emb_hist = torch.stack((prev, current), dim=-2)
+        action = u.unsqueeze(-2)
+        pred_next = self.predictor(emb_hist, action)[..., 0, :]
+        next_state = torch.cat((current, pred_next), dim=-1)
+        return next_state[0] if squeeze else next_state
 
 
 def parse_args() -> argparse.Namespace:
@@ -302,6 +367,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-max-iters", type=int, default=15)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
+    parser.add_argument("--lpb-bank-path", type=Path, default=None)
+    parser.add_argument("--lpb-weight", type=float, default=1.0)
+    parser.add_argument("--lpb-threshold-scale", type=float, default=1.0)
+    parser.add_argument("--lpb-stage-only", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--policy", default=None, help="Stable-worldmodel run name, directory, or checkpoint stem.")
     parser.add_argument("--cache-dir", type=Path, default=None)
@@ -510,10 +579,27 @@ def load_ilqr_assets(args: argparse.Namespace, device: torch.device) -> tuple[IL
     )
     model = ilqr_base.load_model(checkpoint_path, device)
     history_size = int(config.get("history_size", 1))
-    if history_size != 1:
-        raise ValueError(f"Expected ILQR model history_size=1, got {history_size}.")
+    if history_size not in (1, 2):
+        raise ValueError(f"Expected ILQR model history_size in {{1, 2}}, got {history_size}.")
     img_size = int(config.get("img_size", 224))
     action_dim = int(config.get("action_dim", 2))
+    embed_dim = int(config.get("embed_dim", 18))
+    markov_state_dim = int(config.get("markov_state_dim", 2 * embed_dim))
+    lpb_barrier = None
+    lpb_bank_path = getattr(args, "lpb_bank_path", None)
+    if lpb_bank_path is not None:
+        from reacher.safety.lpb.barrier import ReacherLPBBarrier
+
+        lpb_barrier = ReacherLPBBarrier(
+            lpb_bank_path,
+            device=device,
+            threshold_scale=float(getattr(args, "lpb_threshold_scale", 1.0)),
+        )
+        if int(lpb_barrier.state_dim) != int(markov_state_dim):
+            raise ValueError(
+                "LPB bank Markov-state dimension does not match the Reacher iLQR model: "
+                f"bank={lpb_barrier.state_dim}, model={markov_state_dim}"
+            )
     stats_dataset_path = (
         args.stats_dataset_path.expanduser().resolve()
         if args.stats_dataset_path is not None
@@ -545,17 +631,34 @@ def load_ilqr_assets(args: argparse.Namespace, device: torch.device) -> tuple[IL
         ilqr_max_iters=args.ilqr_max_iters,
         ilqr_tol=args.ilqr_tol,
         ilqr_regularization=args.ilqr_regularization,
+        lpb_barrier=lpb_barrier,
+        lpb_weight=float(getattr(args, "lpb_weight", 1.0)),
+        lpb_stage_only=bool(getattr(args, "lpb_stage_only", True)),
     )
+    policy.set_lpb_enabled(lpb_barrier is not None)
     method_config = {
         "model_dir": str(model_dir),
         "checkpoint": str(checkpoint_path),
         "stats_dataset_path": str(stats_dataset_path),
         "img_size": img_size,
+        "history_size": history_size,
+        "ilqr_state_mode": policy.state_mode,
         "horizon": int(args.horizon),
         "q_terminal": float(args.q_terminal),
         "q_stage": float(args.q_stage),
         "r_control": float(args.r_control),
         "ilqr_max_iters": int(args.ilqr_max_iters),
+        "lpb": None
+        if lpb_barrier is None
+        else {
+            "bank_path": str(lpb_bank_path.expanduser().resolve()),
+            "weight": float(getattr(args, "lpb_weight", 1.0)),
+            "threshold": float(lpb_barrier.threshold),
+            "threshold_scale": float(getattr(args, "lpb_threshold_scale", 1.0)),
+            "scaled_threshold": float(lpb_barrier.scaled_threshold),
+            "stage_only": bool(getattr(args, "lpb_stage_only", True)),
+            "metadata": lpb_barrier.metadata,
+        },
     }
     return policy, model, method_config, train_stats_dataset.pixel_mean, train_stats_dataset.pixel_std, checkpoint_path
 

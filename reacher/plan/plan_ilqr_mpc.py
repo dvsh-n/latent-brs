@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 import json
+from typing import Any
 
 from reacher.eval.reacher_policy_viz import configure_offscreen_framebuffer
 try:
@@ -310,6 +311,9 @@ class ILQRMPCSolver:
         tol: float,
         regularization: float,
         device: torch.device,
+        lpb_barrier: Any | None = None,
+        lpb_weight: float = 0.0,
+        lpb_stage_only: bool = True,
     ) -> None:
         self.dynamics = dynamics
         self.state_dim = dynamics.state_dim
@@ -322,6 +326,11 @@ class ILQRMPCSolver:
         self.tol = float(tol)
         self.regularization = float(regularization)
         self.device = device
+        self.lpb_barrier = lpb_barrier
+        self.lpb_weight = float(lpb_weight)
+        self.lpb_stage_only = bool(lpb_stage_only)
+        self.lpb_enabled = lpb_barrier is not None and self.lpb_weight > 0.0
+        self.last_lpb_diagnostics: dict[str, float] = {}
         self.prev_u_guess = torch.zeros((self.horizon, self.action_dim), dtype=torch.float32, device=device)
         self.eye_x = torch.eye(self.state_dim, dtype=torch.float32, device=device)
         self.eye_u = torch.eye(self.action_dim, dtype=torch.float32, device=device)
@@ -352,7 +361,24 @@ class ILQRMPCSolver:
             cost = cost + self.r_control * torch.dot(u_seq[step], u_seq[step])
         terminal_err = x_traj[self.horizon] - x_goal
         cost = cost + self.q_terminal * torch.dot(terminal_err, terminal_err)
+        if self.lpb_enabled and self.lpb_barrier is not None:
+            cost = cost + self.lpb_weight * self.lpb_barrier.trajectory_penalty(
+                x_traj,
+                stage_only=self.lpb_stage_only,
+            )
         return cost
+
+    def _lpb_state_derivatives(self, x: torch.Tensor, *, mean_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.lpb_enabled or self.lpb_barrier is None:
+            return torch.zeros_like(x), torch.zeros((self.state_dim, self.state_dim), dtype=x.dtype, device=x.device)
+
+        def penalty_fn(state: torch.Tensor) -> torch.Tensor:
+            return self.lpb_weight * float(mean_scale) * self.lpb_barrier.state_penalty(state).reshape(())
+
+        x_req = x.detach().requires_grad_(True)
+        grad = torch.autograd.functional.jacobian(penalty_fn, x_req, vectorize=True).detach()
+        hess = torch.autograd.functional.hessian(penalty_fn, x_req, vectorize=True).detach()
+        return grad, 0.5 * (hess + hess.T)
 
     def _linearize_dynamics(
         self,
@@ -397,6 +423,14 @@ class ILQRMPCSolver:
             terminal_err = x_traj[self.horizon] - x_goal
             v_x = 2.0 * self.q_terminal * terminal_err
             v_xx = 2.0 * self.q_terminal * self.eye_x
+            lpb_mean_scale = 1.0 / float(self.horizon if self.lpb_stage_only else self.horizon + 1)
+            if self.lpb_enabled and not self.lpb_stage_only:
+                terminal_lpb_x, terminal_lpb_xx = self._lpb_state_derivatives(
+                    x_traj[self.horizon],
+                    mean_scale=lpb_mean_scale,
+                )
+                v_x = v_x + terminal_lpb_x
+                v_xx = v_xx + terminal_lpb_xx
             backward_ok = True
 
             for step in range(self.horizon - 1, -1, -1):
@@ -409,6 +443,9 @@ class ILQRMPCSolver:
                 l_u = 2.0 * self.r_control * u
                 l_xx = 2.0 * self.q_stage * self.eye_x
                 l_uu = 2.0 * self.r_control * self.eye_u
+                lpb_x, lpb_xx = self._lpb_state_derivatives(x_traj[step], mean_scale=lpb_mean_scale)
+                l_x = l_x + lpb_x
+                l_xx = l_xx + lpb_xx
 
                 q_x = l_x + a.T @ v_x
                 q_u = l_u + b.T @ v_x
@@ -468,6 +505,15 @@ class ILQRMPCSolver:
                 break
 
         self.prev_u_guess = u_seq.detach().clone()
+        if self.lpb_barrier is not None:
+            self.last_lpb_diagnostics = self.lpb_barrier.diagnostics(
+                x_traj.detach(),
+                stage_only=self.lpb_stage_only,
+            )
+            self.last_lpb_diagnostics["lpb_weight"] = float(self.lpb_weight)
+            self.last_lpb_diagnostics["lpb_enabled"] = float(self.lpb_enabled)
+        else:
+            self.last_lpb_diagnostics = {}
 
         maybe_cuda_synchronize(self.device)
         solve_time = time.perf_counter() - t0
