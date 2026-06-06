@@ -277,6 +277,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-max-iters", type=int, default=15)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
+    parser.add_argument("--lpb-bank-path", type=Path, default=None)
+    parser.add_argument("--lpb-weight", type=float, default=1.0)
+    parser.add_argument("--lpb-threshold-scale", type=float, default=1.0)
+    parser.add_argument("--lpb-stage-only", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--policy", default=None, help="Stable-worldmodel run name, directory, or object checkpoint.")
     parser.add_argument("--cache-dir", type=Path, default=None)
@@ -811,6 +815,9 @@ class ILQRMPCSolver:
         tol: float,
         regularization: float,
         device: torch.device,
+        lpb_barrier: Any | None = None,
+        lpb_weight: float = 0.0,
+        lpb_stage_only: bool = True,
     ) -> None:
         self.dynamics = dynamics
         self.state_dim = dynamics.state_dim
@@ -823,6 +830,11 @@ class ILQRMPCSolver:
         self.tol = float(tol)
         self.regularization = float(regularization)
         self.device = device
+        self.lpb_barrier = lpb_barrier
+        self.lpb_weight = float(lpb_weight)
+        self.lpb_stage_only = bool(lpb_stage_only)
+        self.lpb_enabled = lpb_barrier is not None and self.lpb_weight > 0.0
+        self.last_lpb_diagnostics: dict[str, float] = {}
         self.prev_u_guess = torch.zeros((self.horizon, self.action_dim), dtype=torch.float32, device=device)
         self.eye_x = torch.eye(self.state_dim, dtype=torch.float32, device=device)
         self.eye_u = torch.eye(self.action_dim, dtype=torch.float32, device=device)
@@ -853,7 +865,26 @@ class ILQRMPCSolver:
             cost = cost + self.r_control * torch.dot(u_seq[step], u_seq[step])
         terminal_err = x_traj[self.horizon] - x_goal
         cost = cost + self.q_terminal * torch.dot(terminal_err, terminal_err)
+        if self.lpb_enabled and self.lpb_barrier is not None:
+            cost = cost + self.lpb_weight * self.lpb_barrier.trajectory_penalty(
+                x_traj,
+                stage_only=self.lpb_stage_only,
+            )
         return cost
+
+    def _lpb_state_derivatives(self, x: torch.Tensor, *, mean_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.lpb_enabled or self.lpb_barrier is None:
+            return torch.zeros_like(x), torch.zeros((self.state_dim, self.state_dim), dtype=x.dtype, device=x.device)
+
+        def state_cost(state: torch.Tensor) -> torch.Tensor:
+            return self.lpb_weight * float(mean_scale) * self.lpb_barrier.state_penalty(state).reshape(())
+
+        state = x.detach().clone().requires_grad_(True)
+        cost = state_cost(state)
+        grad = torch.autograd.grad(cost, state, allow_unused=False)[0].detach()
+        hess = torch.autograd.functional.hessian(state_cost, state, vectorize=True).detach()
+        hess = 0.5 * (hess + hess.T)
+        return grad, hess
 
     def _linearize_dynamics(self, x_traj: torch.Tensor, u_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         a_list = []
@@ -894,6 +925,14 @@ class ILQRMPCSolver:
             terminal_err = x_traj[self.horizon] - x_goal
             v_x = 2.0 * self.q_terminal * terminal_err
             v_xx = 2.0 * self.q_terminal * self.eye_x
+            lpb_mean_scale = 1.0 / float(self.horizon if self.lpb_stage_only else self.horizon + 1)
+            if self.lpb_enabled and not self.lpb_stage_only:
+                terminal_lpb_x, terminal_lpb_xx = self._lpb_state_derivatives(
+                    x_traj[self.horizon],
+                    mean_scale=lpb_mean_scale,
+                )
+                v_x = v_x + terminal_lpb_x
+                v_xx = v_xx + terminal_lpb_xx
             backward_ok = True
 
             for step in range(self.horizon - 1, -1, -1):
@@ -906,6 +945,9 @@ class ILQRMPCSolver:
                 l_u = 2.0 * self.r_control * u
                 l_xx = 2.0 * self.q_stage * self.eye_x
                 l_uu = 2.0 * self.r_control * self.eye_u
+                lpb_x, lpb_xx = self._lpb_state_derivatives(x_traj[step], mean_scale=lpb_mean_scale)
+                l_x = l_x + lpb_x
+                l_xx = l_xx + lpb_xx
 
                 q_x = l_x + a.T @ v_x
                 q_u = l_u + b.T @ v_x
@@ -965,6 +1007,15 @@ class ILQRMPCSolver:
                 break
 
         self.prev_u_guess = u_seq.detach().clone()
+        if self.lpb_barrier is not None:
+            self.last_lpb_diagnostics = self.lpb_barrier.diagnostics(
+                x_traj.detach(),
+                stage_only=self.lpb_stage_only,
+            )
+            self.last_lpb_diagnostics["lpb_weight"] = float(self.lpb_weight)
+            self.last_lpb_diagnostics["lpb_enabled"] = float(self.lpb_enabled)
+        else:
+            self.last_lpb_diagnostics = {}
 
         maybe_cuda_synchronize(self.device)
         solve_time = time.perf_counter() - t0
@@ -993,6 +1044,9 @@ class ILQRPolicyAdapter:
         ilqr_max_iters: int,
         ilqr_tol: float,
         ilqr_regularization: float,
+        lpb_barrier: Any | None = None,
+        lpb_weight: float = 0.0,
+        lpb_stage_only: bool = True,
     ) -> None:
         self.action_mean = action_mean
         self.action_std = action_std
@@ -1012,10 +1066,16 @@ class ILQRPolicyAdapter:
             tol=ilqr_tol,
             regularization=ilqr_regularization,
             device=device,
+            lpb_barrier=lpb_barrier,
+            lpb_weight=lpb_weight,
+            lpb_stage_only=lpb_stage_only,
         )
         self.history_len = required_markov_history(self.markov_deriv)
         self.current_history: list[torch.Tensor] = []
         self.goal_state: np.ndarray | None = None
+
+    def set_lpb_enabled(self, enabled: bool) -> None:
+        self.solver.lpb_enabled = bool(enabled) and self.solver.lpb_barrier is not None and self.solver.lpb_weight > 0.0
 
     def reset(self, *, start_embedding: torch.Tensor, goal_embedding: torch.Tensor) -> None:
         self.current_history = [start_embedding] * self.history_len
@@ -1043,6 +1103,7 @@ class ILQRPolicyAdapter:
             "solve_time_ms": float(solve_time * 1000.0),
             "ilqr_iterations": float(n_iters),
             "ilqr_cost": float(plan_cost),
+            **self.solver.last_lpb_diagnostics,
         }
 
 
@@ -1317,6 +1378,22 @@ def load_ilqr_assets(args: argparse.Namespace, device: torch.device) -> tuple[IL
     )
     pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
     pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+    lpb_barrier = None
+    lpb_bank_path = getattr(args, "lpb_bank_path", None)
+    if lpb_bank_path is not None:
+        from rope.safety.lpb.barrier import RopeLPBBarrier
+
+        lpb_barrier = RopeLPBBarrier(
+            lpb_bank_path,
+            device=device,
+            threshold_scale=float(getattr(args, "lpb_threshold_scale", 1.0)),
+        )
+        expected_state_dim = int(config.get("markov_state_dim", (markov_deriv + 1) * int(config.get("embed_dim", 32))))
+        if int(lpb_barrier.state_dim) != expected_state_dim:
+            raise ValueError(
+                "LPB bank Markov-state dimension does not match the rope iLQR model: "
+                f"bank={lpb_barrier.state_dim}, model={expected_state_dim}"
+            )
     policy = ILQRPolicyAdapter(
         model=model,
         config=config,
@@ -1330,7 +1407,11 @@ def load_ilqr_assets(args: argparse.Namespace, device: torch.device) -> tuple[IL
         ilqr_max_iters=args.ilqr_max_iters,
         ilqr_tol=args.ilqr_tol,
         ilqr_regularization=args.ilqr_regularization,
+        lpb_barrier=lpb_barrier,
+        lpb_weight=float(getattr(args, "lpb_weight", 1.0)),
+        lpb_stage_only=bool(getattr(args, "lpb_stage_only", True)),
     )
+    policy.set_lpb_enabled(False)
     method_config = {
         "model_dir": str(model_dir),
         "checkpoint": str(checkpoint_path),
@@ -1342,6 +1423,17 @@ def load_ilqr_assets(args: argparse.Namespace, device: torch.device) -> tuple[IL
         "q_stage": float(args.q_stage),
         "r_control": float(args.r_control),
         "ilqr_max_iters": int(args.ilqr_max_iters),
+        "lpb": None
+        if lpb_barrier is None
+        else {
+            "bank_path": str(lpb_bank_path.expanduser().resolve()),
+            "weight": float(getattr(args, "lpb_weight", 1.0)),
+            "threshold": float(lpb_barrier.threshold),
+            "threshold_scale": float(getattr(args, "lpb_threshold_scale", 1.0)),
+            "scaled_threshold": float(lpb_barrier.scaled_threshold),
+            "stage_only": bool(getattr(args, "lpb_stage_only", True)),
+            "metadata": lpb_barrier.metadata,
+        },
     }
     return policy, model, method_config, pixel_mean, pixel_std, checkpoint_path
 
@@ -1730,6 +1822,12 @@ def build_run_metrics(
 ) -> dict[str, Any]:
     successes = np.asarray([case["success"] for case in case_results], dtype=bool)
     success_rate = 0.0 if successes.size == 0 else float(np.mean(successes) * 100.0)
+    lpb_records = [
+        item
+        for case in case_results
+        for item in case.get("step_records", [])
+        if "lpb_violation_rate" in item
+    ]
     return {
         "partial": bool(partial),
         "success_rate": success_rate,
@@ -1750,6 +1848,11 @@ def build_run_metrics(
         "eval_budget": int(args.eval_budget),
         "goal_tolerance_override": None if args.goal_tolerance is None else float(args.goal_tolerance),
         "goal_protocol": "start_step_0_to_final_episode_step",
+        "lpb_guided": bool(args.method == "ilqr" and getattr(args, "lpb_bank_path", None) is not None),
+        "lpb_violation_rate_mean": float(np.mean([item["lpb_violation_rate"] for item in lpb_records]))
+        if lpb_records
+        else None,
+        "lpb_distance_max": float(np.max([item["lpb_distance_max"] for item in lpb_records])) if lpb_records else None,
         "cases": case_results,
     }
 
@@ -1830,6 +1933,7 @@ def isolated_case_worker(
         if args.method == "ilqr":
             debug_log(args, f"worker_load_ilqr_start case_idx={case_idx}", log_path=debug_log_path)
             ilqr_assets = load_ilqr_assets(args, device)
+            ilqr_assets[0].set_lpb_enabled(getattr(args, "lpb_bank_path", None) is not None)
             debug_log(args, f"worker_load_ilqr_done case_idx={case_idx}", log_path=debug_log_path, nvidia_smi=True)
         else:
             debug_log(args, f"worker_make_swm_start case_idx={case_idx}", log_path=debug_log_path)
@@ -2006,9 +2110,19 @@ def main() -> None:
                 "q_stage": float(args.q_stage),
                 "r_control": float(args.r_control),
                 "ilqr_max_iters": int(args.ilqr_max_iters),
+                "lpb": None
+                if args.lpb_bank_path is None
+                else {
+                    "bank_path": str(args.lpb_bank_path.expanduser().resolve()),
+                    "weight": float(args.lpb_weight),
+                    "threshold_scale": float(args.lpb_threshold_scale),
+                    "stage_only": bool(args.lpb_stage_only),
+                    "loaded_in_isolated_workers": True,
+                },
             }
         else:
             ilqr_assets = load_ilqr_assets(args, device)
+            ilqr_assets[0].set_lpb_enabled(getattr(args, "lpb_bank_path", None) is not None)
             method_config = ilqr_assets[2]
     else:
         if args.isolate_cases:
