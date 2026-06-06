@@ -5,7 +5,7 @@ mirrors the cube and rope LPB path: build a shuffled prototype bank from
 encoded trusted Reacher states, then add the nearest-prototype penalty to iLQR.
 
 By default, the bank filters safe states with the same joint-space obstacle rule
-used by `reacher/Haoran_obs_data/obs_data_collect_new.py`: obstacle/unsafe means
+used by `reacher/experiments/legacy_obstacle/collect_joint_box_obstacle_data.py`: obstacle/unsafe means
 `qpos` lies inside the configured box, default `q1 in [0, 3.1415]` and
 `q2 in [-2.88, -2.45]`; safe means outside that box.
 

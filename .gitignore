@@ -30,6 +30,7 @@ wandb/
 **/runs/
 **/*_eval/
 **/__MACOSX/
+**/requirements_frozen*.txt
 
 # Large local datasets, checkpoints, and rendered media
 reacher/models/reacher-v5-sac-expert/

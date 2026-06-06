@@ -7,8 +7,10 @@ methods across several control environments.
 
 - `reacher/`, `pusht/`, `rope/`, and `ogbench/`: environment-specific data,
   training, evaluation, planning, and safety code.
+- Task-local `experiments/` directories: preserved experimental workflows that
+  may depend on legacy code or local artifacts.
 - `shared/`: code intended for reuse across environments.
-- `scripts/`: experiment launchers, queue helpers, and visualization utilities.
+- `scripts/`: visualization utilities and third-party maintenance helpers.
 - `third_party/`: external repositories managed primarily as Git submodules.
 - `data/`, task-local `data/` directories, `models/`, and output directories:
   local datasets, checkpoints, and generated experiment artifacts.

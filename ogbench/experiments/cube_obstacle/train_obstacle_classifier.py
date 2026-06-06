@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and conformalize an OGBench cube latent obstacle classifier."""
+"""Train and conformalize an OGBench cube latent obstacle classifier from collected obstacle data."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -28,11 +28,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
-from ogbench.safety.compat import register_legacy_checkpoint_aliases
-
-DEFAULT_MODEL_DIR = "ogbench/models/mlpdyn"
-DEFAULT_DATA_PATH = "ogbench/experiments/cube_obstacle/obstacle_data/obstacle_classifier_data.pt"
-DEFAULT_OUT_DIR = "ogbench/safety/obs_net"
+DEFAULT_MODEL_DIR = "ogbench_cube/models/mlpdyn_embd_8"
+DEFAULT_DATA_PATH = "ogbench_cube/plan/obstacle_data/obstacle_classifier_data.pt"
+DEFAULT_OUT_DIR = "ogbench_cube/plan/obs_net"
+DEFAULT_ACTIVATION = nn.GELU
+DEFAULT_SOURCE_TRAIN_FRAC = 0.9
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,39 +44,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--frame-batch-size", type=int, default=64)
-    parser.add_argument(
-        "--hidden-dim",
-        type=int,
-        default=None,
-        help="Classifier hidden width. Defaults to input_dim for --head-style dino and 32 for postnorm heads.",
-    )
+    parser.add_argument("--hidden-dim", type=int, default=12)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument(
-        "--head-style",
-        choices=("dino", "dino-gelu", "postnorm-relu", "postnorm-gelu"),
-        default="dino",
-        help="Classifier head architecture. dino uses LayerNorm(input)->Linear->activation->Linear.",
-    )
-    parser.add_argument(
-        "--feature-normalization",
-        choices=("none", "zscore"),
-        default="none",
-        help="Latent preprocessing before the classifier. DINO-WM-style training uses none.",
-    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--margin", type=float, default=0.75)
-    parser.add_argument(
-        "--loss",
-        choices=("latent-safety-dino", "signed-hinge"),
-        default="latent-safety-dino",
-        help="Classifier loss. latent-safety-dino matches the DINO branch failure-head training loss.",
-    )
+    parser.add_argument("--margin", type=float, default=1.0)
     parser.add_argument("--delta", type=float, default=0.01)
-    parser.add_argument("--source-train-frac", type=float, default=0.9)
+    parser.add_argument("--source-train-frac", type=float, default=DEFAULT_SOURCE_TRAIN_FRAC)
     parser.add_argument("--validation-frac", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--force-retrain", action="store_true")
@@ -84,7 +61,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def log_progress(message: str) -> None:
-    print(f"[ogbench_obstacle_net] {message}", flush=True)
+    print(f"[ogbench_cube_obstacle_net] {message}", flush=True)
 
 
 def save_json(path: Path, payload: dict[str, Any]) -> None:
@@ -138,7 +115,6 @@ def require_device(device_arg: str) -> torch.device:
 def load_world_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    register_legacy_checkpoint_aliases()
     model = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model = model.to(device)
     model.eval()
@@ -148,12 +124,7 @@ def load_world_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Mo
 
 def load_obstacle_dataset(data_path: Path) -> dict[str, Any]:
     if not data_path.is_file():
-        candidates = sorted(data_path.parent.glob(f"{data_path.stem}-*.pt"))
-        if len(candidates) == 1:
-            data_path = candidates[0]
-            log_progress(f"Default obstacle dataset missing; using {data_path}.")
-        else:
-            raise FileNotFoundError(f"Obstacle dataset not found: {data_path}")
+        raise FileNotFoundError(f"Obstacle dataset not found: {data_path}")
     payload = torch.load(data_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or "dataset" not in payload:
         raise ValueError(f"Unexpected obstacle dataset format in {data_path}.")
@@ -226,38 +197,16 @@ def encode_pixels(
 
 
 class ObstacleMLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        depth: int,
-        dropout: float,
-        *,
-        head_style: str = "postnorm-gelu",
-    ) -> None:
+    def __init__(self, input_dim: int, hidden_dim: int, depth: int, dropout: float) -> None:
         super().__init__()
         if depth < 1:
             raise ValueError(f"Expected depth >= 1, got {depth}.")
-        if hidden_dim <= 0:
-            raise ValueError(f"Expected hidden_dim > 0, got {hidden_dim}.")
-        if head_style in {"dino", "dino-gelu"}:
-            activation: nn.Module = nn.ReLU() if head_style == "dino" else nn.GELU()
-            self.net = nn.Sequential(
-                nn.LayerNorm(input_dim),
-                nn.Linear(input_dim, hidden_dim),
-                activation,
-                nn.Linear(hidden_dim, 1),
-            )
-            return
-        if head_style not in {"postnorm-relu", "postnorm-gelu"}:
-            raise ValueError(f"Unknown obstacle classifier head style: {head_style!r}.")
-        activation_cls: type[nn.Module] = nn.ReLU if head_style == "postnorm-relu" else nn.GELU
         layers: list[nn.Module] = []
         in_dim = input_dim
         for _ in range(depth - 1):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(activation_cls())
+            layers.append(DEFAULT_ACTIVATION())
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
             in_dim = hidden_dim
@@ -266,33 +215,6 @@ class ObstacleMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
-
-
-def split_stratified_validation(
-    train_idx: np.ndarray,
-    labels: np.ndarray,
-    *,
-    validation_frac: float,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
-    if not 0.0 < validation_frac < 1.0:
-        raise ValueError("--validation-frac must be between 0 and 1.")
-    train_parts: list[np.ndarray] = []
-    val_parts: list[np.ndarray] = []
-    for label in sorted(np.unique(labels[train_idx]).tolist()):
-        class_idx = train_idx[labels[train_idx] == label].copy()
-        rng.shuffle(class_idx)
-        if class_idx.shape[0] < 2:
-            raise ValueError(f"Need at least two training samples for class {label}.")
-        val_count = int(np.ceil(validation_frac * class_idx.shape[0]))
-        val_count = min(max(val_count, 1), class_idx.shape[0] - 1)
-        val_parts.append(class_idx[:val_count])
-        train_parts.append(class_idx[val_count:])
-    split_train = np.concatenate(train_parts, axis=0).astype(np.int64)
-    split_val = np.concatenate(val_parts, axis=0).astype(np.int64)
-    rng.shuffle(split_train)
-    rng.shuffle(split_val)
-    return split_train, split_val
 
 
 def split_indices(indices: np.ndarray, rng: np.random.Generator, train_fraction: float) -> tuple[np.ndarray, np.ndarray]:
@@ -327,54 +249,40 @@ def split_stratified_train_calibration(
     return source_train_idx, calibration_idx
 
 
+def split_stratified_validation(
+    train_idx: np.ndarray,
+    labels: np.ndarray,
+    *,
+    validation_frac: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not 0.0 < validation_frac < 1.0:
+        raise ValueError("--validation-frac must be between 0 and 1.")
+    train_parts: list[np.ndarray] = []
+    val_parts: list[np.ndarray] = []
+    for label in sorted(np.unique(labels[train_idx]).tolist()):
+        class_idx = train_idx[labels[train_idx] == label].copy()
+        rng.shuffle(class_idx)
+        if class_idx.shape[0] < 2:
+            raise ValueError(f"Need at least two source-train samples for class {label}.")
+        val_count = int(np.ceil(validation_frac * class_idx.shape[0]))
+        val_count = min(max(val_count, 1), class_idx.shape[0] - 1)
+        val_parts.append(class_idx[:val_count])
+        train_parts.append(class_idx[val_count:])
+    split_train = np.concatenate(train_parts, axis=0).astype(np.int64)
+    split_val = np.concatenate(val_parts, axis=0).astype(np.int64)
+    rng.shuffle(split_train)
+    rng.shuffle(split_val)
+    return split_train, split_val
+
+
 def to_signed_labels(binary_labels: np.ndarray) -> np.ndarray:
     labels = np.asarray(binary_labels, dtype=np.int64)
-    return np.where(labels == 0, 1.0, -1.0).astype(np.float32)
+    return np.where(labels == 1, -1.0, 1.0).astype(np.float32)
 
 
 def hinge_loss(scores: torch.Tensor, labels: torch.Tensor, *, margin: float) -> torch.Tensor:
     return torch.clamp(float(margin) - labels * scores, min=0.0).mean()
-
-
-def latent_safety_dino_failure_loss(scores: torch.Tensor, failure_labels: torch.Tensor, *, margin: float) -> torch.Tensor:
-    """Match latent-safety's DINO failure-head classifier loss.
-
-    Label convention follows `origin/dino:dino_wm/train_dino_classifier.py`:
-    0 = safe, 1 = unsafe, 2 = weak unsafe. Safe scores are pushed above
-    `+margin`; unsafe scores are pushed below `-margin`; weak unsafe scores are
-    pushed below zero.
-    """
-
-    labels = failure_labels.to(dtype=torch.long)
-    safe = scores[labels == 0]
-    unsafe = scores[labels == 1]
-    weak_unsafe = scores[labels == 2]
-    zero = scores.sum() * 0.0
-    loss = zero
-    if safe.numel() > 0:
-        loss = loss + torch.relu(float(margin) - safe).mean()
-    if unsafe.numel() > 0:
-        loss = loss + torch.relu(float(margin) + unsafe).mean()
-    if weak_unsafe.numel() > 0:
-        loss = loss + torch.relu(weak_unsafe).mean()
-    return loss
-
-
-def classifier_loss(
-    scores: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    margin: float,
-    loss_name: str,
-) -> torch.Tensor:
-    if loss_name == "latent-safety-dino":
-        return latent_safety_dino_failure_loss(scores, labels, margin=margin)
-    if loss_name == "signed-hinge":
-        labels_float = labels.to(dtype=torch.float32)
-        if torch.all((labels_float == 0.0) | (labels_float == 1.0) | (labels_float == 2.0)):
-            labels_float = torch.where(labels_float == 0.0, torch.ones_like(labels_float), -torch.ones_like(labels_float))
-        return hinge_loss(scores, labels_float, margin=margin)
-    raise ValueError(f"Unknown classifier loss: {loss_name!r}.")
 
 
 def compute_signed_metrics(scores: torch.Tensor, labels: torch.Tensor, *, threshold: float = 0.0) -> dict[str, float]:
@@ -404,8 +312,6 @@ def evaluate_signed_model(
     batch_size: int,
     device: torch.device,
     margin: float,
-    loss_name: str,
-    failure_labels: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     model.eval()
     score_chunks: list[torch.Tensor] = []
@@ -414,14 +320,7 @@ def evaluate_signed_model(
             xb = x[start : start + batch_size].to(device)
             score_chunks.append(model(xb).cpu())
     scores = torch.cat(score_chunks, dim=0)
-    if loss_name == "latent-safety-dino":
-        if failure_labels is None:
-            eval_labels = torch.where(y > 0.0, torch.zeros_like(y, dtype=torch.long), torch.ones_like(y, dtype=torch.long))
-        else:
-            eval_labels = failure_labels.to(dtype=torch.long)
-    else:
-        eval_labels = y
-    loss = float(classifier_loss(scores, eval_labels, margin=margin, loss_name=loss_name).item())
+    loss = float(hinge_loss(scores, y, margin=margin).item())
     metrics = compute_signed_metrics(scores, y, threshold=0.0)
     return {
         "loss": loss,
@@ -485,9 +384,6 @@ class ObstacleNetConfig:
     lr: float
     weight_decay: float
     margin: float
-    loss: str
-    head_style: str
-    feature_normalization: str
     delta: float
     source_train_frac: float
     validation_frac: float
@@ -513,7 +409,6 @@ def build_run_config(
     model_dir: Path,
     checkpoint_path: Path,
     data_path: Path,
-    hidden_dim: int,
     embed_dim: int,
     img_size: int,
 ) -> ObstacleNetConfig:
@@ -523,7 +418,7 @@ def build_run_config(
         data_path=str(data_path),
         seed=int(args.seed),
         frame_batch_size=int(args.frame_batch_size),
-        hidden_dim=int(hidden_dim),
+        hidden_dim=int(args.hidden_dim),
         depth=int(args.depth),
         dropout=float(args.dropout),
         epochs=int(args.epochs),
@@ -531,9 +426,6 @@ def build_run_config(
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         margin=float(args.margin),
-        loss=str(args.loss),
-        head_style=str(args.head_style),
-        feature_normalization=str(args.feature_normalization),
         delta=float(args.delta),
         source_train_frac=float(args.source_train_frac),
         validation_frac=float(args.validation_frac),
@@ -561,18 +453,10 @@ def make_feature_tensors(
     train_latents: np.ndarray,
     val_latents: np.ndarray,
     cal_latents: np.ndarray,
-    *,
-    feature_normalization: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     train_x = torch.from_numpy(train_latents.astype(np.float32))
-    if feature_normalization == "none":
-        train_mean = torch.zeros((train_x.shape[1],), dtype=torch.float32)
-        train_std = torch.ones((train_x.shape[1],), dtype=torch.float32)
-    elif feature_normalization == "zscore":
-        train_mean = train_x.mean(dim=0)
-        train_std = train_x.std(dim=0).clamp_min(1e-6)
-    else:
-        raise ValueError(f"Unknown feature normalization: {feature_normalization!r}.")
+    train_mean = train_x.mean(dim=0)
+    train_std = train_x.std(dim=0).clamp_min(1e-6)
 
     def normalize(x_np: np.ndarray) -> torch.Tensor:
         return (torch.from_numpy(x_np.astype(np.float32)) - train_mean) / train_std
@@ -599,20 +483,14 @@ def main() -> None:
     )
     data_path = args.data_path.expanduser().resolve()
     config_dict = load_config(model_dir)
-    embed_dim = int(config_dict.get("embed_dim", 12))
+    embed_dim = int(config_dict.get("embed_dim", 8))
     img_size = int(config_dict.get("img_size", 224))
-    hidden_dim = (
-        int(args.hidden_dim)
-        if args.hidden_dim is not None
-        else (embed_dim if args.head_style == "dino" else 32)
-    )
 
     run_config = build_run_config(
         args,
         model_dir=model_dir,
         checkpoint_path=checkpoint_path,
         data_path=data_path,
-        hidden_dim=hidden_dim,
         embed_dim=embed_dim,
         img_size=img_size,
     )
@@ -632,24 +510,32 @@ def main() -> None:
     dataset = data_payload["dataset"]
     pixels = np.asarray(dataset["pixels"], dtype=np.uint8)
     labels_binary = np.asarray(dataset["label"], dtype=np.int64)
-    split_origin = "dataset"
-    if "train_idx" in dataset and "calibration_idx" in dataset:
-        source_train_idx = np.asarray(dataset["train_idx"], dtype=np.int64)
-        calibration_idx = np.asarray(dataset["calibration_idx"], dtype=np.int64)
-    else:
-        source_train_idx, calibration_idx = split_stratified_train_calibration(
-            labels_binary,
-            source_train_frac=float(args.source_train_frac),
-            rng=rng,
-        )
-        split_origin = "generated_in_obstacle_classifier"
 
     if pixels.ndim != 4 or pixels.shape[-1] != 3:
         raise ValueError(f"Expected pixels with shape (N, H, W, 3), got {pixels.shape}.")
     if labels_binary.shape[0] != pixels.shape[0]:
         raise ValueError("Label count does not match pixel count.")
-    if not set(np.unique(labels_binary).tolist()).issubset({0, 1, 2}):
-        raise ValueError("Expected labels with 0=non-obstacle, 1=obstacle, and optional 2=weak obstacle.")
+    if not set(np.unique(labels_binary).tolist()).issubset({0, 1}):
+        raise ValueError("Expected binary labels with 1=obstacle and 0=non-obstacle.")
+
+    source_train_idx = (
+        np.asarray(dataset["train_idx"], dtype=np.int64)
+        if "train_idx" in dataset and "calibration_idx" in dataset
+        else None
+    )
+    calibration_idx = (
+        np.asarray(dataset["calibration_idx"], dtype=np.int64)
+        if "train_idx" in dataset and "calibration_idx" in dataset
+        else None
+    )
+    split_origin = "dataset"
+    if source_train_idx is None or calibration_idx is None:
+        source_train_idx, calibration_idx = split_stratified_train_calibration(
+            labels_binary,
+            source_train_frac=float(args.source_train_frac),
+            rng=rng,
+        )
+        split_origin = "generated_in_obstacle_net"
 
     train_idx, val_idx = split_stratified_validation(
         source_train_idx,
@@ -660,9 +546,9 @@ def main() -> None:
     y_train = to_signed_labels(labels_binary[train_idx])
     y_val = to_signed_labels(labels_binary[val_idx])
     y_cal = to_signed_labels(labels_binary[calibration_idx])
-    cal_obstacle_mask = labels_binary[calibration_idx] != 0
+    cal_obstacle_mask = labels_binary[calibration_idx] == 1
 
-    log_progress("Loading ogbench world model and encoding train, validation, and calibration frames.")
+    log_progress("Loading OGBench world model and encoding train, validation, and calibration frames.")
     world_model = load_world_model(checkpoint_path, device)
     encode_start = time.perf_counter()
     train_latents = encode_pixels(
@@ -702,16 +588,12 @@ def main() -> None:
         train_latents,
         val_latents,
         cal_latents,
-        feature_normalization=str(args.feature_normalization),
     )
-    train_failure_tensor = torch.from_numpy(labels_binary[train_idx].astype(np.int64))
-    val_failure_tensor = torch.from_numpy(labels_binary[val_idx].astype(np.int64))
-    cal_failure_tensor = torch.from_numpy(labels_binary[calibration_idx].astype(np.int64))
     y_train_tensor = torch.from_numpy(y_train)
     y_val_tensor = torch.from_numpy(y_val)
     y_cal_tensor = torch.from_numpy(y_cal)
 
-    train_ds = TensorDataset(normalized_train, train_failure_tensor)
+    train_ds = TensorDataset(normalized_train, y_train_tensor)
     train_loader = DataLoader(
         train_ds,
         batch_size=min(int(args.batch_size), max(1, len(train_ds))),
@@ -719,16 +601,12 @@ def main() -> None:
         num_workers=int(args.num_workers),
     )
 
-    model = ObstacleMLP(
-        embed_dim,
-        hidden_dim,
-        int(args.depth),
-        float(args.dropout),
-        head_style=str(args.head_style),
-    ).to(device)
+    model = ObstacleMLP(embed_dim, int(args.hidden_dim), int(args.depth), float(args.dropout)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
-    log_progress(f"Training classifier on {len(train_ds)} train / {len(val_idx)} validation / {len(calibration_idx)} calibration samples.")
+    log_progress(
+        f"Training classifier on {len(train_ds)} train / {len(val_idx)} validation / {len(calibration_idx)} calibration samples."
+    )
     train_start = time.perf_counter()
     for _ in tqdm(range(int(args.epochs)), desc="Training epochs", unit="epoch"):
         model.train()
@@ -736,7 +614,7 @@ def main() -> None:
             xb = xb.to(device)
             yb = yb.to(device)
             scores = model(xb)
-            loss = classifier_loss(scores, yb, margin=float(args.margin), loss_name=str(args.loss))
+            loss = hinge_loss(scores, yb, margin=float(args.margin))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -749,8 +627,6 @@ def main() -> None:
         batch_size=int(args.batch_size),
         device=device,
         margin=float(args.margin),
-        loss_name=str(args.loss),
-        failure_labels=train_failure_tensor,
     )
     val_eval = evaluate_signed_model(
         model,
@@ -759,8 +635,6 @@ def main() -> None:
         batch_size=int(args.batch_size),
         device=device,
         margin=float(args.margin),
-        loss_name=str(args.loss),
-        failure_labels=val_failure_tensor,
     )
     cal_eval = evaluate_signed_model(
         model,
@@ -769,8 +643,6 @@ def main() -> None:
         batch_size=int(args.batch_size),
         device=device,
         margin=float(args.margin),
-        loss_name=str(args.loss),
-        failure_labels=cal_failure_tensor,
     )
 
     cal_scores = np.asarray(cal_eval["scores"], dtype=np.float64)
@@ -788,26 +660,21 @@ def main() -> None:
         {
             "state_dict": model.state_dict(),
             "input_dim": int(embed_dim),
-            "hidden_dim": int(hidden_dim),
+            "hidden_dim": int(args.hidden_dim),
             "depth": int(args.depth),
             "dropout": float(args.dropout),
-            "head_style": str(args.head_style),
-            "feature_normalization": str(args.feature_normalization),
             "feature_mean": train_mean.numpy().astype(np.float32),
             "feature_std": train_std.numpy().astype(np.float32),
             "score_sign_convention": {
                 "obstacle": "negative",
                 "non_obstacle": "positive",
                 "binary_source_labels": {"obstacle": 1, "non_obstacle": 0},
-                "weak_obstacle_label": 2,
             },
             "base_decision_threshold": 0.0,
             "conformal_safe_score_threshold": float(safe_score_threshold),
             "conformal_delta": float(args.delta),
             "conformal_nonconformity_definition": "max(0, NN(x)) on obstacle calibration samples",
             "conformal_score_quantile": float(conformal["score_quantile"]),
-            "classifier_loss": str(args.loss),
-            "classifier_loss_reference": "latent-safety origin/dino:dino_wm/train_dino_classifier.py fail_loss",
             "cache_config": asdict(run_config),
             "source_metadata": jsonable(metadata),
         },
@@ -819,7 +686,6 @@ def main() -> None:
             "val_idx": val_idx.astype(np.int64),
             "calibration_idx": calibration_idx.astype(np.int64),
             "source_train_idx": source_train_idx.astype(np.int64),
-            "split_origin": split_origin,
             "train_latents": train_latents.astype(np.float32),
             "val_latents": val_latents.astype(np.float32),
             "calibration_latents": cal_latents.astype(np.float32),
@@ -829,6 +695,7 @@ def main() -> None:
             "train_labels_binary": labels_binary[train_idx].astype(np.int64),
             "val_labels_binary": labels_binary[val_idx].astype(np.int64),
             "calibration_labels_binary": labels_binary[calibration_idx].astype(np.int64),
+            "split_origin": split_origin,
             "eval": {
                 "train": train_eval,
                 "val": val_eval,
@@ -847,8 +714,6 @@ def main() -> None:
                     "cal": cal_cp,
                 },
             },
-            "head_style": str(args.head_style),
-            "feature_normalization": str(args.feature_normalization),
             "feature_mean": train_mean.numpy().astype(np.float32),
             "feature_std": train_std.numpy().astype(np.float32),
         },
@@ -876,40 +741,10 @@ def main() -> None:
             "cal": int(calibration_idx.shape[0]),
             "train_obstacle": int(np.sum(labels_binary[train_idx] == 1)),
             "train_non_obstacle": int(np.sum(labels_binary[train_idx] == 0)),
-            "train_weak_obstacle": int(np.sum(labels_binary[train_idx] == 2)),
             "val_obstacle": int(np.sum(labels_binary[val_idx] == 1)),
             "val_non_obstacle": int(np.sum(labels_binary[val_idx] == 0)),
-            "val_weak_obstacle": int(np.sum(labels_binary[val_idx] == 2)),
             "cal_obstacle": int(np.sum(labels_binary[calibration_idx] == 1)),
             "cal_non_obstacle": int(np.sum(labels_binary[calibration_idx] == 0)),
-            "cal_weak_obstacle": int(np.sum(labels_binary[calibration_idx] == 2)),
-        },
-        "classifier_loss": {
-            "name": str(args.loss),
-            "margin": float(args.margin),
-            "reference": "latent-safety origin/dino:dino_wm/train_dino_classifier.py fail_loss",
-            "formula": "mean(relu(gamma - safe_scores)) + mean(relu(gamma + unsafe_scores)) + mean(relu(weak_unsafe_scores))",
-            "label_convention": {
-                "safe": 0,
-                "unsafe": 1,
-                "weak_unsafe": 2,
-            },
-        },
-        "classifier_head": {
-            "style": str(args.head_style),
-            "feature_normalization": str(args.feature_normalization),
-            "architecture": (
-                "LayerNorm(input_dim) -> Linear(input_dim, hidden_dim) -> ReLU -> Linear(hidden_dim, 1)"
-                if args.head_style == "dino"
-                else "LayerNorm(input_dim) -> Linear(input_dim, hidden_dim) -> GELU -> Linear(hidden_dim, 1)"
-                if args.head_style == "dino-gelu"
-                else "Linear -> LayerNorm -> ReLU blocks -> Linear(1)"
-                if args.head_style == "postnorm-relu"
-                else "Linear -> LayerNorm -> GELU blocks -> Linear(1)"
-            ),
-            "hidden_dim": int(hidden_dim),
-            "depth": int(args.depth),
-            "dropout": float(args.dropout),
         },
         "metrics": {
             "train": compact_eval(train_eval),
@@ -933,7 +768,6 @@ def main() -> None:
             "obstacle": "negative",
             "non_obstacle": "positive",
             "binary_source_labels": {"obstacle": 1, "non_obstacle": 0},
-            "weak_obstacle_label": 2,
         },
     }
     save_json(paths.summary, summary)

@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 from reacher.plan.benchmark_reacher_hard import wrapped_qpos_distance
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-HAORAN_ILQR_PATH = REPO_ROOT / "reacher" / "Haoran_obs_data" / "reacher_stuff" / "reacher_stuff" / "plan_ilqr_mpc.py"
+HAORAN_ILQR_PATH = REPO_ROOT / "reacher" / "experiments" / "legacy_obstacle" / "plan_ilqr_mpc.py"
 DEFAULT_START_GOAL_PATH = REPO_ROOT / "reacher" / "Haoran_obs_data" / "reacher_stuff" / "reacher_stuff" / "start_goal.pt"
 DEFAULT_MODEL_DIR = REPO_ROOT / "reacher" / "Haoran_obs_data" / "reacher_stuff" / "reacher_stuff" / "mlpdyn_ft_6"
 DEFAULT_CHECKPOINT = DEFAULT_MODEL_DIR / "lewm_epoch_1_object.ckpt"

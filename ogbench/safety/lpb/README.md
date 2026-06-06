@@ -114,7 +114,7 @@ Artifacts analyzed:
 There were two model tracks:
 
 - LPB bank/eval used the default 24-D cube model at `ogbench/models/mlpdyn`, with `markov_state_dim=48`.
-- PyHJ/HJ-filter safety used the older 8-D cube model at `ogbench/obstacle_shit/mlpdyn_embd_8`, with `markov_state_dim=16`.
+- PyHJ/HJ-filter safety used the older 8-D cube model at `ogbench/experiments/cube_obstacle/mlpdyn_embd_8`, with `markov_state_dim=16`.
 
 This matters because LPB banks, latent caches, policies, and planners are dimension-locked to the world model that produced their latents.
 
@@ -139,8 +139,8 @@ Hard cube planning baseline context:
 
 Classifier:
 
-- Model: `ogbench/obstacle_shit/mlpdyn_embd_8/lewm_epoch_2_object.ckpt`.
-- Data: `ogbench/obstacle_shit/obstacle_data/obstacle_classifier_data-002.pt`.
+- Model: `ogbench/experiments/cube_obstacle/mlpdyn_embd_8/lewm_epoch_2_object.ckpt`.
+- Data: `ogbench/experiments/cube_obstacle/obstacle_data/obstacle_classifier_data-002.pt`.
 - Size: 16,384 balanced samples.
 - Train/val/cal accuracy: 0.9940 / 0.9946 / 0.9933.
 - Recall on obstacle class was 1.0 for train, validation, and calibration.

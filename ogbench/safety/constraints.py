@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-DEFAULT_OBSTACLE_DATA_PATH = "ogbench/obstacle_shit/obstacle_data/summary.json"
+DEFAULT_OBSTACLE_DATA_PATH = "ogbench/experiments/cube_obstacle/obstacle_data/summary.json"
 
 DEFAULT_RULE = {
     "obstacle_profile": "half_ellipse",
