@@ -127,6 +127,7 @@ DEFAULT_NUM_EVAL = 50
 DEFAULT_EVAL_BUDGET = 120
 DEFAULT_SEED = 42
 DEFAULT_CUBE_SUCCESS_THRESHOLD = 0.04
+DEFAULT_HEIGHT_THRESHOLD = 0.09
 DEFAULT_SWM_HISTORY_SIZE = 3
 
 DEVICE = "auto"
@@ -271,11 +272,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--num-eval", type=int, default=DEFAULT_NUM_EVAL)
     parser.add_argument("--episode-idx", type=int, default=None)
+    parser.add_argument("--start-goal-path", type=Path, default=None)
+    parser.add_argument(
+        "--use-start-goal-pixels",
+        action="store_true",
+        help="When --start-goal-path provides pixels, use stored start/goal images for WM embeddings.",
+    )
     parser.add_argument("--eval-budget", type=int, default=DEFAULT_EVAL_BUDGET)
     parser.add_argument("--cube-success-threshold", type=float, default=DEFAULT_CUBE_SUCCESS_THRESHOLD)
+    parser.add_argument("--success-mode", choices=("cube_distance", "ogbench_success"), default="cube_distance")
+    parser.add_argument(
+        "--height-threshold",
+        type=float,
+        default=DEFAULT_HEIGHT_THRESHOLD,
+        help="Geometry safety threshold: unsafe iff proprio/effector_pos[2] is greater than this value.",
+    )
     parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--video-fps", type=int, default=VIDEO_FPS)
     parser.add_argument("--no-videos", action="store_true")
+    parser.add_argument("--save-frame-archive", action="store_true")
 
     parser.add_argument("--model-dir", type=Path, default=Path(DEFAULT_MODEL_DIR))
     parser.add_argument("--checkpoint", type=Path, default=None)
@@ -286,6 +301,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ilqr-max-iters", type=int, default=15)
     parser.add_argument("--ilqr-tol", type=float, default=1e-4)
     parser.add_argument("--ilqr-regularization", type=float, default=1e-3)
+    parser.add_argument("--lpb-bank-path", type=Path, default=None)
+    parser.add_argument("--lpb-weight", type=float, default=1.0)
+    parser.add_argument("--lpb-threshold-scale", type=float, default=1.0)
+    parser.add_argument("--lpb-stage-only", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--env-max-episode-steps", type=int, default=None)
     parser.add_argument("--max-oracle-steps", type=int, default=MAX_ORACLE_STEPS)
@@ -294,6 +313,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oracle-noise-smoothing", type=float, default=ORACLE_NOISE_SMOOTHING)
     parser.add_argument("--grasp-contact-threshold", type=float, default=GRASP_CONTACT_THRESHOLD)
     parser.add_argument("--grasp-alignment-threshold", type=float, default=GRASP_ALIGNMENT_THRESHOLD)
+    parser.add_argument(
+        "--constant-grasp-action-norm",
+        type=float,
+        default=None,
+        help="If set, clamp standardized action[4] to this value before stepping the policy action.",
+    )
+    parser.add_argument(
+        "--constant-grasp-action",
+        type=float,
+        default=None,
+        help="If set, clamp raw action[4] to this value before stepping the policy action.",
+    )
 
     parser.add_argument("--policy", default=None, help="Stable-worldmodel run name, directory, or object checkpoint.")
     parser.add_argument("--cache-dir", type=Path, default=None)
@@ -476,6 +507,15 @@ def cube_yaw_error(info: dict[str, Any], goal_block_yaw: float) -> float:
     return angular_distance(float(info["privileged/block_0_yaw"][0]), goal_block_yaw)
 
 
+def effector_z(info: dict[str, Any]) -> float:
+    effector_pos = np.asarray(info["proprio/effector_pos"], dtype=np.float32).reshape(-1)
+    return float(effector_pos[2])
+
+
+def height_geometry_unsafe(info: dict[str, Any], threshold: float) -> bool:
+    return bool(effector_z(info) > float(threshold))
+
+
 def load_dataset_episode(dataset_path: Path, episode_idx: int) -> dict[str, Any]:
     with h5py.File(dataset_path, "r") as h5:
         ep_len = int(h5["ep_len"][episode_idx])
@@ -499,6 +539,115 @@ def load_dataset_episode(dataset_path: Path, episode_idx: int) -> dict[str, Any]
             "max_episode_steps": int(h5.attrs.get("max_episode_steps", ep_len)),
             "video_fps": float(h5.attrs.get("video_fps", 20.0)),
         }
+
+
+def _select_pair_value(value: Any, index: int, pair_count: int | None) -> Any:
+    if isinstance(value, dict):
+        return {key: _select_pair_value(item, index, pair_count) for key, item in value.items()}
+    if isinstance(value, (list, tuple)) and pair_count is not None and len(value) == pair_count:
+        return value[index]
+    if isinstance(value, torch.Tensor) and pair_count is not None and value.ndim > 0 and int(value.shape[0]) == pair_count:
+        return value[index]
+    if isinstance(value, np.ndarray) and pair_count is not None and value.ndim > 0 and int(value.shape[0]) == pair_count:
+        return value[index]
+    return value
+
+
+def _infer_pair_count(payload: Any) -> int | None:
+    if isinstance(payload, dict):
+        metadata = payload.get("metadata", {})
+        if isinstance(metadata, dict) and "pair_count" in metadata:
+            return int(metadata["pair_count"])
+        if isinstance(metadata, dict) and "num_points" in metadata:
+            return int(metadata["num_points"])
+        if "pair_count" in payload:
+            return int(payload["pair_count"])
+        if "start" in payload and any(key in payload for key in ("goal", "end", "target")):
+            start = payload["start"]
+            if isinstance(start, dict):
+                for item in start.values():
+                    if isinstance(item, (torch.Tensor, np.ndarray)) and item.ndim > 0:
+                        return int(item.shape[0])
+        for key in ("pairs", "episodes", "endpoint_pairs"):
+            if key in payload and isinstance(payload[key], (list, tuple)):
+                return len(payload[key])
+    if isinstance(payload, (list, tuple)):
+        return len(payload)
+    return None
+
+
+def _pick_key(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for name in names:
+        if name in mapping:
+            return mapping[name]
+    raise KeyError(f"Expected one of keys {names}, got {sorted(mapping.keys())}.")
+
+
+def load_start_goal_pairs(path: Path, count: int) -> list[dict[str, Any]]:
+    payload = torch.load(path.expanduser().resolve(), map_location="cpu", weights_only=False)
+    pair_count = _infer_pair_count(payload)
+    if pair_count is None:
+        raise ValueError(f"Could not infer endpoint-pair count from {path}.")
+    if int(count) > pair_count:
+        raise ValueError(f"Requested {count} endpoint pairs, but {path} only contains {pair_count}.")
+    pairs = []
+    for index in range(int(count)):
+        if isinstance(payload, dict) and "start" in payload and any(key in payload for key in ("goal", "end", "target")):
+            pair = {
+                "metadata": payload.get("metadata", {}),
+                "start": _select_pair_value(payload["start"], index, pair_count),
+                "goal": _select_pair_value(_pick_key(payload, ("goal", "end", "target")), index, pair_count),
+            }
+        elif isinstance(payload, dict):
+            pair = _select_pair_value(_pick_key(payload, ("pairs", "episodes", "endpoint_pairs")), index, pair_count)
+            pair = {**pair, "metadata": payload.get("metadata", {})} if isinstance(pair, dict) else pair
+        else:
+            pair = payload[index]
+        if not isinstance(pair, dict):
+            raise TypeError(f"Endpoint pair {index} must be a dict, got {type(pair)!r}.")
+        pairs.append(pair)
+    return pairs
+
+
+def synthesize_qpos_qvel_from_block_pose(
+    env: gymnasium.Env,
+    pos: np.ndarray,
+    yaw: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    env.reset(seed=seed)
+    unwrapped = env.unwrapped
+    unwrapped._target_block = 0
+    joint_qpos = unwrapped._data.joint("object_joint_0").qpos
+    joint_qpos[:3] = np.asarray(pos, dtype=np.float64)
+    joint_qpos[3:] = np.asarray(lie.SO3.from_z_radians(float(yaw)).wxyz, dtype=np.float64)
+    unwrapped.pre_step()
+    mujoco.mj_forward(unwrapped._model, unwrapped._data)
+    unwrapped.post_step()
+    return (
+        np.asarray(unwrapped._data.qpos, dtype=np.float32).copy(),
+        np.zeros_like(np.asarray(unwrapped._data.qvel, dtype=np.float32)),
+    )
+
+
+def endpoint_pixels(pair: dict[str, Any], endpoint: str) -> np.ndarray:
+    pixels = np.asarray(pair[endpoint]["pixels"], dtype=np.uint8)
+    if pixels.ndim != 3 or pixels.shape[-1] != 3:
+        raise ValueError(f"Expected {endpoint} pixels with shape [H, W, 3], got {pixels.shape}.")
+    return pixels
+
+
+def ogbench_success(info: dict[str, Any]) -> bool:
+    success = info.get("success", False)
+    if isinstance(success, dict):
+        return all(bool(value) for value in success.values())
+    return bool(np.asarray(success).item())
+
+
+def goal_success(args: argparse.Namespace, info: dict[str, Any], distance: float) -> bool:
+    if args.success_mode == "ogbench_success":
+        return ogbench_success(info)
+    return bool(float(distance) <= float(args.cube_success_threshold))
 
 
 def make_env(
@@ -594,6 +743,10 @@ class ILQRMPCSolver:
         tol: float,
         regularization: float,
         device: torch.device,
+        lpb_barrier: Any | None = None,
+        lpb_weight: float = 0.0,
+        lpb_threshold_scale: float = 1.0,
+        lpb_stage_only: bool = True,
     ) -> None:
         self.dynamics = dynamics
         self.state_dim = dynamics.state_dim
@@ -606,6 +759,12 @@ class ILQRMPCSolver:
         self.tol = float(tol)
         self.regularization = float(regularization)
         self.device = device
+        self.lpb_barrier = lpb_barrier
+        self.lpb_weight = float(lpb_weight)
+        self.lpb_threshold_scale = float(lpb_threshold_scale)
+        self.lpb_stage_only = bool(lpb_stage_only)
+        self.lpb_enabled = lpb_barrier is not None and self.lpb_weight > 0.0
+        self.last_lpb_diagnostics: dict[str, float] = {}
         self.prev_u_guess = torch.zeros((self.horizon, self.action_dim), dtype=torch.float32, device=device)
         self.eye_x = torch.eye(self.state_dim, dtype=torch.float32, device=device)
         self.eye_u = torch.eye(self.action_dim, dtype=torch.float32, device=device)
@@ -636,7 +795,26 @@ class ILQRMPCSolver:
             cost = cost + self.r_control * torch.dot(u_seq[step], u_seq[step])
         terminal_err = x_traj[self.horizon] - x_goal
         cost = cost + self.q_terminal * torch.dot(terminal_err, terminal_err)
+        if self.lpb_enabled and self.lpb_barrier is not None:
+            cost = cost + self.lpb_weight * self.lpb_barrier.trajectory_penalty(
+                x_traj,
+                stage_only=self.lpb_stage_only,
+            )
         return cost
+
+    def _lpb_state_derivatives(self, x: torch.Tensor, *, mean_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.lpb_enabled or self.lpb_barrier is None:
+            return torch.zeros_like(x), torch.zeros_like(self.eye_x)
+
+        def state_cost(state: torch.Tensor) -> torch.Tensor:
+            return self.lpb_weight * float(mean_scale) * self.lpb_barrier.state_penalty(state).reshape(())
+
+        state = x.detach().clone().requires_grad_(True)
+        cost = state_cost(state)
+        grad = torch.autograd.grad(cost, state, allow_unused=False)[0].detach()
+        hess = torch.autograd.functional.hessian(state_cost, state, vectorize=True).detach()
+        hess = 0.5 * (hess + hess.T)
+        return grad, hess
 
     def _linearize_dynamics(self, x_traj: torch.Tensor, u_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         a_list = []
@@ -673,6 +851,14 @@ class ILQRMPCSolver:
             terminal_err = x_traj[self.horizon] - x_goal
             v_x = 2.0 * self.q_terminal * terminal_err
             v_xx = 2.0 * self.q_terminal * self.eye_x
+            lpb_mean_scale = 1.0 / float(self.horizon if self.lpb_stage_only else self.horizon + 1)
+            if self.lpb_enabled and not self.lpb_stage_only:
+                terminal_lpb_x, terminal_lpb_xx = self._lpb_state_derivatives(
+                    x_traj[self.horizon],
+                    mean_scale=lpb_mean_scale,
+                )
+                v_x = v_x + terminal_lpb_x
+                v_xx = v_xx + terminal_lpb_xx
             backward_ok = True
 
             for step in range(self.horizon - 1, -1, -1):
@@ -684,6 +870,9 @@ class ILQRMPCSolver:
                 l_u = 2.0 * self.r_control * u
                 l_xx = 2.0 * self.q_stage * self.eye_x
                 l_uu = 2.0 * self.r_control * self.eye_u
+                lpb_x, lpb_xx = self._lpb_state_derivatives(x_traj[step], mean_scale=lpb_mean_scale)
+                l_x = l_x + lpb_x
+                l_xx = l_xx + lpb_xx
                 q_x = l_x + a.T @ v_x
                 q_u = l_u + b.T @ v_x
                 q_xx = l_xx + a.T @ v_xx @ a
@@ -738,6 +927,15 @@ class ILQRMPCSolver:
                 break
 
         self.prev_u_guess = u_seq.detach().clone()
+        if self.lpb_barrier is not None:
+            self.last_lpb_diagnostics = self.lpb_barrier.diagnostics(
+                x_traj.detach(),
+                stage_only=self.lpb_stage_only,
+            )
+            self.last_lpb_diagnostics["lpb_weight"] = float(self.lpb_weight)
+            self.last_lpb_diagnostics["lpb_enabled"] = float(self.lpb_enabled)
+        else:
+            self.last_lpb_diagnostics = {}
         maybe_cuda_synchronize(self.device)
         return (
             x_traj.detach().cpu().numpy().astype(np.float64),
@@ -764,6 +962,10 @@ class ILQRPolicyAdapter:
         ilqr_max_iters: int,
         ilqr_tol: float,
         ilqr_regularization: float,
+        lpb_barrier: Any | None = None,
+        lpb_weight: float = 0.0,
+        lpb_threshold_scale: float = 1.0,
+        lpb_stage_only: bool = True,
     ) -> None:
         self.model = model
         self.config = config
@@ -785,10 +987,17 @@ class ILQRPolicyAdapter:
             tol=ilqr_tol,
             regularization=ilqr_regularization,
             device=device,
+            lpb_barrier=lpb_barrier,
+            lpb_weight=lpb_weight,
+            lpb_threshold_scale=lpb_threshold_scale,
+            lpb_stage_only=lpb_stage_only,
         )
         self.history_len = required_markov_history(self.markov_deriv)
         self.current_history: list[torch.Tensor] = []
         self.goal_state: np.ndarray | None = None
+
+    def set_lpb_enabled(self, enabled: bool) -> None:
+        self.solver.lpb_enabled = bool(enabled) and self.solver.lpb_barrier is not None and self.solver.lpb_weight > 0.0
 
     def reset(self, *, start_embedding: torch.Tensor, goal_embedding: torch.Tensor) -> None:
         self.current_history = [start_embedding] * self.history_len
@@ -806,16 +1015,25 @@ class ILQRPolicyAdapter:
             raise ValueError(f"State dimension mismatch: config says {self.markov_state_dim}, built {state.numel()}.")
         return state.detach().cpu().numpy().astype(np.float64)
 
-    def get_action(self) -> tuple[np.ndarray, dict[str, float]]:
+    def get_action(self, *, constant_grasp_action_norm: float | None = None) -> tuple[np.ndarray, dict[str, float]]:
         if self.goal_state is None:
             raise RuntimeError("ILQRPolicyAdapter.reset must be called before get_action.")
         _, u_plan, solve_time, n_iters, plan_cost = self.solver.solve(self.current_state_np(), self.goal_state)
         u0_norm = u_plan[0].astype(np.float32)
+        if constant_grasp_action_norm is not None:
+            if u0_norm.shape[0] <= 4:
+                raise ValueError("Cannot clamp gripper action: action dimension is <= 4.")
+            u0_norm = u0_norm.copy()
+            u0_norm[4] = float(constant_grasp_action_norm)
         u0_raw = normalized_to_raw_action(u0_norm, self.action_mean, self.action_std)
         return u0_raw, {
             "solve_time_ms": float(solve_time * 1000.0),
             "ilqr_iterations": float(n_iters),
             "ilqr_cost": float(plan_cost),
+            "constant_grasp_action_norm": None
+            if constant_grasp_action_norm is None
+            else float(constant_grasp_action_norm),
+            **self.solver.last_lpb_diagnostics,
         }
 
 
@@ -825,6 +1043,10 @@ def load_episode_lengths(dataset_path: Path) -> np.ndarray:
 
 
 def sample_eval_cases(args: argparse.Namespace, ep_len: np.ndarray) -> list[EvalCase]:
+    if args.start_goal_path is not None:
+        if args.episode_idx is not None:
+            raise ValueError("--start-goal-path uses the first --num-eval pairs; do not combine with --episode-idx.")
+        return [EvalCase(int(idx), 0, 1, 2) for idx in range(int(args.num_eval))]
     valid = np.flatnonzero(ep_len >= 2)
     if valid.size == 0:
         raise ValueError("Need at least one episode with at least two frames.")
@@ -1007,6 +1229,21 @@ def load_ilqr_assets(args: argparse.Namespace, device: torch.device) -> tuple[IL
     )
     pixel_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
     pixel_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+    lpb_barrier = None
+    lpb_bank_path = getattr(args, "lpb_bank_path", None)
+    if lpb_bank_path is not None:
+        from ogbench.safety.lpb.barrier import CubeLPBBarrier
+
+        lpb_barrier = CubeLPBBarrier(
+            lpb_bank_path,
+            device=device,
+            threshold_scale=float(getattr(args, "lpb_threshold_scale", 1.0)),
+        )
+        if int(lpb_barrier.state_dim) != int(config.get("markov_state_dim", (markov_deriv + 1) * int(config.get("embed_dim", 64)))):
+            raise ValueError(
+                "LPB bank Markov-state dimension does not match the Cube iLQR model: "
+                f"bank={lpb_barrier.state_dim}, model={config.get('markov_state_dim')}"
+            )
     policy = ILQRPolicyAdapter(
         model=model,
         config=config,
@@ -1020,7 +1257,12 @@ def load_ilqr_assets(args: argparse.Namespace, device: torch.device) -> tuple[IL
         ilqr_max_iters=args.ilqr_max_iters,
         ilqr_tol=args.ilqr_tol,
         ilqr_regularization=args.ilqr_regularization,
+        lpb_barrier=lpb_barrier,
+        lpb_weight=float(getattr(args, "lpb_weight", 1.0)),
+        lpb_threshold_scale=float(getattr(args, "lpb_threshold_scale", 1.0)),
+        lpb_stage_only=bool(getattr(args, "lpb_stage_only", True)),
     )
+    policy.set_lpb_enabled(False)
     method_config = {
         "model_dir": str(model_dir),
         "checkpoint": str(checkpoint_path),
@@ -1031,6 +1273,17 @@ def load_ilqr_assets(args: argparse.Namespace, device: torch.device) -> tuple[IL
         "q_stage": float(args.q_stage),
         "r_control": float(args.r_control),
         "ilqr_max_iters": int(args.ilqr_max_iters),
+        "lpb": None
+        if lpb_barrier is None
+        else {
+            "bank_path": str(lpb_bank_path.expanduser().resolve()),
+            "weight": float(getattr(args, "lpb_weight", 1.0)),
+            "threshold": float(lpb_barrier.threshold),
+            "threshold_scale": float(getattr(args, "lpb_threshold_scale", 1.0)),
+            "scaled_threshold": float(lpb_barrier.scaled_threshold),
+            "stage_only": bool(getattr(args, "lpb_stage_only", True)),
+            "metadata": lpb_barrier.metadata,
+        },
     }
     return policy, model, method_config, pixel_mean, pixel_std, checkpoint_path
 
@@ -1050,27 +1303,42 @@ def run_case(
     ilqr_assets: tuple[ILQRPolicyAdapter, torch.nn.Module, dict[str, Any], torch.Tensor, torch.Tensor, Path] | None,
     swm_policy: Any | None,
     swm_history_size: int | None,
+    start_goal_pair: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    episode = load_dataset_episode(args.dataset_path, case.episode_idx)
-    qpos_np = np.asarray(episode["qpos"], dtype=np.float32)
-    qvel_np = np.asarray(episode["qvel"], dtype=np.float32)
-    target_block_pos_np = np.asarray(episode["target_block_pos"], dtype=np.float32)
-    target_block_yaw_np = np.asarray(episode["target_block_yaw"], dtype=np.float32)
-    pixels_np = np.asarray(episode["pixels"], dtype=np.uint8)
-    obs_np = np.asarray(episode["observation"], dtype=np.float32)
-    episode_seed = int(episode["episode_seed"])
-    env_name = str(episode["env_name"])
-    camera = str(episode["camera"])
-    width = int(episode["width"])
-    height = int(episode["height"])
-    physics_timestep = float(episode["physics_timestep"])
-    control_timestep = float(episode["control_timestep"])
-    dataset_max_episode_steps = int(episode["max_episode_steps"])
-    max_episode_steps = (
-        int(args.env_max_episode_steps)
-        if args.env_max_episode_steps is not None
-        else max(dataset_max_episode_steps, int(args.max_oracle_steps) + int(args.eval_budget) + 1)
-    )
+    if start_goal_pair is None:
+        episode = load_dataset_episode(args.dataset_path, case.episode_idx)
+        qpos_np = np.asarray(episode["qpos"], dtype=np.float32)
+        qvel_np = np.asarray(episode["qvel"], dtype=np.float32)
+        target_block_pos_np = np.asarray(episode["target_block_pos"], dtype=np.float32)
+        target_block_yaw_np = np.asarray(episode["target_block_yaw"], dtype=np.float32)
+        episode_seed = int(episode["episode_seed"])
+        env_name = str(episode["env_name"])
+        camera = str(episode["camera"])
+        width = int(episode["width"])
+        height = int(episode["height"])
+        physics_timestep = float(episode["physics_timestep"])
+        control_timestep = float(episode["control_timestep"])
+        dataset_max_episode_steps = int(episode["max_episode_steps"])
+        max_episode_steps = (
+            int(args.env_max_episode_steps)
+            if args.env_max_episode_steps is not None
+            else max(dataset_max_episode_steps, int(args.max_oracle_steps) + int(args.eval_budget) + 1)
+        )
+    else:
+        metadata = start_goal_pair.get("metadata", {})
+        episode_seed = int(metadata.get("episode_seed", args.seed)) + int(case_idx)
+        env_name = str(metadata.get("env_name", "cube-single-v0"))
+        camera = str(metadata.get("camera", "front_pixels"))
+        width = int(metadata.get("image_width", 224))
+        height = int(metadata.get("image_height", 224))
+        physics_timestep = 1.0 / 500.0
+        control_timestep = 25.0 / 500.0
+        dataset_max_episode_steps = int(metadata.get("max_episode_steps", 150))
+        max_episode_steps = (
+            int(args.env_max_episode_steps)
+            if args.env_max_episode_steps is not None
+            else max(dataset_max_episode_steps, int(args.max_oracle_steps) + int(args.eval_budget) + 8)
+        )
 
     case_dir = out_root / f"case_{case_idx:04d}_episode_{case.episode_idx:05d}"
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -1090,33 +1358,65 @@ def run_case(
         noise_smoothing=args.oracle_noise_smoothing,
     )
 
+    if start_goal_pair is None:
+        start_qpos = qpos_np[case.start_step]
+        start_qvel = qvel_np[case.start_step]
+        goal_qpos = qpos_np[case.goal_step]
+        goal_qvel = qvel_np[case.goal_step]
+        start_target_pos = target_block_pos_np[case.start_step]
+        start_target_yaw = float(target_block_yaw_np[case.start_step, 0])
+        goal_target_pos = target_block_pos_np[case.goal_step]
+        goal_target_yaw = float(target_block_yaw_np[case.goal_step, 0])
+        goal_frame_override = None
+        start_frame_override = None
+    else:
+        start_endpoint = start_goal_pair["start"]
+        goal_endpoint = start_goal_pair["goal"]
+        start_pos = np.asarray(_pick_key(start_endpoint, ("task_target", "block_pos", "object_pos", "pos")), dtype=np.float32)
+        goal_pos = np.asarray(_pick_key(goal_endpoint, ("task_target", "block_pos", "object_pos", "pos")), dtype=np.float32)
+        start_yaw = float(np.asarray(_pick_key(start_endpoint, ("yaw", "block_yaw", "object_yaw"))).reshape(-1)[0])
+        goal_yaw = float(np.asarray(_pick_key(goal_endpoint, ("yaw", "block_yaw", "object_yaw"))).reshape(-1)[0])
+        start_qpos, start_qvel = synthesize_qpos_qvel_from_block_pose(env, start_pos, start_yaw, episode_seed)
+        goal_qpos, goal_qvel = synthesize_qpos_qvel_from_block_pose(env, goal_pos, goal_yaw, episode_seed)
+        start_target_pos = goal_pos
+        start_target_yaw = goal_yaw
+        goal_target_pos = goal_pos
+        goal_target_yaw = goal_yaw
+        start_frame_override = endpoint_pixels(start_goal_pair, "start") if args.use_start_goal_pixels else None
+        goal_frame_override = endpoint_pixels(start_goal_pair, "goal") if args.use_start_goal_pixels else None
+
     start_frame, start_info, start_obs = reset_env_to_state(
         env,
         seed=episode_seed,
-        qpos=qpos_np[case.start_step],
-        qvel=qvel_np[case.start_step],
-        target_block_pos=target_block_pos_np[case.start_step],
-        target_block_yaw=float(target_block_yaw_np[case.start_step, 0]),
+        qpos=start_qpos,
+        qvel=start_qvel,
+        target_block_pos=start_target_pos,
+        target_block_yaw=start_target_yaw,
         camera=camera,
     )
     goal_frame, goal_info, goal_obs = reset_env_to_state(
         env,
         seed=episode_seed,
-        qpos=qpos_np[case.goal_step],
-        qvel=qvel_np[case.goal_step],
-        target_block_pos=target_block_pos_np[case.goal_step],
-        target_block_yaw=float(target_block_yaw_np[case.goal_step, 0]),
+        qpos=goal_qpos,
+        qvel=goal_qvel,
+        target_block_pos=goal_target_pos,
+        target_block_yaw=goal_target_yaw,
         camera=camera,
     )
     current_frame, current_info, current_obs = reset_env_to_state(
         env,
         seed=episode_seed,
-        qpos=qpos_np[case.start_step],
-        qvel=qvel_np[case.start_step],
-        target_block_pos=target_block_pos_np[case.start_step],
-        target_block_yaw=float(target_block_yaw_np[case.start_step, 0]),
+        qpos=start_qpos,
+        qvel=start_qvel,
+        target_block_pos=start_target_pos,
+        target_block_yaw=start_target_yaw,
         camera=camera,
     )
+    if start_frame_override is not None:
+        start_frame = start_frame_override.copy()
+        current_frame = start_frame_override.copy()
+    if goal_frame_override is not None:
+        goal_frame = goal_frame_override.copy()
     save_rgb_image(case_dir / "start_image.png", start_frame)
     save_rgb_image(case_dir / "goal_image.png", goal_frame)
 
@@ -1125,6 +1425,9 @@ def run_case(
     rollout_frames = [current_frame.copy()]
     cube_goal_distances = [cube_distance(current_info, goal_block_pos)]
     cube_yaw_errors = [cube_yaw_error(current_info, goal_block_yaw)]
+    height_threshold = float(args.height_threshold)
+    initial_effector_z = effector_z(current_info)
+    height_geometry_violations = [height_geometry_unsafe(current_info, height_threshold)]
     step_records: list[dict[str, Any]] = []
     executed_actions_raw: list[np.ndarray] = []
     used_oracle_before_policy = True
@@ -1223,6 +1526,9 @@ def run_case(
             )
             cube_goal_distances.append(dist)
             cube_yaw_errors.append(yaw_err)
+            step_effector_z = effector_z(current_info)
+            step_height_unsafe = height_geometry_unsafe(current_info, height_threshold)
+            height_geometry_violations.append(step_height_unsafe)
             step_records.append(
                 {
                     "phase": "oracle",
@@ -1230,6 +1536,9 @@ def run_case(
                     "cube_goal_distance": dist,
                     "cube_yaw_error": yaw_err,
                     "oracle_grasped": bool(oracle_grasped),
+                    "effector_z": step_effector_z,
+                    "height_threshold": height_threshold,
+                    "height_geometry_unsafe": bool(step_height_unsafe),
                 }
             )
             if oracle_grasped:
@@ -1242,7 +1551,7 @@ def run_case(
     if oracle_grasped:
         handoff_info = current_info
 
-    success = float(np.min(cube_goal_distances)) <= float(args.cube_success_threshold)
+    success = goal_success(args, current_info, float(np.min(cube_goal_distances)))
     if success:
         stop_reason = "goal_reached"
 
@@ -1251,12 +1560,20 @@ def run_case(
             if args.method == "ilqr":
                 assert ilqr_assets is not None
                 ilqr_policy, _, _, _, _, _ = ilqr_assets
-                action_raw, record = ilqr_policy.get_action()
+                action_raw, record = ilqr_policy.get_action(
+                    constant_grasp_action_norm=args.constant_grasp_action_norm,
+                )
             else:
                 assert swm_policy is not None and episode_history is not None
                 action_batch = swm_policy.get_action(episode_history.info())
                 action_raw = np.asarray(action_batch, dtype=np.float32).reshape(-1, env.action_space.shape[0])[0]
                 record = {}
+            if args.constant_grasp_action is not None:
+                action_raw = np.asarray(action_raw, dtype=np.float32).copy()
+                if action_raw.shape[0] <= 4:
+                    raise ValueError("Cannot clamp raw gripper action: action dimension is <= 4.")
+                action_raw[4] = float(args.constant_grasp_action)
+                record["constant_grasp_action"] = float(args.constant_grasp_action)
 
             executed_actions_raw.append(action_raw.copy())
             _, _, terminated, truncated, step_info = env.step(action_raw)
@@ -1292,7 +1609,10 @@ def run_case(
             yaw_err = cube_yaw_error(current_info, goal_block_yaw)
             cube_goal_distances.append(dist)
             cube_yaw_errors.append(yaw_err)
-            success = dist <= float(args.cube_success_threshold)
+            success = goal_success(args, current_info, dist)
+            step_effector_z = effector_z(current_info)
+            step_height_unsafe = height_geometry_unsafe(current_info, height_threshold)
+            height_geometry_violations.append(step_height_unsafe)
             step_records.append(
                 {
                     "phase": "policy",
@@ -1300,6 +1620,9 @@ def run_case(
                     "policy_step": int(policy_step + 1),
                     "cube_goal_distance": dist,
                     "cube_yaw_error": yaw_err,
+                    "effector_z": step_effector_z,
+                    "height_threshold": height_threshold,
+                    "height_geometry_unsafe": bool(step_height_unsafe),
                     **record,
                 }
             )
@@ -1317,12 +1640,16 @@ def run_case(
     video_path = None
     if not args.no_videos:
         video_path = str(save_rollout_video(rollout_frames, case_dir, fps=args.video_fps))
+    frame_archive_path = None
+    if args.save_frame_archive:
+        frame_archive_path = str(case_dir / "rollout_frames.npz")
+        np.savez_compressed(frame_archive_path, frames=np.stack(rollout_frames, axis=0))
     env.close()
 
     summary = {
         **asdict(case),
         "success": bool(success),
-        "success_metric": "cube_position_l2",
+        "success_metric": str(args.success_mode),
         "cube_success_threshold": float(args.cube_success_threshold),
         "initial_cube_goal_distance": float(cube_goal_distances[0]),
         "handoff_cube_goal_distance": float(cube_distance(handoff_info, goal_block_pos)),
@@ -1339,6 +1666,27 @@ def run_case(
         "policy_steps_executed": int(policy_steps_executed),
         "steps_executed": int(len(executed_actions_raw)),
         "stop_reason": stop_reason,
+        "height_threshold": height_threshold,
+        "initial_effector_z": initial_effector_z,
+        "height_geometry_violation": bool(np.any(height_geometry_violations)),
+        "height_geometry_violation_rate": float(np.mean(height_geometry_violations)),
+        "min_effector_z": float(
+            np.min([initial_effector_z] + [item["effector_z"] for item in step_records if "effector_z" in item])
+        ),
+        "max_effector_z": float(
+            np.max([initial_effector_z] + [item["effector_z"] for item in step_records if "effector_z" in item])
+        ),
+        "lpb_guided": bool(args.method == "ilqr" and getattr(args, "lpb_bank_path", None) is not None),
+        "lpb_violation_rate_mean": float(
+            np.mean([item["lpb_violation_rate"] for item in step_records if "lpb_violation_rate" in item])
+        )
+        if any("lpb_violation_rate" in item for item in step_records)
+        else None,
+        "lpb_distance_max": float(
+            np.max([item["lpb_distance_max"] for item in step_records if "lpb_distance_max" in item])
+        )
+        if any("lpb_distance_max" in item for item in step_records)
+        else None,
         "episode_seed": int(episode_seed),
         "env_name": env_name,
         "camera": camera,
@@ -1357,6 +1705,7 @@ def run_case(
         "final_qpos": np.asarray(current_info["qpos"], dtype=np.float32).tolist(),
         "final_qvel": np.asarray(current_info["qvel"], dtype=np.float32).tolist(),
         "video_path": video_path,
+        "frame_archive_path": frame_archive_path,
         "step_records": step_records,
     }
     save_case_summary(case_dir, summary)
@@ -1366,6 +1715,10 @@ def run_case(
 def main() -> None:
     args = parse_args()
     args.dataset_path = args.dataset_path.expanduser().resolve()
+    if args.start_goal_path is not None:
+        args.start_goal_path = args.start_goal_path.expanduser().resolve()
+        if not args.start_goal_path.is_file():
+            raise FileNotFoundError(f"Start/goal pair file not found: {args.start_goal_path}")
     if not args.dataset_path.is_file():
         raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
     if args.eval_budget < 1:
@@ -1374,9 +1727,18 @@ def main() -> None:
         raise ValueError("--max-oracle-steps must be non-negative.")
     if args.cube_success_threshold <= 0:
         raise ValueError("--cube-success-threshold must be positive.")
+    if args.height_threshold <= 0:
+        raise ValueError("--height-threshold must be positive.")
+    if args.use_start_goal_pixels and args.start_goal_path is None:
+        raise ValueError("--use-start-goal-pixels requires --start-goal-path.")
 
     device = require_device(args.device)
-    ep_len = load_episode_lengths(args.dataset_path)
+    start_goal_pairs = None
+    if args.start_goal_path is not None:
+        start_goal_pairs = load_start_goal_pairs(args.start_goal_path, int(args.num_eval))
+        ep_len = np.full((int(args.num_eval),), 2, dtype=np.int64)
+    else:
+        ep_len = load_episode_lengths(args.dataset_path)
     cases = sample_eval_cases(args, ep_len)
 
     run_name = f"{int(time.time())}_{args.method}_seed_{args.seed}"
@@ -1389,8 +1751,11 @@ def main() -> None:
     method_config: dict[str, Any]
     if args.method == "ilqr":
         ilqr_assets = load_ilqr_assets(args, device)
+        ilqr_assets[0].set_lpb_enabled(getattr(args, "lpb_bank_path", None) is not None)
         method_config = ilqr_assets[2]
     else:
+        if args.start_goal_path is not None:
+            raise NotImplementedError("--start-goal-path is currently supported for --method ilqr only.")
         probe_episode = load_dataset_episode(args.dataset_path, cases[0].episode_idx)
         env_for_space = make_env(
             env_name=str(probe_episode["env_name"]),
@@ -1415,23 +1780,40 @@ def main() -> None:
                 ilqr_assets=ilqr_assets,
                 swm_policy=swm_policy,
                 swm_history_size=swm_history_size,
+                start_goal_pair=None if start_goal_pairs is None else start_goal_pairs[case_idx],
             )
         )
 
     successes = np.asarray([case["success"] for case in case_results], dtype=bool)
+    geometry_violations = np.asarray([case["height_geometry_violation"] for case in case_results], dtype=bool)
     metrics = {
         "success_rate": float(np.mean(successes) * 100.0),
+        "geometry_safety_rate": float((1.0 - np.mean(geometry_violations)) * 100.0),
+        "geometry_safety_violation_rate": float(np.mean(geometry_violations) * 100.0),
+        "mean_height_geometry_step_violation_rate": float(
+            np.mean([case["height_geometry_violation_rate"] for case in case_results])
+        ),
+        "height_threshold": float(args.height_threshold),
         "episode_successes": successes.astype(int).tolist(),
-        "success_metric": "cube_position_l2",
+        "episode_geometry_safe": (~geometry_violations).astype(int).tolist(),
+        "success_metric": str(args.success_mode),
         "cube_success_threshold": float(args.cube_success_threshold),
         "method": args.method,
         "method_config": method_config,
         "dataset_path": str(args.dataset_path),
+        "start_goal_path": None if args.start_goal_path is None else str(args.start_goal_path),
+        "use_start_goal_pixels": bool(args.use_start_goal_pixels),
         "seed": int(args.seed),
         "num_eval": len(case_results),
         "eval_budget": int(args.eval_budget),
         "max_oracle_steps": int(args.max_oracle_steps),
-        "goal_protocol": "start_step_0_to_final_episode_step_with_oracle_grasp",
+        "constant_grasp_action_norm": None
+        if args.constant_grasp_action_norm is None
+        else float(args.constant_grasp_action_norm),
+        "save_frame_archive": bool(args.save_frame_archive),
+        "goal_protocol": "first_start_goal_pairs_with_oracle_grasp"
+        if args.start_goal_path is not None
+        else "start_step_0_to_final_episode_step_with_oracle_grasp",
         "cases": case_results,
     }
     with (out_root / "metrics.json").open("w", encoding="utf-8") as handle:
